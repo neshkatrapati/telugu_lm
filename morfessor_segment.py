@@ -464,25 +464,172 @@ def compute_vocab_stats(model_path: Path, freq_path: Path, output_dir: Path):
 
 
 # ---------------------------------------------------------------------------
-# Step 4: Segment full corpus
+# Step 4: Segment full corpus (with caching + multiprocessing)
 # ---------------------------------------------------------------------------
+
+def _build_segmentation_cache(model, freq_path: Path, separator: str) -> dict[str, str]:
+    """
+    Pre-segment all known words into a lookup dict.
+    This avoids calling viterbi_segment millions of times during corpus pass.
+    """
+    cache = {}
+    logger.info("Building segmentation cache from word frequencies...")
+
+    with open(freq_path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split(" ", 1)
+            if len(parts) != 2:
+                continue
+            _, word = parts
+
+            segments = model.viterbi_segment(word)[0]
+            if len(segments) > 1:
+                segmented_parts = []
+                for i, seg in enumerate(segments):
+                    if i < len(segments) - 1:
+                        segmented_parts.append(seg + separator)
+                    else:
+                        segmented_parts.append(seg)
+                cache[word] = " ".join(segmented_parts)
+            else:
+                cache[word] = word
+
+    logger.info("Cached segmentations for %d word types", len(cache))
+    return cache
+
+
+def _segment_text_cached(cache: dict, model, text: str, separator: str) -> str:
+    """
+    Segment Telugu words in text using cache for known words.
+    Falls back to viterbi_segment for unknown words (cache miss).
+    """
+    tokens = text.split()
+    result = []
+
+    for token in tokens:
+        # No Telugu characters — keep as-is
+        if not TELUGU_WORD_RE.search(token):
+            result.append(token)
+            continue
+
+        # Purely Telugu token — use cache
+        if TELUGU_WORD_RE.fullmatch(token):
+            cached = cache.get(token)
+            if cached is not None:
+                result.append(cached)
+            else:
+                # Cache miss — segment and cache for future
+                segments = model.viterbi_segment(token)[0]
+                if len(segments) > 1:
+                    parts = []
+                    for i, seg in enumerate(segments):
+                        if i < len(segments) - 1:
+                            parts.append(seg + separator)
+                        else:
+                            parts.append(seg)
+                    segmented = " ".join(parts)
+                else:
+                    segmented = token
+                cache[token] = segmented
+                result.append(segmented)
+        else:
+            # Mixed token — split on Telugu boundaries
+            parts = re.split(r"([\u0C00-\u0C7F]+)", token)
+            for part in parts:
+                if not part:
+                    continue
+                if TELUGU_WORD_RE.fullmatch(part):
+                    cached = cache.get(part)
+                    if cached is not None:
+                        result.append(cached)
+                    else:
+                        segments = model.viterbi_segment(part)[0]
+                        if len(segments) > 1:
+                            seg_parts = []
+                            for i, seg in enumerate(segments):
+                                if i < len(segments) - 1:
+                                    seg_parts.append(seg + separator)
+                                else:
+                                    seg_parts.append(seg)
+                            segmented = " ".join(seg_parts)
+                        else:
+                            segmented = part
+                        cache[part] = segmented
+                        result.append(segmented)
+                else:
+                    result.append(part)
+
+    return " ".join(result)
+
+
+def _segment_single_file(args_tuple):
+    """
+    Worker function for multiprocessing. Segments a single file.
+    Receives a tuple: (fpath, out_file, model_path, freq_path, separator, input_dir)
+    """
+    import morfessor
+    from tqdm import tqdm
+
+    fpath, out_file, model_path, freq_path, separator, input_dir = args_tuple
+
+    try:
+        rel = fpath.relative_to(input_dir)
+    except ValueError:
+        rel = Path(fpath.name)
+
+    # Skip if already segmented
+    if out_file.exists() and out_file.stat().st_size > 1024:
+        return f"SKIPPED {rel} — already segmented"
+
+    # Load model in this worker process
+    io = morfessor.MorfessorIO()
+    model = io.read_binary_model_file(str(model_path))
+
+    # Build cache in this worker
+    cache = _build_segmentation_cache(model, freq_path, separator)
+
+    start = time.time()
+    doc_count = 0
+    cache_misses = 0
+
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(out_file, "w", encoding="utf-8") as fout:
+        for text in _iter_text_from_file(fpath):
+            prev_cache_size = len(cache)
+            segmented_text = _segment_text_cached(cache, model, text, separator)
+            if len(cache) > prev_cache_size:
+                cache_misses += len(cache) - prev_cache_size
+            fout.write(segmented_text + "\n")
+            doc_count += 1
+
+    elapsed = time.time() - start
+    size_mb = out_file.stat().st_size / (1024 ** 2)
+    return (
+        f"Done {rel}: {doc_count} docs, {size_mb:.1f} MB, "
+        f"{elapsed / 60:.1f} min, {cache_misses} cache misses"
+    )
+
+
 def segment_corpus(
     input_dir: Path,
     model_path: Path,
     output_dir: Path,
     separator: str,
+    num_workers: int = 0,
 ):
-    """Apply Morfessor segmentation to all corpus files."""
+    """
+    Apply Morfessor segmentation to all corpus files.
+    Uses pre-built cache for speed + multiprocessing for parallelism.
+    """
     import morfessor
-    from tqdm import tqdm
-
-    io = morfessor.MorfessorIO()
-    model = io.read_binary_model_file(str(model_path))
+    from multiprocessing import Pool, cpu_count
 
     seg_dir = output_dir / "segmented_corpus"
     seg_dir.mkdir(parents=True, exist_ok=True)
+    freq_path = output_dir / "word_frequencies.txt"
 
-    # Find all data files (same logic as build_word_frequencies)
+    # Find all data files
     data_files = []
     for ext in ("*.parquet", "*.jsonl", "*.txt"):
         data_files.extend(input_dir.rglob(ext))
@@ -493,98 +640,75 @@ def segment_corpus(
         logger.error("No data files found in %s", input_dir)
         sys.exit(1)
 
-    logger.info("Segmenting %d files...", len(data_files))
-
+    # Build list of (input, output) file pairs
+    work_items = []
     for fpath in data_files:
-        # Build output filename preserving relative structure
         try:
             rel = fpath.relative_to(input_dir)
         except ValueError:
             rel = Path(fpath.name)
-
         out_file = seg_dir / rel.with_suffix(".seg.txt")
-        out_file.parent.mkdir(parents=True, exist_ok=True)
-
-        # Skip if already segmented
-        if out_file.exists() and out_file.stat().st_size > 1024:
-            logger.info("SKIPPING %s — already segmented", rel)
-            continue
-
-        logger.info("Segmenting %s -> %s", rel, out_file.name)
-        start = time.time()
-        doc_count = 0
-
-        with open(out_file, "w", encoding="utf-8") as fout:
-            for text in tqdm(
-                _iter_text_from_file(fpath),
-                desc=fpath.name,
-                unit=" docs",
-            ):
-                segmented_text = _segment_text(model, text, separator)
-                fout.write(segmented_text + "\n")
-                doc_count += 1
-
-        elapsed = time.time() - start
-        size_mb = out_file.stat().st_size / (1024 ** 2)
-        logger.info(
-            "  Done: %d docs, %.1f MB, %.1f min",
-            doc_count, size_mb, elapsed / 60,
+        work_items.append(
+            (fpath, out_file, model_path, freq_path, separator, input_dir)
         )
 
+    if num_workers <= 0:
+        num_workers = max(1, cpu_count() - 1)
 
-def _segment_text(model, text: str, separator: str) -> str:
-    """
-    Segment Telugu words in text, leaving non-Telugu tokens untouched.
+    # If only 1 file or 1 worker, run sequentially (avoids mp overhead)
+    if len(work_items) == 1 or num_workers == 1:
+        logger.info(
+            "Segmenting %d file(s) sequentially (cached)...", len(work_items)
+        )
+        # For sequential, build cache once and reuse
+        io = morfessor.MorfessorIO()
+        model = io.read_binary_model_file(str(model_path))
+        cache = _build_segmentation_cache(model, freq_path, separator)
 
-    Example (separator="@@"):
-      "విద్యార్థులకు went to school" -> "విద్యార్థు@@ ల@@ కు went to school"
-    """
-    tokens = text.split()
-    result = []
+        from tqdm import tqdm
+        for fpath, out_file, _, _, _, _ in work_items:
+            try:
+                rel = fpath.relative_to(input_dir)
+            except ValueError:
+                rel = Path(fpath.name)
 
-    for token in tokens:
-        # Extract Telugu parts
-        telugu_words = TELUGU_WORD_RE.findall(token)
-        if not telugu_words:
-            # No Telugu characters — keep as-is
-            result.append(token)
-            continue
+            if out_file.exists() and out_file.stat().st_size > 1024:
+                logger.info("SKIPPING %s — already segmented", rel)
+                continue
 
-        # If the token is purely Telugu, segment it
-        if TELUGU_WORD_RE.fullmatch(token):
-            segments = model.viterbi_segment(token)[0]
-            if len(segments) > 1:
-                # Mark continuation with separator (like BPE)
-                segmented = []
-                for i, seg in enumerate(segments):
-                    if i < len(segments) - 1:
-                        segmented.append(seg + separator)
-                    else:
-                        segmented.append(seg)
-                result.extend(segmented)
-            else:
-                result.append(token)
-        else:
-            # Mixed token — segment Telugu parts, keep rest
-            # Split on Telugu boundaries
-            parts = re.split(r"([\u0C00-\u0C7F]+)", token)
-            for part in parts:
-                if not part:
-                    continue
-                if TELUGU_WORD_RE.fullmatch(part):
-                    segments = model.viterbi_segment(part)[0]
-                    if len(segments) > 1:
-                        for i, seg in enumerate(segments):
-                            if i < len(segments) - 1:
-                                result.append(seg + separator)
-                            else:
-                                result.append(seg)
-                    else:
-                        result.append(part)
-                else:
-                    result.append(part)
+            logger.info("Segmenting %s -> %s", rel, out_file.name)
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            start = time.time()
+            doc_count = 0
 
-    return " ".join(result)
+            with open(out_file, "w", encoding="utf-8") as fout:
+                for text in tqdm(
+                    _iter_text_from_file(fpath),
+                    desc=fpath.name,
+                    unit=" docs",
+                ):
+                    segmented_text = _segment_text_cached(
+                        cache, model, text, separator
+                    )
+                    fout.write(segmented_text + "\n")
+                    doc_count += 1
+
+            elapsed = time.time() - start
+            size_mb = out_file.stat().st_size / (1024 ** 2)
+            logger.info(
+                "  Done: %d docs, %.1f MB, %.1f min",
+                doc_count, size_mb, elapsed / 60,
+            )
+    else:
+        # Parallel: each worker loads its own model + cache
+        logger.info(
+            "Segmenting %d files with %d workers (cached + parallel)...",
+            len(work_items), num_workers,
+        )
+        with Pool(processes=num_workers) as pool:
+            results = pool.map(_segment_single_file, work_items)
+        for r in results:
+            logger.info("  %s", r)
 
 
 # ---------------------------------------------------------------------------
@@ -702,6 +826,12 @@ Examples:
         action="store_true",
         help="Compute and display morpheme vocabulary statistics (can be used standalone with --model)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Number of parallel workers for corpus segmentation (default: auto = cpu_count - 1)",
+    )
 
     args = parser.parse_args()
 
@@ -746,7 +876,7 @@ Examples:
         logger.info("  Separator: '%s'", args.separator)
         logger.info("=" * 70)
 
-        segment_corpus(input_dir, model_path, output_dir, args.separator)
+        segment_corpus(input_dir, model_path, output_dir, args.separator, args.workers)
 
     else:
         # Full pipeline or train-only
@@ -779,7 +909,7 @@ Examples:
 
         # Step 4: Segment full corpus (unless train-only)
         if not args.train_only:
-            segment_corpus(input_dir, model_path, output_dir, args.separator)
+            segment_corpus(input_dir, model_path, output_dir, args.separator, args.workers)
 
     elapsed_total = time.time() - start_total
     print_summary(output_dir)
