@@ -585,48 +585,21 @@ def _init_worker(cache, model, separator):
     _shared_separator = separator
 
 
-def _segment_single_file(args_tuple):
+def _segment_batch(texts):
     """
-    Worker function for multiprocessing. Segments a single file.
-    Uses shared cache + model set by _init_worker (no re-loading).
+    Worker function: segment a batch of texts using shared cache + model.
+    Returns list of segmented texts.
     """
-    fpath, out_file, input_dir = args_tuple
-
-    try:
-        rel = fpath.relative_to(input_dir)
-    except ValueError:
-        rel = Path(fpath.name)
-
-    # Skip if already segmented
-    if out_file.exists() and out_file.stat().st_size > 1024:
-        return f"SKIPPED {rel} — already segmented"
-
-    # Use shared cache + model from parent process
-    cache = dict(_shared_cache)  # copy so workers don't conflict on cache misses
+    cache = _shared_cache  # read-only from parent via fork (copy-on-write)
     model = _shared_model
     separator = _shared_separator
+    results = []
+    for text in texts:
+        results.append(_segment_text_cached(cache, model, text, separator))
+    return results
 
-    start = time.time()
-    doc_count = 0
-    cache_misses = 0
 
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(out_file, "w", encoding="utf-8") as fout:
-        for text in _iter_text_from_file(fpath):
-            prev_cache_size = len(cache)
-            segmented_text = _segment_text_cached(cache, model, text, separator)
-            if len(cache) > prev_cache_size:
-                cache_misses += len(cache) - prev_cache_size
-            fout.write(segmented_text + "\n")
-            doc_count += 1
-
-    elapsed = time.time() - start
-    size_mb = out_file.stat().st_size / (1024 ** 2)
-    return (
-        f"Done {rel}: {doc_count:,} docs, {size_mb:.1f} MB, "
-        f"{elapsed / 60:.1f} min, {cache_misses:,} cache misses"
-    )
+BATCH_SIZE = 5000  # docs per batch sent to workers
 
 
 def segment_corpus(
@@ -638,7 +611,8 @@ def segment_corpus(
 ):
     """
     Apply Morfessor segmentation to all corpus files.
-    Builds cache ONCE, then shares with workers via fork.
+    Builds cache ONCE, then processes each file with parallel batch segmentation.
+    Progress bar updates per batch so you always see movement.
     """
     import morfessor
     from multiprocessing import Pool, cpu_count
@@ -665,47 +639,30 @@ def segment_corpus(
     model = io.read_binary_model_file(str(model_path))
     cache = _build_segmentation_cache(model, freq_path, separator)
 
-    # Build list of (input, output, input_dir) tuples — lightweight, no model/cache
-    work_items = []
-    skipped = 0
+    if num_workers <= 0:
+        num_workers = max(1, cpu_count() - 1)
+
+    # ---- Process each file ----
     for fpath in data_files:
         try:
             rel = fpath.relative_to(input_dir)
         except ValueError:
             rel = Path(fpath.name)
-        out_file = seg_dir / rel.with_suffix(".seg.txt")
 
+        out_file = seg_dir / rel.with_suffix(".seg.txt")
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Skip if already segmented
         if out_file.exists() and out_file.stat().st_size > 1024:
             logger.info("SKIPPING %s — already segmented", rel)
-            skipped += 1
             continue
 
-        out_file.parent.mkdir(parents=True, exist_ok=True)
-        work_items.append((fpath, out_file, input_dir))
+        logger.info("Segmenting %s -> %s (%d workers)", rel, out_file.name, num_workers)
+        start = time.time()
+        doc_count = 0
 
-    if not work_items:
-        logger.info("All %d files already segmented. Nothing to do.", skipped)
-        return
-
-    if num_workers <= 0:
-        num_workers = max(1, cpu_count() - 1)
-
-    # ---- Sequential mode ----
-    if len(work_items) == 1 or num_workers == 1:
-        logger.info(
-            "Segmenting %d file(s) sequentially (cached, %d skipped)...",
-            len(work_items), skipped,
-        )
-        for fpath, out_file, _ in work_items:
-            try:
-                rel = fpath.relative_to(input_dir)
-            except ValueError:
-                rel = Path(fpath.name)
-
-            logger.info("Segmenting %s -> %s", rel, out_file.name)
-            start = time.time()
-            doc_count = 0
-
+        if num_workers <= 1:
+            # ---- Sequential: simple loop with progress bar ----
             with open(out_file, "w", encoding="utf-8") as fout:
                 for text in tqdm(
                     _iter_text_from_file(fpath),
@@ -717,30 +674,56 @@ def segment_corpus(
                     )
                     fout.write(segmented_text + "\n")
                     doc_count += 1
+        else:
+            # ---- Parallel: batch docs, send to workers, write results in order ----
+            with Pool(
+                processes=num_workers,
+                initializer=_init_worker,
+                initargs=(cache, model, separator),
+            ) as pool, open(out_file, "w", encoding="utf-8") as fout:
 
-            elapsed = time.time() - start
-            size_mb = out_file.stat().st_size / (1024 ** 2)
-            logger.info(
-                "  Done: %d docs, %.1f MB, %.1f min",
-                doc_count, size_mb, elapsed / 60,
-            )
+                batch = []
+                pbar = tqdm(desc=fpath.name, unit=" docs")
 
-    # ---- Parallel mode ----
-    else:
-        num_workers = min(num_workers, len(work_items))
+                for text in _iter_text_from_file(fpath):
+                    batch.append(text)
+                    if len(batch) >= BATCH_SIZE:
+                        # Split batch across workers
+                        chunk_size = max(1, len(batch) // num_workers)
+                        chunks = [
+                            batch[i:i + chunk_size]
+                            for i in range(0, len(batch), chunk_size)
+                        ]
+                        results = pool.map(_segment_batch, chunks)
+                        for chunk_results in results:
+                            for seg_text in chunk_results:
+                                fout.write(seg_text + "\n")
+                                doc_count += 1
+                        pbar.update(len(batch))
+                        batch = []
+
+                # Process remaining docs
+                if batch:
+                    chunk_size = max(1, len(batch) // num_workers)
+                    chunks = [
+                        batch[i:i + chunk_size]
+                        for i in range(0, len(batch), chunk_size)
+                    ]
+                    results = pool.map(_segment_batch, chunks)
+                    for chunk_results in results:
+                        for seg_text in chunk_results:
+                            fout.write(seg_text + "\n")
+                            doc_count += 1
+                    pbar.update(len(batch))
+
+                pbar.close()
+
+        elapsed = time.time() - start
+        size_mb = out_file.stat().st_size / (1024 ** 2)
         logger.info(
-            "Segmenting %d files with %d workers (cached + parallel, %d skipped)...",
-            len(work_items), num_workers, skipped,
+            "  Done: %d docs, %.1f MB, %.1f min",
+            doc_count, size_mb, elapsed / 60,
         )
-        # Workers inherit cache + model via fork initializer
-        with Pool(
-            processes=num_workers,
-            initializer=_init_worker,
-            initargs=(cache, model, separator),
-        ) as pool:
-            results = pool.imap_unordered(_segment_single_file, work_items)
-            for r in results:
-                logger.info("  %s", r)
 
 
 # ---------------------------------------------------------------------------
