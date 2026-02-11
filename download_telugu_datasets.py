@@ -17,7 +17,7 @@ Usage:
     python download_telugu_datasets.py --dataset indiccorp # Only IndicCorp v2
     python download_telugu_datasets.py --subset verified   # Only Sangraha verified split
     python download_telugu_datasets.py --streaming         # Stream & save (low memory)
-    python download_telugu_datasets.py --output ./data     # Custom output directory
+    python download_telugu_datasets.py --output /mnt/data   # Custom output directory
     python download_telugu_datasets.py --format jsonl      # Output as JSONL (default: parquet)
 """
 
@@ -132,6 +132,21 @@ def check_disk_space(output_dir: Path, required_gb: float):
 
 
 # ---------------------------------------------------------------------------
+# Already-downloaded check
+# ---------------------------------------------------------------------------
+MINIMUM_FILE_SIZE_BYTES = 1024 * 1024  # 1 MB — anything smaller is likely corrupt/incomplete
+
+
+def find_existing_file(output_path: Path, name: str) -> Path | None:
+    """Check if a dataset file already exists in any supported format."""
+    for ext in (".parquet", ".jsonl", ".txt"):
+        candidate = output_path / f"{name}{ext}"
+        if candidate.exists() and candidate.stat().st_size > MINIMUM_FILE_SIZE_BYTES:
+            return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Save helpers
 # ---------------------------------------------------------------------------
 def save_dataset(dataset, output_path: Path, fmt: str, name: str):
@@ -203,12 +218,26 @@ def download_sangraha(subsets, output_dir: Path, fmt: str, streaming: bool):
             continue
 
         config = SANGRAHA_SUBSETS[subset_name]
+        out_path = output_dir / "sangraha"
+        file_name = f"telugu_{subset_name}"
+
+        # Skip if already downloaded
+        existing = find_existing_file(out_path, file_name)
+        if existing:
+            size_gb = existing.stat().st_size / (1024 ** 3)
+            logger.info("=" * 70)
+            logger.info(
+                "SKIPPING Sangraha [%s] — already exists: %s (%.2f GB)",
+                subset_name, existing, size_gb,
+            )
+            logger.info("=" * 70)
+            continue
+
         logger.info("=" * 70)
         logger.info("Downloading Sangraha [%s]", subset_name)
         logger.info("   %s", config["description"])
         logger.info("=" * 70)
 
-        out_path = output_dir / "sangraha"
         start = time.time()
 
         try:
@@ -219,7 +248,7 @@ def download_sangraha(subsets, output_dir: Path, fmt: str, streaming: bool):
                     streaming=True,
                     split="train",
                 )
-                save_streaming_dataset(ds, out_path, fmt, f"telugu_{subset_name}")
+                save_streaming_dataset(ds, out_path, fmt, file_name)
             else:
                 ds = load_dataset(
                     "ai4bharat/sangraha",
@@ -231,7 +260,7 @@ def download_sangraha(subsets, output_dir: Path, fmt: str, streaming: bool):
                     len(ds),
                     subset_name,
                 )
-                save_dataset(ds, out_path, fmt, f"telugu_{subset_name}")
+                save_dataset(ds, out_path, fmt, file_name)
 
             elapsed = time.time() - start
             logger.info("Sangraha [%s] completed in %.1f minutes", subset_name, elapsed / 60)
@@ -246,12 +275,26 @@ def download_indiccorp(output_dir: Path, fmt: str, streaming: bool):
     """Download AI4Bharat IndicCorp v2 Telugu data."""
     from datasets import load_dataset
 
+    out_path = output_dir / "indiccorp_v2"
+    file_name = "telugu_indiccorp_v2"
+
+    # Skip if already downloaded
+    existing = find_existing_file(out_path, file_name)
+    if existing:
+        size_gb = existing.stat().st_size / (1024 ** 3)
+        logger.info("=" * 70)
+        logger.info(
+            "SKIPPING IndicCorp v2 — already exists: %s (%.2f GB)",
+            existing, size_gb,
+        )
+        logger.info("=" * 70)
+        return
+
     logger.info("=" * 70)
     logger.info("Downloading IndicCorp v2 [Telugu]")
     logger.info("   %s", INDICCORP_CONFIG["description"])
     logger.info("=" * 70)
 
-    out_path = output_dir / "indiccorp_v2"
     start = time.time()
 
     try:
@@ -263,7 +306,7 @@ def download_indiccorp(output_dir: Path, fmt: str, streaming: bool):
                 streaming=True,
                 split="train",
             )
-            save_streaming_dataset(ds, out_path, fmt, "telugu_indiccorp_v2")
+            save_streaming_dataset(ds, out_path, fmt, file_name)
         else:
             ds = load_dataset(
                 INDICCORP_CONFIG["repo"],
@@ -272,7 +315,7 @@ def download_indiccorp(output_dir: Path, fmt: str, streaming: bool):
                 split="train",
             )
             logger.info("Loaded %d documents from IndicCorp v2", len(ds))
-            save_dataset(ds, out_path, fmt, "telugu_indiccorp_v2")
+            save_dataset(ds, out_path, fmt, file_name)
 
         elapsed = time.time() - start
         logger.info("IndicCorp v2 completed in %.1f minutes", elapsed / 60)
@@ -350,8 +393,8 @@ Examples:
     parser.add_argument(
         "--output",
         type=str,
-        default=os.path.expanduser("~/Documents/telugu_lm/data"),
-        help="Output directory (default: ~/Documents/telugu_lm/data)",
+        default="./data",
+        help="Output directory (default: ./data in current working directory)",
     )
     parser.add_argument(
         "--format",
