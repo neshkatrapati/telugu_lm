@@ -634,7 +634,10 @@ def segment_corpus(
 
     seg_dir = output_dir / "segmented_corpus"
     seg_dir.mkdir(parents=True, exist_ok=True)
+    # Look for word_frequencies.txt in output_dir first, then next to the model
     freq_path = output_dir / "word_frequencies.txt"
+    if not freq_path.exists():
+        freq_path = model_path.parent / "word_frequencies.txt"
 
     # Find all data files — input_dir can be a file or a directory
     if input_dir.is_file():
