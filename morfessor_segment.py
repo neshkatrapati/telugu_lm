@@ -472,11 +472,20 @@ def _build_segmentation_cache(model, freq_path: Path, separator: str) -> dict[st
     Pre-segment all known words into a lookup dict.
     This avoids calling viterbi_segment millions of times during corpus pass.
     """
+    from tqdm import tqdm
+
     cache = {}
-    logger.info("Building segmentation cache from word frequencies...")
+
+    # Count lines first for progress bar
+    num_lines = 0
+    with open(freq_path, "r", encoding="utf-8") as f:
+        for _ in f:
+            num_lines += 1
+
+    logger.info("Building segmentation cache from %d word types...", num_lines)
 
     with open(freq_path, "r", encoding="utf-8") as f:
-        for line in f:
+        for line in tqdm(f, total=num_lines, desc="Caching segmentations", unit=" words"):
             parts = line.strip().split(" ", 1)
             if len(parts) != 2:
                 continue
