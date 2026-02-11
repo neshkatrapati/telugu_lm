@@ -183,16 +183,20 @@ def _iter_text_from_file(fpath: Path):
     if suffix == ".parquet":
         try:
             import pyarrow.parquet as pq
-            table = pq.read_table(fpath, columns=["text"])
-            for text in table.column("text").to_pylist():
-                if text:
-                    yield text
+            # Read in batches to avoid loading entire file into RAM
+            parquet_file = pq.ParquetFile(fpath)
+            for batch in parquet_file.iter_batches(
+                batch_size=5000, columns=["text"]
+            ):
+                for text in batch.column("text").to_pylist():
+                    if text:
+                        yield text
         except ImportError:
-            # Fallback: use pandas
+            # Fallback: use pandas in chunks
             import pandas as pd
-            df = pd.read_parquet(fpath, columns=["text"])
-            for text in df["text"].dropna():
-                yield text
+            for chunk in pd.read_parquet(fpath, columns=["text"], chunksize=5000):
+                for text in chunk["text"].dropna():
+                    yield text
 
     elif suffix == ".jsonl":
         with open(fpath, "r", encoding="utf-8") as f:
