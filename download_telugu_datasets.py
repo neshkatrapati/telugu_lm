@@ -101,7 +101,7 @@ SANGRAHA_SUBSETS = {
 INDICCORP_CONFIG = {
     "repo": "ai4bharat/IndicCorpV2",
     "config_name": "indiccorp_v2",
-    "data_dir": "data/tel_Telu",
+    "split": "tel_Telu",
     "description": "IndicCorp v2 Telugu (~731M tokens, ~15.8 GB .txt)",
     "approx_size_gb": 15.8,
     "approx_tokens": "731M",
@@ -302,17 +302,15 @@ def download_indiccorp(output_dir: Path, fmt: str, streaming: bool):
             ds = load_dataset(
                 INDICCORP_CONFIG["repo"],
                 INDICCORP_CONFIG["config_name"],
-                data_dir=INDICCORP_CONFIG["data_dir"],
+                split=INDICCORP_CONFIG["split"],
                 streaming=True,
-                split="train",
             )
             save_streaming_dataset(ds, out_path, fmt, file_name)
         else:
             ds = load_dataset(
                 INDICCORP_CONFIG["repo"],
                 INDICCORP_CONFIG["config_name"],
-                data_dir=INDICCORP_CONFIG["data_dir"],
-                split="train",
+                split=INDICCORP_CONFIG["split"],
             )
             logger.info("Loaded %d documents from IndicCorp v2", len(ds))
             save_dataset(ds, out_path, fmt, file_name)
