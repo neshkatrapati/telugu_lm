@@ -362,6 +362,108 @@ def inspect_segmentation(model_path: Path, output_dir: Path):
 
 
 # ---------------------------------------------------------------------------
+# Step 3b: Vocab statistics
+# ---------------------------------------------------------------------------
+def compute_vocab_stats(model_path: Path, freq_path: Path, output_dir: Path):
+    """Compute and display morpheme vocabulary statistics from the trained model."""
+    import morfessor
+
+    io = morfessor.MorfessorIO()
+    model = io.read_binary_model_file(str(model_path))
+
+    # Collect morpheme stats by segmenting all words in the frequency file
+    morpheme_freq = Counter()
+    word_type_count = 0
+    total_tokens = 0
+    total_morpheme_tokens = 0
+    unsegmented_count = 0
+
+    logger.info("Computing vocabulary statistics...")
+
+    with open(freq_path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split(" ", 1)
+            if len(parts) != 2:
+                continue
+            count_str, word = parts
+            try:
+                count = int(count_str)
+            except ValueError:
+                continue
+
+            word_type_count += 1
+            total_tokens += count
+
+            segments = model.viterbi_segment(word)[0]
+            total_morpheme_tokens += len(segments) * count
+
+            if len(segments) == 1:
+                unsegmented_count += 1
+
+            for seg in segments:
+                morpheme_freq[seg] += count
+
+    morpheme_types = len(morpheme_freq)
+    avg_morphemes_per_word = total_morpheme_tokens / total_tokens if total_tokens > 0 else 0
+    compression_ratio = word_type_count / morpheme_types if morpheme_types > 0 else 0
+
+    # Morpheme length distribution
+    lengths = [len(m) for m in morpheme_freq]
+    avg_morpheme_len = sum(lengths) / len(lengths) if lengths else 0
+
+    # Print stats
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("VOCABULARY STATISTICS")
+    logger.info("=" * 70)
+    logger.info("  Word types (surface forms):      %d", word_type_count)
+    logger.info("  Morpheme types (unique):         %d", morpheme_types)
+    logger.info("  Compression ratio:               %.1fx (word types / morpheme types)", compression_ratio)
+    logger.info("  Unsegmented words (kept intact):  %d (%.1f%%)",
+                unsegmented_count, 100 * unsegmented_count / word_type_count if word_type_count else 0)
+    logger.info("  Avg morphemes per word token:    %.2f", avg_morphemes_per_word)
+    logger.info("  Avg morpheme length (chars):     %.1f", avg_morpheme_len)
+    logger.info("  Total word tokens:               %d", total_tokens)
+    logger.info("  Total morpheme tokens:           %d", total_morpheme_tokens)
+    logger.info("-" * 70)
+
+    # Top morphemes
+    logger.info("  Top 30 most frequent morphemes:")
+    for morph, cnt in morpheme_freq.most_common(30):
+        logger.info("    %-20s  %10d", morph, cnt)
+
+    # Bottom — rarest morphemes
+    logger.info("")
+    logger.info("  30 rarest morphemes:")
+    for morph, cnt in morpheme_freq.most_common()[-30:]:
+        logger.info("    %-20s  %10d", morph, cnt)
+
+    logger.info("=" * 70)
+
+    # Save full morpheme vocabulary
+    vocab_path = output_dir / "morpheme_vocab.tsv"
+    with open(vocab_path, "w", encoding="utf-8") as f:
+        f.write("morpheme\tfrequency\n")
+        for morph, cnt in morpheme_freq.most_common():
+            f.write(f"{morph}\t{cnt}\n")
+    logger.info("Saved full morpheme vocabulary (%d entries) to %s", morpheme_types, vocab_path)
+
+    # Save summary stats
+    stats_path = output_dir / "vocab_stats.txt"
+    with open(stats_path, "w", encoding="utf-8") as f:
+        f.write(f"word_types: {word_type_count}\n")
+        f.write(f"morpheme_types: {morpheme_types}\n")
+        f.write(f"compression_ratio: {compression_ratio:.2f}\n")
+        f.write(f"unsegmented_words: {unsegmented_count}\n")
+        f.write(f"unsegmented_pct: {100 * unsegmented_count / word_type_count if word_type_count else 0:.1f}\n")
+        f.write(f"avg_morphemes_per_word_token: {avg_morphemes_per_word:.2f}\n")
+        f.write(f"avg_morpheme_length_chars: {avg_morpheme_len:.1f}\n")
+        f.write(f"total_word_tokens: {total_tokens}\n")
+        f.write(f"total_morpheme_tokens: {total_morpheme_tokens}\n")
+    logger.info("Saved vocab stats to %s", stats_path)
+
+
+# ---------------------------------------------------------------------------
 # Step 4: Segment full corpus
 # ---------------------------------------------------------------------------
 def segment_corpus(
@@ -532,6 +634,8 @@ Examples:
   %(prog)s --input ./data --corpus-weight 2.0       # Less segmentation
   %(prog)s --input ./data --corpus-weight 0.5       # More segmentation
   %(prog)s --input ./data --separator " "            # Space-separated morphemes
+  %(prog)s --input ./data --vocab-stats             # Show morpheme vocab stats
+  %(prog)s --segment-only --vocab-stats             # Stats on existing model only
         """,
     )
 
@@ -593,6 +697,11 @@ Examples:
         default=2,
         help="Minimum word frequency to include in training (default: 2)",
     )
+    parser.add_argument(
+        "--vocab-stats",
+        action="store_true",
+        help="Compute and display morpheme vocabulary statistics (can be used standalone with --model)",
+    )
 
     args = parser.parse_args()
 
@@ -609,7 +718,19 @@ Examples:
 
     start_total = time.time()
 
-    if args.segment_only:
+    if args.vocab_stats and args.segment_only:
+        # Standalone vocab stats mode
+        model_path = Path(args.model) if args.model else output_dir / "morfessor_telugu.bin"
+        freq_path = output_dir / "word_frequencies.txt"
+        if not model_path.exists():
+            logger.error("Model file not found: %s", model_path)
+            sys.exit(1)
+        if not freq_path.exists():
+            logger.error("Word frequency file not found: %s", freq_path)
+            sys.exit(1)
+        compute_vocab_stats(model_path, freq_path, output_dir)
+
+    elif args.segment_only:
         # Segment-only mode
         model_path = Path(args.model) if args.model else output_dir / "morfessor_telugu.bin"
         if not model_path.exists():
@@ -651,6 +772,10 @@ Examples:
 
         # Step 3: Inspect
         inspect_segmentation(model_path, output_dir)
+
+        # Step 3b: Vocab stats (if requested or always during train-only)
+        if args.vocab_stats or args.train_only:
+            compute_vocab_stats(model_path, freq_path, output_dir)
 
         # Step 4: Segment full corpus (unless train-only)
         if not args.train_only:
