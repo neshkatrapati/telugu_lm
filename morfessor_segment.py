@@ -571,15 +571,26 @@ def _segment_text_cached(cache: dict, model, text: str, separator: str) -> str:
     return " ".join(result)
 
 
+# Module-level globals for shared state across forked workers
+_shared_cache = None
+_shared_model = None
+_shared_separator = None
+
+
+def _init_worker(cache, model, separator):
+    """Initializer for pool workers — sets shared globals from parent."""
+    global _shared_cache, _shared_model, _shared_separator
+    _shared_cache = cache
+    _shared_model = model
+    _shared_separator = separator
+
+
 def _segment_single_file(args_tuple):
     """
     Worker function for multiprocessing. Segments a single file.
-    Receives a tuple: (fpath, out_file, model_path, freq_path, separator, input_dir)
+    Uses shared cache + model set by _init_worker (no re-loading).
     """
-    import morfessor
-    from tqdm import tqdm
-
-    fpath, out_file, model_path, freq_path, separator, input_dir = args_tuple
+    fpath, out_file, input_dir = args_tuple
 
     try:
         rel = fpath.relative_to(input_dir)
@@ -590,12 +601,10 @@ def _segment_single_file(args_tuple):
     if out_file.exists() and out_file.stat().st_size > 1024:
         return f"SKIPPED {rel} — already segmented"
 
-    # Load model in this worker process
-    io = morfessor.MorfessorIO()
-    model = io.read_binary_model_file(str(model_path))
-
-    # Build cache in this worker
-    cache = _build_segmentation_cache(model, freq_path, separator)
+    # Use shared cache + model from parent process
+    cache = dict(_shared_cache)  # copy so workers don't conflict on cache misses
+    model = _shared_model
+    separator = _shared_separator
 
     start = time.time()
     doc_count = 0
@@ -615,8 +624,8 @@ def _segment_single_file(args_tuple):
     elapsed = time.time() - start
     size_mb = out_file.stat().st_size / (1024 ** 2)
     return (
-        f"Done {rel}: {doc_count} docs, {size_mb:.1f} MB, "
-        f"{elapsed / 60:.1f} min, {cache_misses} cache misses"
+        f"Done {rel}: {doc_count:,} docs, {size_mb:.1f} MB, "
+        f"{elapsed / 60:.1f} min, {cache_misses:,} cache misses"
     )
 
 
@@ -629,10 +638,11 @@ def segment_corpus(
 ):
     """
     Apply Morfessor segmentation to all corpus files.
-    Uses pre-built cache for speed + multiprocessing for parallelism.
+    Builds cache ONCE, then shares with workers via fork.
     """
     import morfessor
     from multiprocessing import Pool, cpu_count
+    from tqdm import tqdm
 
     seg_dir = output_dir / "segmented_corpus"
     seg_dir.mkdir(parents=True, exist_ok=True)
@@ -649,44 +659,50 @@ def segment_corpus(
         logger.error("No data files found in %s", input_dir)
         sys.exit(1)
 
-    # Build list of (input, output) file pairs
+    # ---- Build cache + load model ONCE in parent process ----
+    logger.info("Loading model and building segmentation cache (once)...")
+    io = morfessor.MorfessorIO()
+    model = io.read_binary_model_file(str(model_path))
+    cache = _build_segmentation_cache(model, freq_path, separator)
+
+    # Build list of (input, output, input_dir) tuples — lightweight, no model/cache
     work_items = []
+    skipped = 0
     for fpath in data_files:
         try:
             rel = fpath.relative_to(input_dir)
         except ValueError:
             rel = Path(fpath.name)
         out_file = seg_dir / rel.with_suffix(".seg.txt")
-        work_items.append(
-            (fpath, out_file, model_path, freq_path, separator, input_dir)
-        )
+
+        if out_file.exists() and out_file.stat().st_size > 1024:
+            logger.info("SKIPPING %s — already segmented", rel)
+            skipped += 1
+            continue
+
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        work_items.append((fpath, out_file, input_dir))
+
+    if not work_items:
+        logger.info("All %d files already segmented. Nothing to do.", skipped)
+        return
 
     if num_workers <= 0:
         num_workers = max(1, cpu_count() - 1)
 
-    # If only 1 file or 1 worker, run sequentially (avoids mp overhead)
+    # ---- Sequential mode ----
     if len(work_items) == 1 or num_workers == 1:
         logger.info(
-            "Segmenting %d file(s) sequentially (cached)...", len(work_items)
+            "Segmenting %d file(s) sequentially (cached, %d skipped)...",
+            len(work_items), skipped,
         )
-        # For sequential, build cache once and reuse
-        io = morfessor.MorfessorIO()
-        model = io.read_binary_model_file(str(model_path))
-        cache = _build_segmentation_cache(model, freq_path, separator)
-
-        from tqdm import tqdm
-        for fpath, out_file, _, _, _, _ in work_items:
+        for fpath, out_file, _ in work_items:
             try:
                 rel = fpath.relative_to(input_dir)
             except ValueError:
                 rel = Path(fpath.name)
 
-            if out_file.exists() and out_file.stat().st_size > 1024:
-                logger.info("SKIPPING %s — already segmented", rel)
-                continue
-
             logger.info("Segmenting %s -> %s", rel, out_file.name)
-            out_file.parent.mkdir(parents=True, exist_ok=True)
             start = time.time()
             doc_count = 0
 
@@ -708,16 +724,23 @@ def segment_corpus(
                 "  Done: %d docs, %.1f MB, %.1f min",
                 doc_count, size_mb, elapsed / 60,
             )
+
+    # ---- Parallel mode ----
     else:
-        # Parallel: each worker loads its own model + cache
+        num_workers = min(num_workers, len(work_items))
         logger.info(
-            "Segmenting %d files with %d workers (cached + parallel)...",
-            len(work_items), num_workers,
+            "Segmenting %d files with %d workers (cached + parallel, %d skipped)...",
+            len(work_items), num_workers, skipped,
         )
-        with Pool(processes=num_workers) as pool:
-            results = pool.map(_segment_single_file, work_items)
-        for r in results:
-            logger.info("  %s", r)
+        # Workers inherit cache + model via fork initializer
+        with Pool(
+            processes=num_workers,
+            initializer=_init_worker,
+            initargs=(cache, model, separator),
+        ) as pool:
+            results = pool.imap_unordered(_segment_single_file, work_items)
+            for r in results:
+                logger.info("  %s", r)
 
 
 # ---------------------------------------------------------------------------
