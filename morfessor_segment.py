@@ -245,9 +245,14 @@ def train_morfessor(
     logger.info("  Corpus weight:  %s", corpus_weight)
     logger.info("  Dampening:      %s", dampening)
 
-    # Read word frequencies
+    # Read word frequencies as (count, word) tuples
+    # Our format is: "count word" per line
+    # We parse it manually because read_corpus_file treats input as raw text
+    # and ignores the count column, while read_corpus_list_file expects the
+    # correct "count word" format but returns (count, (word,)) tuples.
     io = morfessor.MorfessorIO()
-    word_counts = io.read_corpus_file(str(freq_path))
+    word_counts = list(io.read_corpus_list_file(str(freq_path)))
+    logger.info("Read %d word types from frequency file", len(word_counts))
 
     # Initialize model
     model = morfessor.BaselineModel(corpusweight=corpus_weight)
