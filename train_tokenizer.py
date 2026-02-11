@@ -175,10 +175,33 @@ def build_tokenizer(
         token_to_id[morph] = tid
         id_to_token[tid] = morph
 
+    # Add character-level fallback tokens for anything not covered by morphemes.
+    # This covers ASCII (English, digits, punctuation) and Telugu Unicode chars,
+    # so unknown tokens can be broken into characters instead of becoming <unk>.
+    char_ranges = []
+    # Printable ASCII (32-126)
+    char_ranges.extend(chr(c) for c in range(32, 127))
+    # Telugu Unicode block (0C00-0C7F)
+    char_ranges.extend(chr(c) for c in range(0x0C00, 0x0C80))
+    # Common punctuation & symbols not in ASCII range
+    char_ranges.extend(list("–—''""…•·€₹°±×÷"))
+
+    char_count = 0
+    next_id = len(token_to_id)
+    for ch in char_ranges:
+        if ch not in token_to_id:
+            token_to_id[ch] = next_id
+            id_to_token[next_id] = ch
+            next_id += 1
+            char_count += 1
+
+    vocab_size = len(token_to_id)
+
     logger.info("Tokenizer built:")
     logger.info("  Vocab size:       %d", vocab_size)
     logger.info("  Special tokens:   %d", NUM_SPECIAL)
     logger.info("  Morpheme tokens:  %d", max_morphemes)
+    logger.info("  Char fallbacks:   %d", char_count)
     logger.info("  Dropped (rare):   %d", dropped)
 
     if selected_morphemes:
@@ -279,9 +302,13 @@ class MorfessorTokenizer:
             tid = self.token_to_id.get(token)
             if tid is None:
                 tid = self.token_to_id.get(clean)
-            if tid is None:
-                tid = self.unk_id
-            ids.append(tid)
+            if tid is not None:
+                ids.append(tid)
+            else:
+                # Character-level fallback: break unknown token into chars
+                for ch in clean:
+                    cid = self.token_to_id.get(ch, self.unk_id)
+                    ids.append(cid)
 
         if add_eos:
             ids.append(self.eos_id)
