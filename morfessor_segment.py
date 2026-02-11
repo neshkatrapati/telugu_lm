@@ -252,16 +252,17 @@ def train_morfessor(
     # Initialize model
     model = morfessor.BaselineModel(corpusweight=corpus_weight)
 
-    # Set dampening
+    # Set dampening via count_modifier
+    import math
     if dampening == "log":
-        damp_func = "log"
+        count_modifier = lambda x: int(round(math.log(x + 1, 2)))
     elif dampening == "ones":
-        damp_func = "ones"
+        count_modifier = lambda x: 1
     else:
-        damp_func = "none"
+        count_modifier = None
 
-    # Load data with dampening
-    model.load_data(word_counts, freqthreshold=2, dampening=damp_func)
+    # Load data
+    model.load_data(word_counts, freqthreshold=2, count_modifier=count_modifier)
 
     # Train
     start = time.time()
