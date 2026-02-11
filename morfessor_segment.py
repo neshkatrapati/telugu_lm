@@ -646,7 +646,7 @@ def segment_corpus(
     from multiprocessing import Pool, cpu_count
     from tqdm import tqdm
 
-    seg_dir = output_dir / "segmented_corpus"
+    seg_dir = output_dir
     seg_dir.mkdir(parents=True, exist_ok=True)
     # Look for word_frequencies.txt in output_dir first, then next to the model
     freq_path = output_dir / "word_frequencies.txt"
