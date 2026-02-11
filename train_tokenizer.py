@@ -32,7 +32,7 @@ import argparse
 import logging
 import struct
 from pathlib import Path
-from collections import OrderedDict
+from collections import OrderedDict, Counter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,35 +58,89 @@ NUM_SPECIAL = len(SPECIAL_TOKENS)
 # ---------------------------------------------------------------------------
 # Build tokenizer from morpheme vocab
 # ---------------------------------------------------------------------------
+def build_vocab_from_corpus(corpus_path: Path, separator: str) -> list[tuple[str, int]]:
+    """Scan segmented corpus files and count every unique token.
+
+    This ensures the tokenizer vocabulary covers ALL morphemes that
+    actually appear in the training data, avoiding UNK tokens.
+
+    Args:
+        corpus_path: Path to a .seg.txt file or a directory containing them.
+        separator: The morpheme boundary marker (e.g. '@@').
+
+    Returns:
+        List of (token, frequency) tuples sorted by frequency descending.
+    """
+    from tqdm import tqdm
+
+    if corpus_path.is_file():
+        seg_files = [corpus_path]
+    else:
+        seg_files = sorted(corpus_path.rglob("*.seg.txt"))
+
+    if not seg_files:
+        logger.error("No .seg.txt files found in %s", corpus_path)
+        sys.exit(1)
+
+    logger.info("Scanning %d segmented file(s) to build vocabulary...", len(seg_files))
+    token_freq: Counter = Counter()
+    total_lines = 0
+
+    for fpath in seg_files:
+        logger.info("  Scanning %s", fpath.name)
+        with open(fpath, "r", encoding="utf-8") as f:
+            for line in tqdm(f, desc=fpath.name, unit=" lines"):
+                for token in line.split():
+                    # Strip separator suffix for counting base morphemes
+                    clean = token.rstrip(separator)
+                    if clean:
+                        token_freq[clean] += 1
+                total_lines += 1
+
+    logger.info("Scanned %d lines, found %d unique morpheme types", total_lines, len(token_freq))
+
+    morphemes = sorted(token_freq.items(), key=lambda x: x[1], reverse=True)
+    return morphemes
+
+
 def build_tokenizer(
     morfessor_dir: Path,
     vocab_size: int,
     output_dir: Path,
     separator: str,
+    segmented_corpus: Path = None,
 ):
     """Build tokenizer from Morfessor morpheme vocabulary.
 
-    If vocab_size is 0, use ALL morphemes from the Morfessor output
-    (i.e. vocab = special tokens + every morpheme type).
+    If segmented_corpus is provided, scan the actual segmented text files
+    to build the vocabulary (ensures near-zero UNK). Otherwise fall back
+    to morfessor_dir/morpheme_vocab.tsv.
+
+    If vocab_size is 0, use ALL morphemes.
     If vocab_size > 0, cap the vocabulary at that size.
     """
 
-    vocab_path = morfessor_dir / "morpheme_vocab.tsv"
-    if not vocab_path.exists():
-        logger.error("morpheme_vocab.tsv not found at %s", vocab_path)
-        logger.error("Run: python morfessor_segment.py --input ./data --train-only")
-        sys.exit(1)
+    if segmented_corpus is not None:
+        # Build vocab directly from the segmented corpus
+        morphemes = build_vocab_from_corpus(segmented_corpus, separator)
+    else:
+        vocab_path = morfessor_dir / "morpheme_vocab.tsv"
+        if not vocab_path.exists():
+            logger.error("morpheme_vocab.tsv not found at %s", vocab_path)
+            logger.error("Run: python morfessor_segment.py --input ./data --train-only")
+            logger.error("Or use --segmented-corpus to build vocab directly from segmented text files")
+            sys.exit(1)
 
-    # Read morpheme vocab
-    logger.info("Reading morpheme vocabulary from %s", vocab_path)
-    morphemes = []
-    with open(vocab_path, "r", encoding="utf-8") as f:
-        header = f.readline()  # skip header
-        for line in f:
-            parts = line.strip().split("\t")
-            if len(parts) == 2:
-                morph, freq = parts[0], int(parts[1])
-                morphemes.append((morph, freq))
+        # Read morpheme vocab
+        logger.info("Reading morpheme vocabulary from %s", vocab_path)
+        morphemes = []
+        with open(vocab_path, "r", encoding="utf-8") as f:
+            header = f.readline()  # skip header
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) == 2:
+                    morph, freq = parts[0], int(parts[1])
+                    morphemes.append((morph, freq))
 
     logger.info("Read %d morphemes from vocabulary", len(morphemes))
 
@@ -361,6 +415,14 @@ Examples:
         help="Morpheme boundary separator used in segmented corpus (default: @@)",
     )
     parser.add_argument(
+        "--segmented-corpus",
+        type=str,
+        default=None,
+        help="Path to segmented corpus file or directory (.seg.txt). "
+             "Builds vocab directly from the corpus instead of morpheme_vocab.tsv. "
+             "This ensures near-zero UNK tokens. (recommended)",
+    )
+    parser.add_argument(
         "--test",
         type=str,
         nargs="*",
@@ -372,10 +434,12 @@ Examples:
 
     morfessor_dir = Path(args.morfessor_dir)
     output_dir = Path(args.output)
+    seg_corpus = Path(args.segmented_corpus) if args.segmented_corpus else None
 
     # Build tokenizer
     token_to_id, id_to_token, vocab_size = build_tokenizer(
         morfessor_dir, args.vocab_size, output_dir, args.separator,
+        segmented_corpus=seg_corpus,
     )
 
     # Test
