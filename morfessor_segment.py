@@ -509,10 +509,14 @@ def _build_segmentation_cache(model, freq_path: Path, separator: str) -> dict[st
     return cache
 
 
+MAX_TOKEN_LEN = 80  # Skip viterbi for tokens longer than this (URLs, garbage, etc.)
+
+
 def _segment_text_cached(cache: dict, model, text: str, separator: str) -> str:
     """
     Segment Telugu words in text using cache for known words.
     Falls back to viterbi_segment for unknown words (cache miss).
+    Skips viterbi for tokens longer than MAX_TOKEN_LEN to avoid hangs.
     """
     tokens = text.split()
     result = []
@@ -528,6 +532,9 @@ def _segment_text_cached(cache: dict, model, text: str, separator: str) -> str:
             cached = cache.get(token)
             if cached is not None:
                 result.append(cached)
+            elif len(token) > MAX_TOKEN_LEN:
+                # Too long — skip viterbi, keep as-is
+                result.append(token)
             else:
                 # Cache miss — segment and cache for future
                 segments = model.viterbi_segment(token)[0]
@@ -553,6 +560,8 @@ def _segment_text_cached(cache: dict, model, text: str, separator: str) -> str:
                     cached = cache.get(part)
                     if cached is not None:
                         result.append(cached)
+                    elif len(part) > MAX_TOKEN_LEN:
+                        result.append(part)
                     else:
                         segments = model.viterbi_segment(part)[0]
                         if len(segments) > 1:
@@ -605,9 +614,14 @@ def _segment_batch(texts):
     return results
 
 
+MAX_DOC_CHARS = 500_000  # Skip segmentation for docs with more chars than this
+
+
 def _segment_single(text):
     """Worker function: segment a single text. For imap_unordered."""
     try:
+        if len(text) > MAX_DOC_CHARS:
+            return text  # Giant doc — skip segmentation, keep raw
         return _segment_text_cached(_shared_cache, _shared_model, text, _shared_separator)
     except Exception:
         return text
@@ -707,10 +721,11 @@ def segment_corpus(
                 pbar = tqdm(desc=fpath.name, unit=" docs")
 
                 # imap_unordered streams results as they complete — no blocking on slow docs
+                # chunksize=1 ensures one stuck doc cannot block any other results
                 for seg_text in pool.imap_unordered(
                     _segment_single,
                     _iter_text_from_file(fpath),
-                    chunksize=200,
+                    chunksize=1,
                 ):
                     fout.write(seg_text + "\n")
                     doc_count += 1
