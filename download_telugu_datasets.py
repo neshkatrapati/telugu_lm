@@ -350,8 +350,8 @@ Examples:
     parser.add_argument(
         "--output",
         type=str,
-        default="./telugu_lm_data",
-        help="Output directory (default: ./telugu_lm_data)",
+        default=os.path.expanduser("~/Documents/telugu_lm/data"),
+        help="Output directory (default: ~/Documents/telugu_lm/data)",
     )
     parser.add_argument(
         "--format",
