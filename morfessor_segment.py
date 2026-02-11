@@ -125,14 +125,16 @@ def build_word_frequencies(
     total_tokens = 0
     files_processed = 0
 
-    # Find all data files
-    data_files = []
-    for ext in ("*.parquet", "*.jsonl", "*.txt"):
-        data_files.extend(input_dir.rglob(ext))
-
-    # Exclude files in the morfessor output directory itself
-    data_files = [f for f in data_files if "morfessor" not in str(f)]
-    data_files.sort(key=lambda f: f.stat().st_size, reverse=True)
+    # Find all data files — input_dir can be a file or a directory
+    if input_dir.is_file():
+        data_files = [input_dir]
+    else:
+        data_files = []
+        for ext in ("*.parquet", "*.jsonl", "*.txt"):
+            data_files.extend(input_dir.rglob(ext))
+        # Exclude files in the morfessor output directory itself
+        data_files = [f for f in data_files if "morfessor" not in str(f)]
+        data_files.sort(key=lambda f: f.stat().st_size, reverse=True)
 
     if not data_files:
         logger.error("No data files found in %s", input_dir)
@@ -588,18 +590,30 @@ def _init_worker(cache, model, separator):
 def _segment_batch(texts):
     """
     Worker function: segment a batch of texts using shared cache + model.
-    Returns list of segmented texts.
+    Returns list of segmented texts. Skips docs that cause errors.
     """
     cache = _shared_cache  # read-only from parent via fork (copy-on-write)
     model = _shared_model
     separator = _shared_separator
     results = []
     for text in texts:
-        results.append(_segment_text_cached(cache, model, text, separator))
+        try:
+            results.append(_segment_text_cached(cache, model, text, separator))
+        except Exception:
+            # Skip problematic docs rather than hanging
+            results.append(text)
     return results
 
 
-BATCH_SIZE = 5000  # docs per batch sent to workers
+def _segment_single(text):
+    """Worker function: segment a single text. For imap_unordered."""
+    try:
+        return _segment_text_cached(_shared_cache, _shared_model, text, _shared_separator)
+    except Exception:
+        return text
+
+
+BATCH_SIZE = 2000  # docs per batch sent to workers (smaller = more responsive)
 
 
 def segment_corpus(
@@ -622,12 +636,17 @@ def segment_corpus(
     seg_dir.mkdir(parents=True, exist_ok=True)
     freq_path = output_dir / "word_frequencies.txt"
 
-    # Find all data files
-    data_files = []
-    for ext in ("*.parquet", "*.jsonl", "*.txt"):
-        data_files.extend(input_dir.rglob(ext))
-    data_files = [f for f in data_files if "morfessor" not in str(f)]
-    data_files.sort()
+    # Find all data files — input_dir can be a file or a directory
+    if input_dir.is_file():
+        data_files = [input_dir]
+        base_dir = input_dir.parent
+    else:
+        data_files = []
+        for ext in ("*.parquet", "*.jsonl", "*.txt"):
+            data_files.extend(input_dir.rglob(ext))
+        data_files = [f for f in data_files if "morfessor" not in str(f)]
+        data_files.sort()
+        base_dir = input_dir
 
     if not data_files:
         logger.error("No data files found in %s", input_dir)
@@ -645,7 +664,7 @@ def segment_corpus(
     # ---- Process each file ----
     for fpath in data_files:
         try:
-            rel = fpath.relative_to(input_dir)
+            rel = fpath.relative_to(base_dir)
         except ValueError:
             rel = Path(fpath.name)
 
@@ -675,46 +694,28 @@ def segment_corpus(
                     fout.write(segmented_text + "\n")
                     doc_count += 1
         else:
-            # ---- Parallel: batch docs, send to workers, write results in order ----
+            # ---- Parallel: stream docs through imap_unordered for responsiveness ----
             with Pool(
                 processes=num_workers,
                 initializer=_init_worker,
                 initargs=(cache, model, separator),
             ) as pool, open(out_file, "w", encoding="utf-8") as fout:
 
-                batch = []
                 pbar = tqdm(desc=fpath.name, unit=" docs")
 
-                for text in _iter_text_from_file(fpath):
-                    batch.append(text)
-                    if len(batch) >= BATCH_SIZE:
-                        # Split batch across workers
-                        chunk_size = max(1, len(batch) // num_workers)
-                        chunks = [
-                            batch[i:i + chunk_size]
-                            for i in range(0, len(batch), chunk_size)
-                        ]
-                        results = pool.map(_segment_batch, chunks)
-                        for chunk_results in results:
-                            for seg_text in chunk_results:
-                                fout.write(seg_text + "\n")
-                                doc_count += 1
-                        pbar.update(len(batch))
-                        batch = []
+                # imap_unordered streams results as they complete — no blocking on slow docs
+                for seg_text in pool.imap_unordered(
+                    _segment_single,
+                    _iter_text_from_file(fpath),
+                    chunksize=200,
+                ):
+                    fout.write(seg_text + "\n")
+                    doc_count += 1
+                    pbar.update(1)
 
-                # Process remaining docs
-                if batch:
-                    chunk_size = max(1, len(batch) // num_workers)
-                    chunks = [
-                        batch[i:i + chunk_size]
-                        for i in range(0, len(batch), chunk_size)
-                    ]
-                    results = pool.map(_segment_batch, chunks)
-                    for chunk_results in results:
-                        for seg_text in chunk_results:
-                            fout.write(seg_text + "\n")
-                            doc_count += 1
-                    pbar.update(len(batch))
+                    # Flush periodically so file size visibly grows
+                    if doc_count % 50000 == 0:
+                        fout.flush()
 
                 pbar.close()
 
@@ -855,7 +856,7 @@ Examples:
 
     input_dir = Path(args.input)
     if not input_dir.exists():
-        logger.error("Input directory does not exist: %s", input_dir)
+        logger.error("Input path does not exist: %s", input_dir)
         sys.exit(1)
 
     output_dir = Path(args.output) if args.output else input_dir / "morfessor"
