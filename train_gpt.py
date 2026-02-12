@@ -134,12 +134,12 @@ class TrainConfig:
 # Phase 1: Data Preparation (parallelized)
 # ===========================================================================
 
-# --- Worker globals (initialized once per process via initializer) ---
-_worker_tok = None  # type: MorfessorTokenizer | None
+# --- Worker globals (initialized once per process via pool initializer) ---
+_worker_tok = None
 
 
 def _init_worker(tokenizer_path: str, script_dir: str):
-    """Process pool initializer — loads tokenizer ONCE per worker process."""
+    """Pool initializer — loads tokenizer ONCE per worker process."""
     global _worker_tok
     if script_dir not in sys.path:
         sys.path.insert(0, script_dir)
@@ -147,19 +147,23 @@ def _init_worker(tokenizer_path: str, script_dir: str):
     _worker_tok = MorfessorTokenizer(tokenizer_path)
 
 
-def _tokenize_chunk(lines: list) -> tuple:
-    """Worker: tokenize a chunk of lines using the pre-loaded tokenizer.
+def _tokenize_chunk(chunk_info: tuple) -> str:
+    """Worker: tokenize lines and write results to a temp file.
 
-    Returns (np.array of uint32 ids, total_tokens, unk_count).
+    Instead of returning large arrays via IPC pickle, writes directly to
+    a per-chunk temp file and returns (temp_path, total_tokens, unk_count).
+    This avoids the IPC bottleneck for large result arrays.
     """
     global _worker_tok
     tok = _worker_tok
 
+    chunk_lines, temp_dir, chunk_idx = chunk_info
+    unk_id = tok.unk_id
+
     ids = []
     total = 0
     unk = 0
-    unk_id = tok.unk_id
-    for line in lines:
+    for line in chunk_lines:
         line = line.strip()
         if not line:
             continue
@@ -167,7 +171,13 @@ def _tokenize_chunk(lines: list) -> tuple:
         unk += sum(1 for i in encoded if i == unk_id)
         total += len(encoded)
         ids.extend(encoded)
-    return np.array(ids, dtype=np.uint32), total, unk
+
+    # Write to per-chunk temp file (avoids pickling large arrays back)
+    chunk_path = os.path.join(temp_dir, f"chunk_{chunk_idx:06d}.bin")
+    arr = np.array(ids, dtype=np.uint32)
+    arr.tofile(chunk_path)
+
+    return chunk_path, total, unk
 
 
 def prepare_data(
@@ -181,17 +191,19 @@ def prepare_data(
     """
     Tokenize segmented corpus into memory-mapped binary shards.
 
-    Parallelized: dispatches chunks of lines to worker processes for encoding.
-    Each worker loads the tokenizer ONCE (via pool initializer), not per-chunk.
-    Writes results in document order to preserve sequential structure.
-    Streams to disk to avoid RAM explosion.
+    Parallelized via multiprocessing.Pool with imap (ordered, streaming):
+      - Each worker loads the tokenizer ONCE (via pool initializer)
+      - Workers write encoded tokens to per-chunk temp files (no IPC pickle bottleneck)
+      - Results streamed back in order, temp files concatenated to final binary
+      - Lines streamed from file → chunks dispatched lazily (low memory)
 
     Reads .seg.txt files, encodes with our Morfessor tokenizer,
     and writes train.bin / val.bin as uint32 numpy arrays.
     """
+    import tempfile
+    import shutil
     from tqdm import tqdm
-    from multiprocessing import cpu_count
-    from concurrent.futures import ProcessPoolExecutor
+    from multiprocessing import Pool, cpu_count
 
     # Import our tokenizer
     sys.path.insert(0, str(Path(__file__).parent))
@@ -217,7 +229,6 @@ def prepare_data(
     # Find all segmented files
     seg_files = sorted(data_dir.rglob("*.seg.txt"))
     if not seg_files:
-        # Maybe the data_dir points directly to parquet/txt files (not segmented)
         seg_files = sorted(data_dir.rglob("*.txt"))
         seg_files = [f for f in seg_files if "morfessor" not in str(f)]
 
@@ -230,81 +241,91 @@ def prepare_data(
     if num_workers <= 0:
         num_workers = max(1, cpu_count() - 1)
 
-    CHUNK_SIZE = 20_000  # lines per chunk (smaller than scan since encode is heavier)
+    CHUNK_SIZE = 50_000  # lines per chunk
 
     # Resolve tokenizer path for workers
     tokenizer_json = tokenizer_dir / "tokenizer.json" if tokenizer_dir.is_dir() else tokenizer_dir
     tokenizer_path_str = str(tokenizer_json)
     script_dir = str(Path(__file__).parent)
 
-    # Phase 1: Tokenize all files in parallel, write to a temp binary
+    # Phase 1: Tokenize all files, write to temp binary
     temp_bin = output_dir / "all_tokens.tmp.bin"
     total_tokens = 0
     total_unk = 0
 
     logger.info("Tokenizing with %d workers (chunk_size=%d lines)...", num_workers, CHUNK_SIZE)
 
-    with open(temp_bin, "wb") as out_f:
-        for fpath in seg_files:
-            logger.info("  Tokenizing %s ...", fpath.name)
+    # Create temp directory for per-chunk output files
+    tmp_dir = tempfile.mkdtemp(prefix="telugu_prep_")
 
-            if num_workers > 1:
-                # Collect all chunks first, then dispatch
-                chunks = []
-                current_chunk = []
-                line_count = 0
+    try:
+        with open(temp_bin, "wb") as out_f:
+            for fpath in seg_files:
+                logger.info("  Tokenizing %s ...", fpath.name)
 
-                pbar = tqdm(desc=f"{fpath.name} (reading)", unit=" lines")
-                with open(fpath, "r", encoding="utf-8") as f:
-                    for line in f:
-                        current_chunk.append(line)
-                        line_count += 1
+                if num_workers > 1:
+                    # Generator that yields (chunk_lines, temp_dir, chunk_idx) lazily
+                    def chunk_generator(filepath, tmp_d):
+                        """Stream lines from file, yield chunks lazily."""
+                        current_chunk = []
+                        chunk_idx = 0
+                        with open(filepath, "r", encoding="utf-8") as f:
+                            for line in f:
+                                current_chunk.append(line)
+                                if len(current_chunk) >= CHUNK_SIZE:
+                                    yield (current_chunk, tmp_d, chunk_idx)
+                                    chunk_idx += 1
+                                    current_chunk = []
+                        if current_chunk:
+                            yield (current_chunk, tmp_d, chunk_idx)
+
+                    # Count lines first for progress bar (fast — just counts newlines)
+                    with open(fpath, "rb") as f:
+                        line_count = sum(1 for _ in f)
+                    n_chunks = (line_count + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+                    logger.info("    %d lines → ~%d chunks", line_count, n_chunks)
+
+                    # Create pool (workers load tokenizer once each via initializer)
+                    pool = Pool(
+                        processes=num_workers,
+                        initializer=_init_worker,
+                        initargs=(tokenizer_path_str, script_dir),
+                    )
+
+                    # imap preserves order AND streams lazily (no pickle of all chunks at once)
+                    pbar = tqdm(total=n_chunks, desc=fpath.name, unit=" chunks")
+                    for chunk_path, total, unk in pool.imap(
+                        _tokenize_chunk,
+                        chunk_generator(fpath, tmp_dir),
+                    ):
+                        # Read chunk temp file and append to main output
+                        with open(chunk_path, "rb") as cf:
+                            shutil.copyfileobj(cf, out_f)
+                        os.unlink(chunk_path)  # clean up immediately
+                        total_tokens += total
+                        total_unk += unk
                         pbar.update(1)
-                        if len(current_chunk) >= CHUNK_SIZE:
-                            chunks.append(current_chunk)
-                            current_chunk = []
-                if current_chunk:
-                    chunks.append(current_chunk)
-                pbar.close()
 
-                logger.info("    %d lines → %d chunks, dispatching to %d workers...",
-                            line_count, len(chunks), num_workers)
+                    pbar.close()
+                    pool.close()
+                    pool.join()
 
-                # Use initializer so tokenizer is loaded ONCE per worker, not per chunk
-                executor = ProcessPoolExecutor(
-                    max_workers=num_workers,
-                    initializer=_init_worker,
-                    initargs=(tokenizer_path_str, script_dir),
-                )
-
-                # Submit all chunks and get futures in order
-                futures = [executor.submit(_tokenize_chunk, chunk) for chunk in chunks]
-
-                # Collect IN ORDER (preserves document sequence)
-                encode_pbar = tqdm(total=len(futures), desc=f"{fpath.name} (encoding)", unit=" chunks")
-                for fut in futures:
-                    ids_arr, total, unk = fut.result()  # blocks in submission order
-                    if len(ids_arr) > 0:
-                        out_f.write(ids_arr.tobytes())
-                    total_tokens += total
-                    total_unk += unk
-                    encode_pbar.update(1)
-
-                encode_pbar.close()
-                executor.shutdown(wait=False)
-
-            else:
-                # Single-threaded with progress bar
-                with open(fpath, "r", encoding="utf-8") as f:
-                    for line in tqdm(f, desc=fpath.name, unit=" docs"):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        ids = tokenizer.encode(line, add_bos=False, add_eos=True)
-                        total_unk += sum(1 for i in ids if i == tokenizer.unk_id)
-                        total_tokens += len(ids)
-                        arr = np.array(ids, dtype=np.uint32)
-                        out_f.write(arr.tobytes())
+                else:
+                    # Single-threaded with progress bar
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        for line in tqdm(f, desc=fpath.name, unit=" docs"):
+                            line = line.strip()
+                            if not line:
+                                continue
+                            ids = tokenizer.encode(line, add_bos=False, add_eos=True)
+                            total_unk += sum(1 for i in ids if i == tokenizer.unk_id)
+                            total_tokens += len(ids)
+                            arr = np.array(ids, dtype=np.uint32)
+                            out_f.write(arr.tobytes())
+    finally:
+        # Clean up temp directory
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     logger.info("Total tokens: %d", total_tokens)
     logger.info("UNK tokens:   %d (%.2f%%)", total_unk, 100 * total_unk / total_tokens if total_tokens else 0)
