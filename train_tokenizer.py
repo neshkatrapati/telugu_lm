@@ -63,23 +63,40 @@ TELUGU_WORD_RE = re.compile(r"[\u0C00-\u0C7F]+")
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Build vocabulary from segmented corpus
+# Step 1: Build vocabulary from segmented corpus (parallelized)
 # ---------------------------------------------------------------------------
-def build_vocab_from_corpus(corpus_path: Path, separator: str) -> list[tuple[str, int]]:
+
+def _count_chunk(lines: list[str]) -> tuple[Counter, int]:
+    """Worker: count token frequencies in a chunk of lines."""
+    freq: Counter = Counter()
+    total = 0
+    for line in lines:
+        for token in line.split():
+            if token:
+                freq[token] += 1
+                total += 1
+    return freq, total
+
+
+def build_vocab_from_corpus(corpus_path: Path, separator: str, num_workers: int = 0) -> list[tuple[str, int]]:
     """Scan segmented corpus files and count every unique token AS-IS.
 
     CRITICAL: Tokens are NOT stripped of @@. "విద్యార్థు@@" and "విద్యార్థు"
     are counted as separate entries. This is the v2 fix — the model can now
     learn word boundaries.
 
+    Parallelized: streams lines into chunks, dispatches to workers.
+
     Args:
         corpus_path: Path to a .seg.txt file or a directory containing them.
         separator: The morpheme boundary marker (e.g. '@@'). Used for logging only.
+        num_workers: Number of parallel workers (0 = auto).
 
     Returns:
         List of (token, frequency) tuples sorted by frequency descending.
     """
     from tqdm import tqdm
+    from multiprocessing import cpu_count
 
     if corpus_path.is_file():
         seg_files = [corpus_path]
@@ -90,18 +107,59 @@ def build_vocab_from_corpus(corpus_path: Path, separator: str) -> list[tuple[str
         logger.error("No .seg.txt files found in %s", corpus_path)
         sys.exit(1)
 
-    logger.info("Scanning %d segmented file(s) to build vocabulary...", len(seg_files))
+    if num_workers <= 0:
+        num_workers = max(1, cpu_count() - 1)
+
+    CHUNK_SIZE = 50_000  # lines per chunk
+
+    logger.info("Scanning %d segmented file(s) to build vocabulary (%d workers)...",
+                len(seg_files), num_workers)
     token_freq: Counter = Counter()
     total_tokens = 0
 
     for fpath in seg_files:
         logger.info("  Scanning %s", fpath.name)
-        with open(fpath, "r", encoding="utf-8") as f:
-            for line in tqdm(f, desc=fpath.name, unit=" lines"):
-                for token in line.split():
-                    if token:
-                        token_freq[token] += 1
-                        total_tokens += 1
+
+        if num_workers > 1:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+
+            futures = []
+            current_chunk = []
+            line_count = 0
+
+            pbar = tqdm(desc=fpath.name, unit=" lines")
+            executor = ProcessPoolExecutor(max_workers=num_workers)
+
+            with open(fpath, "r", encoding="utf-8") as f:
+                for line in f:
+                    current_chunk.append(line)
+                    line_count += 1
+                    pbar.update(1)
+                    if len(current_chunk) >= CHUNK_SIZE:
+                        futures.append(executor.submit(_count_chunk, current_chunk))
+                        current_chunk = []
+            if current_chunk:
+                futures.append(executor.submit(_count_chunk, current_chunk))
+
+            pbar.set_description(f"{fpath.name} (merging {len(futures)} chunks)")
+
+            for fut in as_completed(futures):
+                freq, total = fut.result()
+                token_freq += freq
+                total_tokens += total
+
+            executor.shutdown(wait=False)
+            pbar.close()
+            logger.info("    %d lines, %d chunks", line_count, len(futures))
+
+        else:
+            # Single-threaded with progress bar
+            with open(fpath, "r", encoding="utf-8") as f:
+                for line in tqdm(f, desc=fpath.name, unit=" lines"):
+                    for token in line.split():
+                        if token:
+                            token_freq[token] += 1
+                            total_tokens += 1
 
     # Count how many are continuation vs word-final
     continuation = sum(1 for t in token_freq if t.endswith(separator))
@@ -154,6 +212,7 @@ def build_tokenizer(
     vocab_size: int = 0,
     bpe_vocab_path: Path = None,
     bpe_merges_path: Path = None,
+    num_workers: int = 0,
 ):
     """Build a unified tokenizer from Morfessor morphemes + BPE subwords.
 
@@ -172,7 +231,7 @@ def build_tokenizer(
 
     # --- Collect Morfessor morphemes ---
     if segmented_corpus is not None:
-        morphemes = build_vocab_from_corpus(segmented_corpus, separator)
+        morphemes = build_vocab_from_corpus(segmented_corpus, separator, num_workers)
     elif morfessor_dir is not None:
         vocab_path = morfessor_dir / "morpheme_vocab.tsv"
         if not vocab_path.exists():
@@ -702,6 +761,10 @@ Examples:
         "--test", type=str, nargs="*", default=None,
         help="Test sentences to tokenize.",
     )
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="Number of parallel workers for corpus scan (default: auto = cpu_count - 1).",
+    )
 
     args = parser.parse_args()
 
@@ -725,6 +788,7 @@ Examples:
         vocab_size=args.vocab_size,
         bpe_vocab_path=bpe_vocab_path,
         bpe_merges_path=bpe_merges_path,
+        num_workers=args.workers,
     )
 
     # Test
