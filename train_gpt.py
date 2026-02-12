@@ -131,22 +131,57 @@ class TrainConfig:
 
 
 # ===========================================================================
-# Phase 1: Data Preparation
+# Phase 1: Data Preparation (parallelized)
 # ===========================================================================
+
+def _tokenize_chunk(args: tuple) -> tuple:
+    """Worker: tokenize a chunk of lines and return uint32 array + stats.
+
+    Each worker loads its own tokenizer (needed for multiprocessing).
+    Returns (np.array of uint32 ids, total_tokens, unk_count).
+    """
+    lines, tokenizer_path = args
+    # Import inside worker (each process needs its own)
+    _sys_path = str(Path(tokenizer_path).parent.parent)
+    if _sys_path not in sys.path:
+        sys.path.insert(0, _sys_path)
+    from train_tokenizer import MorfessorTokenizer
+    tok = MorfessorTokenizer(tokenizer_path)
+
+    ids = []
+    total = 0
+    unk = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        encoded = tok.encode(line, add_bos=False, add_eos=True)
+        unk += sum(1 for i in encoded if i == tok.unk_id)
+        total += len(encoded)
+        ids.extend(encoded)
+    return np.array(ids, dtype=np.uint32), total, unk
+
+
 def prepare_data(
     data_dir: Path,
     tokenizer_dir: Path,
     output_dir: Path,
     val_split: float,
     block_size: int,
+    num_workers: int = 0,
 ):
     """
     Tokenize segmented corpus into memory-mapped binary shards.
 
+    Parallelized: dispatches chunks of lines to worker processes for encoding.
+    Streams results to disk via a growing numpy memmap to avoid RAM explosion.
+
     Reads .seg.txt files, encodes with our Morfessor tokenizer,
-    and writes train.bin / val.bin as uint16 numpy arrays.
+    and writes train.bin / val.bin as uint32 numpy arrays.
     """
     from tqdm import tqdm
+    from multiprocessing import cpu_count
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
     # Import our tokenizer
     sys.path.insert(0, str(Path(__file__).parent))
@@ -182,41 +217,95 @@ def prepare_data(
 
     logger.info("Found %d files to tokenize", len(seg_files))
 
-    # Tokenize everything into a list of token IDs
-    all_ids = []
-    total_unk = 0
-    total_tokens = 0
+    if num_workers <= 0:
+        num_workers = max(1, cpu_count() - 1)
 
-    for fpath in seg_files:
-        logger.info("Tokenizing %s ...", fpath.name)
-        with open(fpath, "r", encoding="utf-8") as f:
-            for line in tqdm(f, desc=fpath.name, unit=" docs"):
-                line = line.strip()
-                if not line:
-                    continue
-                ids = tokenizer.encode(line, add_bos=False, add_eos=True)
-                total_unk += sum(1 for i in ids if i == tokenizer.unk_id)
-                total_tokens += len(ids)
-                all_ids.extend(ids)
+    CHUNK_SIZE = 20_000  # lines per chunk (smaller than scan since encode is heavier)
+
+    # Resolve tokenizer path for workers
+    tokenizer_json = tokenizer_dir / "tokenizer.json" if tokenizer_dir.is_dir() else tokenizer_dir
+    tokenizer_path_str = str(tokenizer_json)
+
+    # Phase 1: Tokenize all files in parallel, write to a temp binary
+    temp_bin = output_dir / "all_tokens.tmp.bin"
+    total_tokens = 0
+    total_unk = 0
+
+    logger.info("Tokenizing with %d workers (chunk_size=%d lines)...", num_workers, CHUNK_SIZE)
+
+    with open(temp_bin, "wb") as out_f:
+        for fpath in seg_files:
+            logger.info("  Tokenizing %s ...", fpath.name)
+
+            if num_workers > 1:
+                futures = []
+                current_chunk = []
+                line_count = 0
+
+                pbar = tqdm(desc=fpath.name, unit=" lines")
+                executor = ProcessPoolExecutor(max_workers=num_workers)
+
+                with open(fpath, "r", encoding="utf-8") as f:
+                    for line in f:
+                        current_chunk.append(line)
+                        line_count += 1
+                        pbar.update(1)
+                        if len(current_chunk) >= CHUNK_SIZE:
+                            futures.append(executor.submit(_tokenize_chunk, (current_chunk, tokenizer_path_str)))
+                            current_chunk = []
+                if current_chunk:
+                    futures.append(executor.submit(_tokenize_chunk, (current_chunk, tokenizer_path_str)))
+
+                pbar.set_description(f"{fpath.name} (encoding {len(futures)} chunks)")
+
+                # Collect results and write to temp file
+                for fut in as_completed(futures):
+                    ids_arr, total, unk = fut.result()
+                    if len(ids_arr) > 0:
+                        out_f.write(ids_arr.tobytes())
+                    total_tokens += total
+                    total_unk += unk
+
+                executor.shutdown(wait=False)
+                pbar.close()
+                logger.info("    %d lines, %d chunks", line_count, len(futures))
+
+            else:
+                # Single-threaded with progress bar
+                with open(fpath, "r", encoding="utf-8") as f:
+                    for line in tqdm(f, desc=fpath.name, unit=" docs"):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        ids = tokenizer.encode(line, add_bos=False, add_eos=True)
+                        total_unk += sum(1 for i in ids if i == tokenizer.unk_id)
+                        total_tokens += len(ids)
+                        arr = np.array(ids, dtype=np.uint32)
+                        out_f.write(arr.tobytes())
 
     logger.info("Total tokens: %d", total_tokens)
     logger.info("UNK tokens:   %d (%.2f%%)", total_unk, 100 * total_unk / total_tokens if total_tokens else 0)
 
-    # Convert to numpy uint32 (supports vocab > 65K)
-    all_ids_np = np.array(all_ids, dtype=np.uint32)
+    # Phase 2: Split into train/val from the temp binary
+    temp_size = os.path.getsize(temp_bin)
+    n_total = temp_size // 4  # uint32 = 4 bytes
+    n_val = int(n_total * val_split)
+    n_train = n_total - n_val
 
-    # Split train/val
-    n_val = int(len(all_ids_np) * val_split)
-    n_train = len(all_ids_np) - n_val
+    logger.info("Splitting: %d train + %d val tokens", n_train, n_val)
 
-    # Shuffle at document boundary would be better, but for simplicity
-    # we take the last N tokens as val (avoids data leakage since docs are ordered)
-    train_ids = all_ids_np[:n_train]
-    val_ids = all_ids_np[n_train:]
+    # Memory-map the temp file and write train/val splits
+    all_data = np.memmap(str(temp_bin), dtype=np.uint32, mode="r", shape=(n_total,))
 
-    # Write binary files
+    train_ids = all_data[:n_train]
+    val_ids = all_data[n_train:]
+
     train_ids.tofile(str(train_bin))
     val_ids.tofile(str(val_bin))
+
+    # Clean up temp file
+    del all_data
+    temp_bin.unlink()
 
     train_gb = os.path.getsize(train_bin) / 1e9
     val_gb = os.path.getsize(val_bin) / 1e9
@@ -929,6 +1018,7 @@ Examples:
     prep.add_argument("--tokenizer", type=str, default="./tokenizer", help="Tokenizer directory")
     prep.add_argument("--output", type=str, default="./train_data", help="Output directory for binary shards")
     prep.add_argument("--val-split", type=float, default=0.02, help="Validation split ratio (default: 0.02)")
+    prep.add_argument("--workers", type=int, default=0, help="Number of parallel workers (default: auto = cpu_count - 1)")
 
     # Train
     tr = subparsers.add_parser("train", help="Train LLaMA-style model")
@@ -959,6 +1049,7 @@ Examples:
     al.add_argument("--save-interval", type=int, default=500, help="Steps between checkpoints (default: 500)")
     al.add_argument("--wandb", type=str, default="", help="W&B project name (enables logging)")
     al.add_argument("--wandb-name", type=str, default="", help="W&B run name (optional)")
+    al.add_argument("--workers", type=int, default=0, help="Number of parallel workers for data prep (default: auto)")
 
     # Generate
     gen = subparsers.add_parser("generate", help="Generate text from trained model")
@@ -982,6 +1073,7 @@ Examples:
         prepare_data(
             Path(args.data), Path(args.tokenizer), Path(args.output),
             args.val_split, model_config.block_size,
+            num_workers=args.workers,
         )
 
     elif args.command == "train":
@@ -1012,6 +1104,7 @@ Examples:
         prepare_data(
             Path(args.data), Path(args.tokenizer), output_dir,
             train_config.val_split, model_config.block_size,
+            num_workers=args.workers,
         )
         train(output_dir, Path(args.tokenizer), model_config, train_config)
 
