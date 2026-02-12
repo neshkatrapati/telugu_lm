@@ -134,29 +134,37 @@ class TrainConfig:
 # Phase 1: Data Preparation (parallelized)
 # ===========================================================================
 
-def _tokenize_chunk(args: tuple) -> tuple:
-    """Worker: tokenize a chunk of lines and return uint32 array + stats.
+# --- Worker globals (initialized once per process via initializer) ---
+_worker_tok = None  # type: MorfessorTokenizer | None
 
-    Each worker loads its own tokenizer (needed for multiprocessing).
+
+def _init_worker(tokenizer_path: str, script_dir: str):
+    """Process pool initializer — loads tokenizer ONCE per worker process."""
+    global _worker_tok
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    from train_tokenizer import MorfessorTokenizer
+    _worker_tok = MorfessorTokenizer(tokenizer_path)
+
+
+def _tokenize_chunk(lines: list) -> tuple:
+    """Worker: tokenize a chunk of lines using the pre-loaded tokenizer.
+
     Returns (np.array of uint32 ids, total_tokens, unk_count).
     """
-    lines, tokenizer_path = args
-    # Import inside worker (each process needs its own)
-    _sys_path = str(Path(tokenizer_path).parent.parent)
-    if _sys_path not in sys.path:
-        sys.path.insert(0, _sys_path)
-    from train_tokenizer import MorfessorTokenizer
-    tok = MorfessorTokenizer(tokenizer_path)
+    global _worker_tok
+    tok = _worker_tok
 
     ids = []
     total = 0
     unk = 0
+    unk_id = tok.unk_id
     for line in lines:
         line = line.strip()
         if not line:
             continue
         encoded = tok.encode(line, add_bos=False, add_eos=True)
-        unk += sum(1 for i in encoded if i == tok.unk_id)
+        unk += sum(1 for i in encoded if i == unk_id)
         total += len(encoded)
         ids.extend(encoded)
     return np.array(ids, dtype=np.uint32), total, unk
@@ -174,14 +182,16 @@ def prepare_data(
     Tokenize segmented corpus into memory-mapped binary shards.
 
     Parallelized: dispatches chunks of lines to worker processes for encoding.
-    Streams results to disk via a growing numpy memmap to avoid RAM explosion.
+    Each worker loads the tokenizer ONCE (via pool initializer), not per-chunk.
+    Writes results in document order to preserve sequential structure.
+    Streams to disk to avoid RAM explosion.
 
     Reads .seg.txt files, encodes with our Morfessor tokenizer,
     and writes train.bin / val.bin as uint32 numpy arrays.
     """
     from tqdm import tqdm
     from multiprocessing import cpu_count
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures import ProcessPoolExecutor
 
     # Import our tokenizer
     sys.path.insert(0, str(Path(__file__).parent))
@@ -225,6 +235,7 @@ def prepare_data(
     # Resolve tokenizer path for workers
     tokenizer_json = tokenizer_dir / "tokenizer.json" if tokenizer_dir.is_dir() else tokenizer_dir
     tokenizer_path_str = str(tokenizer_json)
+    script_dir = str(Path(__file__).parent)
 
     # Phase 1: Tokenize all files in parallel, write to a temp binary
     temp_bin = output_dir / "all_tokens.tmp.bin"
@@ -238,37 +249,49 @@ def prepare_data(
             logger.info("  Tokenizing %s ...", fpath.name)
 
             if num_workers > 1:
-                futures = []
+                # Collect all chunks first, then dispatch
+                chunks = []
                 current_chunk = []
                 line_count = 0
 
-                pbar = tqdm(desc=fpath.name, unit=" lines")
-                executor = ProcessPoolExecutor(max_workers=num_workers)
-
+                pbar = tqdm(desc=f"{fpath.name} (reading)", unit=" lines")
                 with open(fpath, "r", encoding="utf-8") as f:
                     for line in f:
                         current_chunk.append(line)
                         line_count += 1
                         pbar.update(1)
                         if len(current_chunk) >= CHUNK_SIZE:
-                            futures.append(executor.submit(_tokenize_chunk, (current_chunk, tokenizer_path_str)))
+                            chunks.append(current_chunk)
                             current_chunk = []
                 if current_chunk:
-                    futures.append(executor.submit(_tokenize_chunk, (current_chunk, tokenizer_path_str)))
+                    chunks.append(current_chunk)
+                pbar.close()
 
-                pbar.set_description(f"{fpath.name} (encoding {len(futures)} chunks)")
+                logger.info("    %d lines → %d chunks, dispatching to %d workers...",
+                            line_count, len(chunks), num_workers)
 
-                # Collect results and write to temp file
-                for fut in as_completed(futures):
-                    ids_arr, total, unk = fut.result()
+                # Use initializer so tokenizer is loaded ONCE per worker, not per chunk
+                executor = ProcessPoolExecutor(
+                    max_workers=num_workers,
+                    initializer=_init_worker,
+                    initargs=(tokenizer_path_str, script_dir),
+                )
+
+                # Submit all chunks and get futures in order
+                futures = [executor.submit(_tokenize_chunk, chunk) for chunk in chunks]
+
+                # Collect IN ORDER (preserves document sequence)
+                encode_pbar = tqdm(total=len(futures), desc=f"{fpath.name} (encoding)", unit=" chunks")
+                for fut in futures:
+                    ids_arr, total, unk = fut.result()  # blocks in submission order
                     if len(ids_arr) > 0:
                         out_f.write(ids_arr.tobytes())
                     total_tokens += total
                     total_unk += unk
+                    encode_pbar.update(1)
 
+                encode_pbar.close()
                 executor.shutdown(wait=False)
-                pbar.close()
-                logger.info("    %d lines, %d chunks", line_count, len(futures))
 
             else:
                 # Single-threaded with progress bar
