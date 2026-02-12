@@ -213,6 +213,7 @@ def build_tokenizer(
     bpe_vocab_path: Path = None,
     bpe_merges_path: Path = None,
     num_workers: int = 0,
+    min_freq: int = 2,
 ):
     """Build a unified tokenizer from Morfessor morphemes + BPE subwords.
 
@@ -227,11 +228,20 @@ def build_tokenizer(
         vocab_size: Cap vocab at this size (0 = use all).
         bpe_vocab_path: Path to bpe_vocab.tsv from train_bpe.py.
         bpe_merges_path: Path to bpe_merges.txt from train_bpe.py.
+        min_freq: Minimum token frequency to include in vocab (default: 2).
     """
 
     # --- Collect Morfessor morphemes ---
     if segmented_corpus is not None:
         morphemes = build_vocab_from_corpus(segmented_corpus, separator, num_workers)
+
+        # Filter by minimum frequency — removes rare junk (URLs, garbage, hapax legomena)
+        if min_freq > 1:
+            before = len(morphemes)
+            morphemes = [(tok, freq) for tok, freq in morphemes if freq >= min_freq]
+            dropped = before - len(morphemes)
+            logger.info("Filtered by min_freq=%d: %d -> %d types (%d rare tokens dropped)",
+                        min_freq, before, len(morphemes), dropped)
     elif morfessor_dir is not None:
         vocab_path = morfessor_dir / "morpheme_vocab.tsv"
         if not vocab_path.exists():
@@ -765,6 +775,10 @@ Examples:
         "--workers", type=int, default=0,
         help="Number of parallel workers for corpus scan (default: auto = cpu_count - 1).",
     )
+    parser.add_argument(
+        "--min-freq", type=int, default=2,
+        help="Minimum token frequency to include in vocab. Filters rare junk (default: 2).",
+    )
 
     args = parser.parse_args()
 
@@ -789,6 +803,7 @@ Examples:
         bpe_vocab_path=bpe_vocab_path,
         bpe_merges_path=bpe_merges_path,
         num_workers=args.workers,
+        min_freq=args.min_freq,
     )
 
     # Test
