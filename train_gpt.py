@@ -131,44 +131,8 @@ class TrainConfig:
 
 
 # ===========================================================================
-# Phase 1: Data Preparation (parallelized)
+# Phase 1: Data Preparation
 # ===========================================================================
-
-# --- Worker globals (initialized once per process via pool initializer) ---
-_worker_tok = None
-
-
-def _init_worker(tokenizer_path: str, script_dir: str):
-    """Pool initializer — loads tokenizer ONCE per worker process."""
-    global _worker_tok
-    if script_dir not in sys.path:
-        sys.path.insert(0, script_dir)
-    from train_tokenizer import MorfessorTokenizer
-    _worker_tok = MorfessorTokenizer(tokenizer_path)
-
-
-def _tokenize_chunk(chunk_info: tuple) -> str:
-    """Worker: tokenize lines and write results to a temp file.
-
-    Uses encode_lines_to_array() for batch encoding (local var refs,
-    BPE cache, no per-line overhead). Writes to per-chunk temp file
-    to avoid pickling large arrays back via IPC.
-    """
-    global _worker_tok
-    tok = _worker_tok
-
-    chunk_lines, temp_dir, chunk_idx = chunk_info
-
-    # Batch encode — much faster than per-line encode()
-    arr, total, unk = tok.encode_lines_to_array(chunk_lines, add_eos=True)
-
-    # Write to per-chunk temp file
-    chunk_path = os.path.join(temp_dir, f"chunk_{chunk_idx:06d}.bin")
-    arr.tofile(chunk_path)
-
-    return chunk_path, total, unk
-
-
 def prepare_data(
     data_dir: Path,
     tokenizer_dir: Path,
@@ -180,19 +144,14 @@ def prepare_data(
     """
     Tokenize segmented corpus into memory-mapped binary shards.
 
-    Parallelized via multiprocessing.Pool with imap (ordered, streaming):
-      - Each worker loads the tokenizer ONCE (via pool initializer)
-      - Workers write encoded tokens to per-chunk temp files (no IPC pickle bottleneck)
-      - Results streamed back in order, temp files concatenated to final binary
-      - Lines streamed from file → chunks dispatched lazily (low memory)
+    Simple single-threaded approach with per-line progress bar and
+    streaming writes to disk. Uses encode_lines_to_array() with BPE
+    cache for speed.
 
     Reads .seg.txt files, encodes with our Morfessor tokenizer,
     and writes train.bin / val.bin as uint32 numpy arrays.
     """
-    import tempfile
-    import shutil
     from tqdm import tqdm
-    from multiprocessing import Pool, cpu_count
 
     # Import our tokenizer
     sys.path.insert(0, str(Path(__file__).parent))
@@ -227,102 +186,102 @@ def prepare_data(
 
     logger.info("Found %d files to tokenize", len(seg_files))
 
-    if num_workers <= 0:
-        num_workers = max(1, cpu_count() - 1)
+    # Local refs for hot-path speed
+    _get = tokenizer.token_to_id.get
+    _unk = tokenizer.unk_id
+    _eos = tokenizer.eos_id
+    _sep = tokenizer.separator
+    _sep_len = len(_sep)
+    _is_tel = tokenizer._is_telugu
+    _bpe = tokenizer._encode_token_bpe
+    _id2tok = tokenizer.id_to_token
 
-    CHUNK_SIZE = 50_000  # lines per chunk
-
-    # Resolve tokenizer path for workers
-    tokenizer_json = tokenizer_dir / "tokenizer.json" if tokenizer_dir.is_dir() else tokenizer_dir
-    tokenizer_path_str = str(tokenizer_json)
-    script_dir = str(Path(__file__).parent)
-
-    # Phase 1: Tokenize all files, write to temp binary
+    # Stream-write to temp binary (avoids holding all IDs in RAM)
     temp_bin = output_dir / "all_tokens.tmp.bin"
     total_tokens = 0
     total_unk = 0
 
-    logger.info("Tokenizing with %d workers (chunk_size=%d lines)...", num_workers, CHUNK_SIZE)
+    # Micro-batch: encode N lines at a time, write as one array
+    BATCH_SIZE = 1000  # lines per micro-batch write
 
-    # Create temp directory for per-chunk output files
-    tmp_dir = tempfile.mkdtemp(prefix="telugu_prep_")
+    with open(temp_bin, "wb") as out_f:
+        for fpath in seg_files:
+            fsize_mb = os.path.getsize(fpath) / 1e6
+            logger.info("  Tokenizing %s (%.0f MB)...", fpath.name, fsize_mb)
 
-    try:
-        with open(temp_bin, "wb") as out_f:
-            for fpath in seg_files:
-                logger.info("  Tokenizing %s ...", fpath.name)
+            batch_ids = []
+            batch_unk = 0
+            batch_total = 0
+            line_in_batch = 0
 
-                if num_workers > 1:
-                    # --- Step A: Stream lines, build chunks, submit to pool ---
-                    # Progress bar ticks per line as file is read (user sees 7M lines ticking)
-                    pool = Pool(
-                        processes=num_workers,
-                        initializer=_init_worker,
-                        initargs=(tokenizer_path_str, script_dir),
-                    )
+            with open(fpath, "r", encoding="utf-8") as f:
+                for line in tqdm(f, desc=fpath.name, unit=" lines", mininterval=0.5):
+                    line = line.strip()
+                    if not line:
+                        continue
 
-                    current_chunk = []
-                    chunk_idx = 0
-                    async_results = []  # (AsyncResult, chunk_idx) in submission order
-                    line_count = 0
+                    # Inline encode — avoids method call overhead per line
+                    for token in line.split():
+                        tid = _get(token)
+                        if tid is not None:
+                            batch_ids.append(tid)
+                            batch_total += 1
+                            if tid == _unk:
+                                batch_unk += 1
+                            continue
 
-                    pbar = tqdm(desc=f"{fpath.name} (reading)", unit=" lines")
-                    with open(fpath, "r", encoding="utf-8") as f:
-                        for line in f:
-                            current_chunk.append(line)
-                            line_count += 1
-                            pbar.update(1)
-                            if len(current_chunk) >= CHUNK_SIZE:
-                                ar = pool.apply_async(
-                                    _tokenize_chunk,
-                                    ((current_chunk, tmp_dir, chunk_idx),),
-                                )
-                                async_results.append(ar)
-                                chunk_idx += 1
-                                current_chunk = []
-                    if current_chunk:
-                        ar = pool.apply_async(
-                            _tokenize_chunk,
-                            ((current_chunk, tmp_dir, chunk_idx),),
-                        )
-                        async_results.append(ar)
-                        chunk_idx += 1
-                    pbar.close()
+                        # Slow path: fallback
+                        batch_total += 1
+                        is_cont = token.endswith(_sep)
+                        bare = token[:-_sep_len] if is_cont else token
 
-                    logger.info("    %d lines → %d chunks, waiting for %d workers...",
-                                line_count, len(async_results), num_workers)
+                        if not _is_tel(bare):
+                            sub_ids = _bpe(bare)
+                            if is_cont and sub_ids:
+                                last_str = _id2tok.get(sub_ids[-1], "")
+                                if not last_str.endswith(_sep):
+                                    ct = _get(last_str + _sep)
+                                    if ct is not None:
+                                        sub_ids[-1] = ct
+                            batch_ids.extend(sub_ids)
+                            batch_unk += sum(1 for i in sub_ids if i == _unk)
+                        else:
+                            n = len(bare)
+                            if is_cont:
+                                for i, ch in enumerate(bare):
+                                    if i < n - 1:
+                                        batch_ids.append(_get(ch + _sep, _unk))
+                                    else:
+                                        batch_ids.append(_get(ch + _sep, _get(ch, _unk)))
+                            else:
+                                for i, ch in enumerate(bare):
+                                    if i < n - 1:
+                                        batch_ids.append(_get(ch + _sep, _unk))
+                                    else:
+                                        batch_ids.append(_get(ch, _unk))
 
-                    # --- Step B: Collect results IN ORDER, write to output ---
-                    encode_pbar = tqdm(total=len(async_results),
-                                       desc=f"{fpath.name} (encoding)", unit=" chunks")
-                    for ar in async_results:
-                        chunk_path, total, unk = ar.get()  # blocks in submission order
-                        with open(chunk_path, "rb") as cf:
-                            shutil.copyfileobj(cf, out_f)
-                        os.unlink(chunk_path)
-                        total_tokens += total
-                        total_unk += unk
-                        encode_pbar.update(1)
+                    # Append EOS after each document
+                    batch_ids.append(_eos)
+                    batch_total += 1
+                    line_in_batch += 1
 
-                    encode_pbar.close()
-                    pool.close()
-                    pool.join()
+                    # Flush micro-batch to disk periodically
+                    if line_in_batch >= BATCH_SIZE:
+                        arr = np.array(batch_ids, dtype=np.uint32)
+                        out_f.write(arr.tobytes())
+                        total_tokens += batch_total
+                        total_unk += batch_unk
+                        batch_ids = []
+                        batch_unk = 0
+                        batch_total = 0
+                        line_in_batch = 0
 
-                else:
-                    # Single-threaded with progress bar
-                    with open(fpath, "r", encoding="utf-8") as f:
-                        for line in tqdm(f, desc=fpath.name, unit=" docs"):
-                            line = line.strip()
-                            if not line:
-                                continue
-                            ids = tokenizer.encode(line, add_bos=False, add_eos=True)
-                            total_unk += sum(1 for i in ids if i == tokenizer.unk_id)
-                            total_tokens += len(ids)
-                            arr = np.array(ids, dtype=np.uint32)
-                            out_f.write(arr.tobytes())
-    finally:
-        # Clean up temp directory
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+            # Flush remaining
+            if batch_ids:
+                arr = np.array(batch_ids, dtype=np.uint32)
+                out_f.write(arr.tobytes())
+                total_tokens += batch_total
+                total_unk += batch_unk
 
     logger.info("Total tokens: %d", total_tokens)
     logger.info("UNK tokens:   %d (%.2f%%)", total_unk, 100 * total_unk / total_tokens if total_tokens else 0)
@@ -335,16 +294,9 @@ def prepare_data(
 
     logger.info("Splitting: %d train + %d val tokens", n_train, n_val)
 
-    # Memory-map the temp file and write train/val splits
     all_data = np.memmap(str(temp_bin), dtype=np.uint32, mode="r", shape=(n_total,))
-
-    train_ids = all_data[:n_train]
-    val_ids = all_data[n_train:]
-
-    train_ids.tofile(str(train_bin))
-    val_ids.tofile(str(val_bin))
-
-    # Clean up temp file
+    all_data[:n_train].tofile(str(train_bin))
+    all_data[n_train:].tofile(str(val_bin))
     del all_data
     temp_bin.unlink()
 
