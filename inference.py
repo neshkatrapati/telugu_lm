@@ -128,15 +128,14 @@ def generate(model, token_ids: list[int], max_new_tokens: int, temperature: floa
     return idx[0].tolist()
 
 
-def desegment(text: str) -> str:
+def desegment(text: str, morf_model, separator: str = "@@") -> str:
     """Reconstruct natural text from space-separated morphemes.
 
-    The tokenizer decode gives us morphemes separated by spaces. We need to
-    merge consecutive Telugu morphemes back into words, since the original
-    text had no spaces between morphemes of the same word.
-
-    Logic: if a token ends with a Telugu character and the next token starts
-    with a Telugu character, they belong to the same word — remove the space.
+    The tokenizer stores bare morphemes (no @@), so at decode time we can't
+    tell which morphemes belong to the same word. We use Morfessor to
+    reconstruct: greedily join consecutive Telugu morphemes and check if
+    Morfessor would segment the joined form back into those same morphemes.
+    If yes, they're one word. If not, they're separate words.
     """
     if not text:
         return text
@@ -146,18 +145,40 @@ def desegment(text: str) -> str:
     if not tokens:
         return text
 
-    result = [tokens[0]]
-    for i in range(1, len(tokens)):
-        prev = tokens[i - 1]
-        curr = tokens[i]
-        # If previous token ends with Telugu and current starts with Telugu,
-        # they are morphemes of the same word — merge without space
-        if prev and curr and TELUGU_CHAR.search(prev[-1]) and TELUGU_CHAR.search(curr[0]):
-            result.append(curr)  # no space
+    # Group consecutive Telugu tokens, keep non-Telugu tokens as-is
+    groups = []  # each group is (is_telugu, [tokens])
+    for token in tokens:
+        is_telugu = bool(TELUGU_CHAR.search(token))
+        if groups and groups[-1][0] == is_telugu and is_telugu:
+            groups[-1][1].append(token)
         else:
-            result.append(" " + curr)
+            groups.append((is_telugu, [token]))
 
-    return "".join(result)
+    # For each group of Telugu morphemes, try to reconstruct words
+    result_parts = []
+    for is_telugu, group_tokens in groups:
+        if not is_telugu:
+            result_parts.append(" ".join(group_tokens))
+            continue
+
+        # Greedily build words from morphemes using Morfessor validation
+        words = []
+        i = 0
+        while i < len(group_tokens):
+            # Try joining morphemes starting from position i
+            # Start with longest possible, shrink until Morfessor agrees
+            best_end = i + 1  # at minimum, one morpheme = one word
+            for j in range(min(i + 8, len(group_tokens)), i, -1):
+                candidate = "".join(group_tokens[i:j])
+                segments = morf_model.viterbi_segment(candidate)[0]
+                if segments == group_tokens[i:j]:
+                    best_end = j
+                    break
+            words.append("".join(group_tokens[i:best_end]))
+            i = best_end
+        result_parts.append(" ".join(words))
+
+    return " ".join(result_parts)
 
 
 def run_inference(
@@ -194,9 +215,9 @@ def run_inference(
     if verbose:
         print(f"  [Raw decode] {raw_generated[:200]}")
 
-    # Step 5: Desegment — merge morphemes back into words
-    generated_text = desegment(raw_text)
-    generated_only = desegment(raw_generated)
+    # Step 5: Desegment — merge morphemes back into words using Morfessor
+    generated_text = desegment(raw_text, morf_model, separator)
+    generated_only = desegment(raw_generated, morf_model, separator)
 
     if verbose:
         print(f"  [Generated]  {len(output_ids) - len(token_ids)} new tokens")
