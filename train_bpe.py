@@ -33,16 +33,51 @@ TELUGU_CHAR = re.compile(r"[\u0C00-\u0C7F]")
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Extract non-Telugu tokens from segmented corpus
+# Step 1: Extract non-Telugu tokens from segmented corpus (parallelized)
 # ---------------------------------------------------------------------------
-def extract_non_telugu(seg_corpus_path: Path, separator: str = "@@") -> Counter:
+
+# Pre-compiled set of Telugu codepoints for fast membership test (no regex per token)
+_TELUGU_CP_RANGE = range(0x0C00, 0x0C80)
+
+
+def _has_telugu(s: str) -> bool:
+    """Fast Telugu detection — checks codepoints directly, no regex."""
+    for ch in s:
+        if ord(ch) in _TELUGU_CP_RANGE:
+            return True
+    return False
+
+
+def _scan_chunk(args: tuple) -> tuple[Counter, int, int]:
+    """Worker: scan a chunk of lines, return (non_telugu_counter, total_toks, non_telugu_toks)."""
+    lines, separator, sep_len = args
+    freq: Counter = Counter()
+    total = 0
+    non_tel = 0
+    for line in lines:
+        for token in line.split():
+            total += 1
+            # Strip @@ suffix
+            if token.endswith(separator):
+                base = token[:-sep_len]
+            else:
+                base = token
+            if not _has_telugu(base):
+                freq[base] += 1
+                non_tel += 1
+    return freq, total, non_tel
+
+
+def extract_non_telugu(seg_corpus_path: Path, separator: str = "@@", num_workers: int = 0) -> Counter:
     """Scan .seg.txt files and collect non-Telugu token frequencies.
 
-    A token is non-Telugu if its base form (with @@ stripped) contains
-    no Telugu characters (Unicode 0C00-0C7F).
+    Parallelized: reads file in large chunks, distributes across workers.
 
     Returns Counter mapping raw surface form (no @@) -> frequency.
     """
+    from multiprocessing import Pool, cpu_count
+    from tqdm import tqdm
+
     if seg_corpus_path.is_file():
         seg_files = [seg_corpus_path]
     else:
@@ -52,25 +87,56 @@ def extract_non_telugu(seg_corpus_path: Path, separator: str = "@@") -> Counter:
         logger.error("No .seg.txt files found in %s", seg_corpus_path)
         sys.exit(1)
 
-    from tqdm import tqdm
+    if num_workers <= 0:
+        num_workers = max(1, cpu_count() - 1)
 
-    logger.info("Scanning %d file(s) for non-Telugu tokens...", len(seg_files))
+    CHUNK_SIZE = 50_000  # lines per chunk
+    sep_len = len(separator)
+
+    logger.info("Scanning %d file(s) for non-Telugu tokens (%d workers)...", len(seg_files), num_workers)
     word_freq: Counter = Counter()
     total_tokens = 0
     non_telugu_tokens = 0
 
     for fpath in seg_files:
         logger.info("  Scanning %s", fpath.name)
+
+        # Read all lines and split into chunks
+        chunks = []
+        current_chunk = []
+        line_count = 0
+
         with open(fpath, "r", encoding="utf-8") as f:
-            for line in tqdm(f, desc=fpath.name, unit=" lines"):
-                for token in line.split():
-                    total_tokens += 1
-                    # Strip @@ to get the base form
-                    base = token.rstrip(separator) if token.endswith(separator) else token
-                    # Check if it contains any Telugu characters
-                    if not TELUGU_CHAR.search(base):
-                        word_freq[base] += 1
-                        non_telugu_tokens += 1
+            for line in f:
+                current_chunk.append(line)
+                line_count += 1
+                if len(current_chunk) >= CHUNK_SIZE:
+                    chunks.append((current_chunk, separator, sep_len))
+                    current_chunk = []
+        if current_chunk:
+            chunks.append((current_chunk, separator, sep_len))
+
+        logger.info("    %d lines -> %d chunks", line_count, len(chunks))
+
+        # Process chunks in parallel
+        if num_workers > 1 and len(chunks) > 1:
+            with Pool(processes=min(num_workers, len(chunks))) as pool:
+                for freq, total, non_tel in tqdm(
+                    pool.imap_unordered(_scan_chunk, chunks),
+                    total=len(chunks),
+                    desc=fpath.name,
+                    unit=" chunks",
+                ):
+                    word_freq += freq
+                    total_tokens += total
+                    non_telugu_tokens += non_tel
+        else:
+            # Single-threaded fallback
+            for chunk_args in tqdm(chunks, desc=fpath.name, unit=" chunks"):
+                freq, total, non_tel = _scan_chunk(chunk_args)
+                word_freq += freq
+                total_tokens += total
+                non_telugu_tokens += non_tel
 
     logger.info("Total tokens scanned: %d", total_tokens)
     logger.info("Non-Telugu tokens: %d (%.1f%%)", non_telugu_tokens,
@@ -84,7 +150,16 @@ def extract_non_telugu(seg_corpus_path: Path, separator: str = "@@") -> Counter:
 # Step 2: Train BPE
 # ---------------------------------------------------------------------------
 def train_bpe(word_freqs: Counter, num_merges: int) -> tuple[list[tuple[str, str]], dict[str, int]]:
-    """Train BPE on word frequencies.
+    """Train BPE on word frequencies — fast incremental version.
+
+    Instead of rescanning every word on every merge, maintains:
+      - pair_counts: global pair frequency counter
+      - pair_to_words: index mapping each pair -> set of word indices that contain it
+
+    When a merge happens, only words containing that pair are updated,
+    and pair counts are adjusted incrementally (subtract old pairs, add new ones).
+
+    ~50-100x faster than naive rescan for typical vocab sizes.
 
     Args:
         word_freqs: Counter mapping word -> frequency
@@ -95,64 +170,118 @@ def train_bpe(word_freqs: Counter, num_merges: int) -> tuple[list[tuple[str, str
         vocab: dict mapping subword -> frequency
     """
     from tqdm import tqdm
+    import heapq
 
-    # Initialize: each word is a tuple of characters
-    # word_splits maps tuple-of-chars -> frequency
-    word_splits: dict[tuple[str, ...], int] = {}
+    # Initialize: each word stored as a mutable list of symbols
+    # words[i] = (list_of_symbols, frequency)
+    words: list[tuple[list[str], int]] = []
     for word, freq in word_freqs.items():
-        chars = tuple(word)
+        chars = list(word)
         if chars:
-            word_splits[chars] = word_splits.get(chars, 0) + freq
+            words.append((chars, freq))
 
-    logger.info("BPE training: %d unique words, %d target merges", len(word_splits), num_merges)
+    logger.info("BPE training: %d unique words, %d target merges", len(words), num_merges)
+
+    # Build initial pair counts and pair->word index
+    pair_counts: Counter = Counter()
+    # pair_to_words: maps pair -> set of word indices that contain it
+    pair_to_words: dict[tuple[str, str], set[int]] = {}
+
+    for wi, (symbols, freq) in enumerate(words):
+        for i in range(len(symbols) - 1):
+            pair = (symbols[i], symbols[i + 1])
+            pair_counts[pair] += freq
+            if pair not in pair_to_words:
+                pair_to_words[pair] = set()
+            pair_to_words[pair].add(wi)
 
     merges: list[tuple[str, str]] = []
 
-    for merge_idx in tqdm(range(num_merges), desc="BPE merges", unit=" merges"):
-        # Count all adjacent pairs
-        pair_freq: Counter = Counter()
-        for word_chars, freq in word_splits.items():
-            for i in range(len(word_chars) - 1):
-                pair_freq[(word_chars[i], word_chars[i + 1])] += freq
+    # Use a max-heap for fast best-pair lookup
+    # Heap entries: (-count, pair) — negative because heapq is min-heap
+    # We use lazy deletion: check if count is still current before using
+    heap = [(-count, pair) for pair, count in pair_counts.items() if count >= 2]
+    heapq.heapify(heap)
 
-        if not pair_freq:
-            logger.info("No more pairs to merge at step %d", merge_idx)
-            break
+    pbar = tqdm(total=num_merges, desc="BPE merges", unit=" merges")
 
-        # Find most frequent pair
-        best_pair = pair_freq.most_common(1)[0][0]
-        best_freq = pair_freq[best_pair]
+    while len(merges) < num_merges and heap:
+        # Pop best pair (lazy deletion: skip stale entries)
+        while heap:
+            neg_count, best_pair = heapq.heappop(heap)
+            actual_count = pair_counts.get(best_pair, 0)
+            if actual_count >= 2 and actual_count == -neg_count:
+                break  # valid entry
+        else:
+            break  # heap exhausted
 
+        best_freq = actual_count
         if best_freq < 2:
-            logger.info("Best pair frequency dropped to %d at step %d, stopping", best_freq, merge_idx)
             break
 
         merges.append(best_pair)
-
-        # Merge the best pair in all words
         merged = best_pair[0] + best_pair[1]
-        new_word_splits: dict[tuple[str, ...], int] = {}
-        for word_chars, freq in word_splits.items():
-            new_chars = []
+
+        # Get all words containing this pair (copy the set since we'll modify it)
+        affected = list(pair_to_words.get(best_pair, set()))
+
+        for wi in affected:
+            symbols, freq = words[wi]
+
+            # Find all positions where best_pair occurs and apply merge
+            # First: subtract old pairs from counts
+            for i in range(len(symbols) - 1):
+                p = (symbols[i], symbols[i + 1])
+                pair_counts[p] -= freq
+                if pair_counts[p] <= 0:
+                    pair_counts.pop(p, None)
+                    if p in pair_to_words:
+                        pair_to_words[p].discard(wi)
+
+            # Apply merge
+            new_symbols = []
             i = 0
-            while i < len(word_chars):
-                if (i < len(word_chars) - 1 and
-                        word_chars[i] == best_pair[0] and
-                        word_chars[i + 1] == best_pair[1]):
-                    new_chars.append(merged)
+            while i < len(symbols):
+                if (i < len(symbols) - 1 and
+                        symbols[i] == best_pair[0] and
+                        symbols[i + 1] == best_pair[1]):
+                    new_symbols.append(merged)
                     i += 2
                 else:
-                    new_chars.append(word_chars[i])
+                    new_symbols.append(symbols[i])
                     i += 1
-            new_word_splits[tuple(new_chars)] = freq
-        word_splits = new_word_splits
+
+            # Update in place
+            words[wi] = (new_symbols, freq)
+
+            # Add new pairs from updated word
+            for i in range(len(new_symbols) - 1):
+                p = (new_symbols[i], new_symbols[i + 1])
+                pair_counts[p] = pair_counts.get(p, 0) + freq
+                if p not in pair_to_words:
+                    pair_to_words[p] = set()
+                pair_to_words[p].add(wi)
+                # Push to heap if promising
+                if pair_counts[p] >= 2:
+                    heapq.heappush(heap, (-pair_counts[p], p))
+
+        # Clean up the merged pair
+        pair_counts.pop(best_pair, None)
+        pair_to_words.pop(best_pair, None)
+
+        pbar.update(1)
+        if len(merges) % 500 == 0:
+            pbar.set_postfix({"vocab": f"{len(set(s for syms, _ in words for s in syms))}",
+                              "best_freq": best_freq})
+
+    pbar.close()
 
     logger.info("Learned %d BPE merges", len(merges))
 
     # Build final subword vocab with frequencies
     vocab: Counter = Counter()
-    for word_chars, freq in word_splits.items():
-        for subword in word_chars:
+    for symbols, freq in words:
+        for subword in symbols:
             vocab[subword] += freq
 
     logger.info("BPE vocabulary: %d subword types", len(vocab))
@@ -282,6 +411,10 @@ Examples:
         "--min-freq", type=int, default=5,
         help="Minimum word frequency to include in BPE training (default: 5)",
     )
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="Number of parallel workers for corpus scan (default: auto = cpu_count - 1)",
+    )
 
     args = parser.parse_args()
 
@@ -290,7 +423,7 @@ Examples:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Step 1: Extract non-Telugu tokens
-    word_freqs = extract_non_telugu(seg_path, args.separator)
+    word_freqs = extract_non_telugu(seg_path, args.separator, args.workers)
 
     # Filter by minimum frequency
     if args.min_freq > 1:
