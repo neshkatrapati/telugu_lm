@@ -150,31 +150,20 @@ def _init_worker(tokenizer_path: str, script_dir: str):
 def _tokenize_chunk(chunk_info: tuple) -> str:
     """Worker: tokenize lines and write results to a temp file.
 
-    Instead of returning large arrays via IPC pickle, writes directly to
-    a per-chunk temp file and returns (temp_path, total_tokens, unk_count).
-    This avoids the IPC bottleneck for large result arrays.
+    Uses encode_lines_to_array() for batch encoding (local var refs,
+    BPE cache, no per-line overhead). Writes to per-chunk temp file
+    to avoid pickling large arrays back via IPC.
     """
     global _worker_tok
     tok = _worker_tok
 
     chunk_lines, temp_dir, chunk_idx = chunk_info
-    unk_id = tok.unk_id
 
-    ids = []
-    total = 0
-    unk = 0
-    for line in chunk_lines:
-        line = line.strip()
-        if not line:
-            continue
-        encoded = tok.encode(line, add_bos=False, add_eos=True)
-        unk += sum(1 for i in encoded if i == unk_id)
-        total += len(encoded)
-        ids.extend(encoded)
+    # Batch encode — much faster than per-line encode()
+    arr, total, unk = tok.encode_lines_to_array(chunk_lines, add_eos=True)
 
-    # Write to per-chunk temp file (avoids pickling large arrays back)
+    # Write to per-chunk temp file
     chunk_path = os.path.join(temp_dir, f"chunk_{chunk_idx:06d}.bin")
-    arr = np.array(ids, dtype=np.uint32)
     arr.tofile(chunk_path)
 
     return chunk_path, total, unk

@@ -38,6 +38,8 @@ import sys
 import json
 import argparse
 import logging
+
+import numpy as np
 from pathlib import Path
 from collections import OrderedDict, Counter
 
@@ -543,12 +545,25 @@ class MorfessorTokenizer:
             self.bpe_merges = [(a, b) for a, b in data["bpe_merges"]]
             logger.info("Loaded %d BPE merge rules from tokenizer", len(self.bpe_merges))
 
+        # Cache for BPE encode results — same word always produces same subwords
+        # Avoids re-running 8K merge rules for repeated tokens (huge speedup)
+        self._bpe_cache: dict[str, list[int]] = {}
+
     def _is_telugu(self, token: str) -> bool:
         """Check if a token contains any Telugu characters."""
         return bool(TELUGU_CHAR_RE.search(token))
 
     def _encode_token_bpe(self, word: str) -> list[int]:
-        """Encode a single non-Telugu word using BPE merges, with char fallback."""
+        """Encode a single non-Telugu word using BPE merges, with char fallback.
+
+        Results are cached — the same word always produces the same IDs,
+        so we avoid re-running 8K merge rules for repeated tokens.
+        """
+        # Check cache first
+        cached = self._bpe_cache.get(word)
+        if cached is not None:
+            return cached
+
         if self.bpe_merges:
             subwords = bpe_encode_word(word, self.bpe_merges, self.separator)
             ids = []
@@ -568,10 +583,13 @@ class MorfessorTokenizer:
                         else:
                             cid = self.token_to_id.get(ch, self.unk_id)
                         ids.append(cid)
+            self._bpe_cache[word] = ids
             return ids
         else:
             # No BPE — pure character fallback
-            return self._encode_token_chars(word)
+            ids = self._encode_token_chars(word)
+            self._bpe_cache[word] = ids
+            return ids
 
     def _encode_token_chars(self, word: str) -> list[int]:
         """Encode a word character-by-character with @@ continuation."""
@@ -664,6 +682,86 @@ class MorfessorTokenizer:
             ids.append(self.eos_id)
 
         return ids
+
+    def encode_lines_to_array(self, lines: list[str], add_eos: bool = True) -> tuple:
+        """Batch-encode multiple lines into a flat uint32 array + stats.
+
+        Optimized for data preparation — avoids per-line Python overhead.
+        Uses local variable references for hot-path speedup.
+
+        Args:
+            lines: List of segmented text lines.
+            add_eos: Append <eos> after each line.
+
+        Returns:
+            (np.uint32 array of all IDs, total_token_count, unk_count)
+        """
+        # Local refs for hot-path (avoids repeated attribute lookups)
+        _get = self.token_to_id.get
+        _unk = self.unk_id
+        _eos = self.eos_id
+        _sep = self.separator
+        _sep_len = len(_sep)
+        _is_tel = self._is_telugu
+        _bpe = self._encode_token_bpe
+        _id2tok = self.id_to_token
+
+        all_ids = []
+        total = 0
+        unk_count = 0
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            for token in line.split():
+                # Fast path: direct vocab lookup (handles ~85%+ of tokens)
+                tid = _get(token)
+                if tid is not None:
+                    all_ids.append(tid)
+                    total += 1
+                    if tid == _unk:
+                        unk_count += 1
+                    continue
+
+                # Slow path: token not in vocab
+                total += 1
+                is_cont = token.endswith(_sep)
+                bare = token[:-_sep_len] if is_cont else token
+
+                if not _is_tel(bare):
+                    # Non-Telugu → BPE (cached)
+                    sub_ids = _bpe(bare)
+                    if is_cont and sub_ids:
+                        last_str = _id2tok.get(sub_ids[-1], "")
+                        if not last_str.endswith(_sep):
+                            ct = _get(last_str + _sep)
+                            if ct is not None:
+                                sub_ids[-1] = ct
+                    all_ids.extend(sub_ids)
+                    unk_count += sum(1 for i in sub_ids if i == _unk)
+                else:
+                    # Telugu unknown → char fallback
+                    n = len(bare)
+                    if is_cont:
+                        for i, ch in enumerate(bare):
+                            if i < n - 1:
+                                all_ids.append(_get(ch + _sep, _unk))
+                            else:
+                                all_ids.append(_get(ch + _sep, _get(ch, _unk)))
+                    else:
+                        for i, ch in enumerate(bare):
+                            if i < n - 1:
+                                all_ids.append(_get(ch + _sep, _unk))
+                            else:
+                                all_ids.append(_get(ch, _unk))
+
+            if add_eos:
+                all_ids.append(_eos)
+                total += 1
+
+        return np.array(all_ids, dtype=np.uint32), total, unk_count
 
     def decode(self, ids: list[int]) -> str:
         """Decode token IDs back to text.
