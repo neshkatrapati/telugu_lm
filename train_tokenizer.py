@@ -456,8 +456,26 @@ def build_tokenizer(
 # ---------------------------------------------------------------------------
 # BPE encode helper (used at encode time for non-Telugu tokens)
 # ---------------------------------------------------------------------------
+
+# Module-level cache for the merge priority dict (built once, reused)
+_bpe_merge_ranks: dict[tuple[str, str], int] | None = None
+
+
+def _get_merge_ranks(merges: list[tuple[str, str]]) -> dict[tuple[str, str], int]:
+    """Build a priority dict from merge list (lower rank = merge first)."""
+    global _bpe_merge_ranks
+    if _bpe_merge_ranks is not None and len(_bpe_merge_ranks) == len(merges):
+        return _bpe_merge_ranks
+    _bpe_merge_ranks = {pair: i for i, pair in enumerate(merges)}
+    return _bpe_merge_ranks
+
+
 def bpe_encode_word(word: str, merges: list[tuple[str, str]], separator: str = "@@") -> list[str]:
     """Encode a word into BPE subwords using the learned merge table.
+
+    Uses priority-based pair merging: at each step, finds the highest-priority
+    (lowest rank) pair present in the current symbols and merges it. This is
+    O(word_length² × log) instead of O(num_merges × word_length).
 
     Returns subwords with @@ on non-final pieces:
         "international" -> ["inter@@", "nation@@", "al"]
@@ -465,25 +483,41 @@ def bpe_encode_word(word: str, merges: list[tuple[str, str]], separator: str = "
     if not word:
         return []
 
-    chars = list(word)
+    ranks = _get_merge_ranks(merges)
+    symbols = list(word)
 
-    for a, b in merges:
+    while len(symbols) > 1:
+        # Find the pair with the lowest merge rank in current symbols
+        best_pair = None
+        best_rank = len(merges)  # sentinel: worse than any real rank
+        for i in range(len(symbols) - 1):
+            pair = (symbols[i], symbols[i + 1])
+            r = ranks.get(pair)
+            if r is not None and r < best_rank:
+                best_rank = r
+                best_pair = pair
+
+        if best_pair is None:
+            break  # no more merges possible
+
+        # Merge all occurrences of best_pair
+        a, b = best_pair
         merged = a + b
-        new_chars = []
+        new_symbols = []
         i = 0
-        while i < len(chars):
-            if i < len(chars) - 1 and chars[i] == a and chars[i + 1] == b:
-                new_chars.append(merged)
+        while i < len(symbols):
+            if i < len(symbols) - 1 and symbols[i] == a and symbols[i + 1] == b:
+                new_symbols.append(merged)
                 i += 2
             else:
-                new_chars.append(chars[i])
+                new_symbols.append(symbols[i])
                 i += 1
-        chars = new_chars
+        symbols = new_symbols
 
     # Add @@ to all subwords except the last (word-final)
     result = []
-    for i, subword in enumerate(chars):
-        if i < len(chars) - 1:
+    for i, subword in enumerate(symbols):
+        if i < len(symbols) - 1:
             result.append(subword + separator)
         else:
             result.append(subword)
