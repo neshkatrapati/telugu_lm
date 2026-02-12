@@ -52,6 +52,8 @@ def extract_non_telugu(seg_corpus_path: Path, separator: str = "@@") -> Counter:
         logger.error("No .seg.txt files found in %s", seg_corpus_path)
         sys.exit(1)
 
+    from tqdm import tqdm
+
     logger.info("Scanning %d file(s) for non-Telugu tokens...", len(seg_files))
     word_freq: Counter = Counter()
     total_tokens = 0
@@ -60,7 +62,7 @@ def extract_non_telugu(seg_corpus_path: Path, separator: str = "@@") -> Counter:
     for fpath in seg_files:
         logger.info("  Scanning %s", fpath.name)
         with open(fpath, "r", encoding="utf-8") as f:
-            for line in f:
+            for line in tqdm(f, desc=fpath.name, unit=" lines"):
                 for token in line.split():
                     total_tokens += 1
                     # Strip @@ to get the base form
