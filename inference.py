@@ -16,6 +16,9 @@ import argparse
 import logging
 from pathlib import Path
 
+import torch
+import torch.nn.functional as F
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -101,9 +104,6 @@ def load_model(checkpoint_path: Path, device: str):
 @torch.no_grad()
 def generate(model, token_ids: list[int], max_new_tokens: int, temperature: float, top_k: int, device: str) -> list[int]:
     """Generate token IDs autoregressively."""
-    import torch
-    import torch.nn.functional as F
-
     idx = torch.tensor([token_ids], dtype=torch.long, device=device)
     block_size = model.config.block_size
 
@@ -128,6 +128,38 @@ def generate(model, token_ids: list[int], max_new_tokens: int, temperature: floa
     return idx[0].tolist()
 
 
+def desegment(text: str) -> str:
+    """Reconstruct natural text from space-separated morphemes.
+
+    The tokenizer decode gives us morphemes separated by spaces. We need to
+    merge consecutive Telugu morphemes back into words, since the original
+    text had no spaces between morphemes of the same word.
+
+    Logic: if a token ends with a Telugu character and the next token starts
+    with a Telugu character, they belong to the same word — remove the space.
+    """
+    if not text:
+        return text
+
+    TELUGU_CHAR = re.compile(r"[\u0C00-\u0C7F]")
+    tokens = text.split()
+    if not tokens:
+        return text
+
+    result = [tokens[0]]
+    for i in range(1, len(tokens)):
+        prev = tokens[i - 1]
+        curr = tokens[i]
+        # If previous token ends with Telugu and current starts with Telugu,
+        # they are morphemes of the same word — merge without space
+        if prev and curr and TELUGU_CHAR.search(prev[-1]) and TELUGU_CHAR.search(curr[0]):
+            result.append(curr)  # no space
+        else:
+            result.append(" " + curr)
+
+    return "".join(result)
+
+
 def run_inference(
     prompt: str,
     model,
@@ -140,7 +172,7 @@ def run_inference(
     separator: str = "@@",
     verbose: bool = False,
 ):
-    """Full inference pipeline: text → segment → tokenize → generate → decode → text."""
+    """Full inference pipeline: text → segment → tokenize → generate → decode → desegment → text."""
 
     # Step 1: Morfessor segmentation
     segmented = segment_text(prompt, morf_model, separator)
@@ -155,20 +187,21 @@ def run_inference(
     # Step 3: Generate
     output_ids = generate(model, token_ids, max_tokens, temperature, top_k, device)
 
-    # Step 4: Decode
-    generated_text = tokenizer.decode(output_ids)
-
-    # Also decode just the new tokens (without prompt)
-    new_ids = output_ids[len(token_ids):]
-    generated_only = tokenizer.decode(new_ids)
+    # Step 4: Decode token IDs → morphemes
+    raw_text = tokenizer.decode(output_ids)
+    raw_generated = tokenizer.decode(output_ids[len(token_ids):])
 
     if verbose:
-        print(f"  [Generated]  {len(new_ids)} new tokens")
+        print(f"  [Raw decode] {raw_generated[:200]}")
+
+    # Step 5: Desegment — merge morphemes back into words
+    generated_text = desegment(raw_text)
+    generated_only = desegment(raw_generated)
+
+    if verbose:
+        print(f"  [Generated]  {len(output_ids) - len(token_ids)} new tokens")
 
     return generated_text, generated_only
-
-
-import torch  # needed for @torch.no_grad decorator
 
 
 def main():
