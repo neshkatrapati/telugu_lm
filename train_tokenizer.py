@@ -12,11 +12,14 @@ Key change from v1: @@ is part of the token, not stripped.
   - This lets the model learn word boundaries and decode reconstructs perfectly.
 
 Pipeline:
-  1. Scan segmented corpus — collect ALL tokens (with @@ preserved)
-  2. Load BPE vocab (from train_bpe.py) — merge into unified token set
+  1. Scan segmented corpus — collect only TELUGU tokens (with @@ preserved)
+     Non-Telugu tokens (English, numbers, URLs) are skipped here.
+  2. Load BPE vocab (from train_bpe.py) — handles all non-Telugu text
   3. Add character-level fallback (both ch and ch@@ variants)
   4. Build token-to-id / id-to-token mappings
   5. Save as JSON tokenizer (v2.0)
+
+Expected vocab size: ~33K Telugu morphemes + ~8K BPE subwords + ~500 chars ≈ ~42K
 
 Usage:
     python train_tokenizer.py \\
@@ -61,35 +64,66 @@ NUM_SPECIAL = len(SPECIAL_TOKENS)
 TELUGU_CHAR_RE = re.compile(r"[\u0C00-\u0C7F]")
 TELUGU_WORD_RE = re.compile(r"[\u0C00-\u0C7F]+")
 
+# Pre-compiled set of Telugu codepoints for fast membership test (no regex per token)
+_TELUGU_CP_RANGE = range(0x0C00, 0x0C80)
+
+
+def _has_telugu(s: str) -> bool:
+    """Fast Telugu detection — checks codepoints directly, no regex."""
+    for ch in s:
+        if ord(ch) in _TELUGU_CP_RANGE:
+            return True
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Step 1: Build vocabulary from segmented corpus (parallelized)
 # ---------------------------------------------------------------------------
 
-def _count_chunk(lines: list[str]) -> tuple[Counter, int]:
-    """Worker: count token frequencies in a chunk of lines."""
+def _count_chunk(args: tuple) -> tuple[Counter, int, int]:
+    """Worker: count Telugu-containing token frequencies in a chunk of lines.
+
+    Only tokens containing at least one Telugu character are counted.
+    Non-Telugu tokens (English, numbers, URLs) are skipped — they are
+    handled entirely by BPE subwords.
+
+    Returns (telugu_token_freq, total_tokens_seen, telugu_tokens_counted).
+    """
+    lines, separator, sep_len = args
     freq: Counter = Counter()
     total = 0
+    telugu_count = 0
     for line in lines:
         for token in line.split():
-            if token:
-                freq[token] += 1
-                total += 1
-    return freq, total
+            if not token:
+                continue
+            total += 1
+            # Strip @@ suffix to check for Telugu characters
+            if token.endswith(separator):
+                base = token[:-sep_len]
+            else:
+                base = token
+            if _has_telugu(base):
+                freq[token] += 1  # Keep @@ as part of the key
+                telugu_count += 1
+    return freq, total, telugu_count
 
 
 def build_vocab_from_corpus(corpus_path: Path, separator: str, num_workers: int = 0) -> list[tuple[str, int]]:
-    """Scan segmented corpus files and count every unique token AS-IS.
+    """Scan segmented corpus files and count TELUGU-CONTAINING tokens only.
 
-    CRITICAL: Tokens are NOT stripped of @@. "విద్యార్థు@@" and "విద్యార్థు"
-    are counted as separate entries. This is the v2 fix — the model can now
-    learn word boundaries.
+    CRITICAL v2 changes:
+      1. Tokens are NOT stripped of @@. "విద్యార్థు@@" and "విద్యార్థు"
+         are counted as separate entries, so the model can learn word boundaries.
+      2. Only tokens containing at least one Telugu character are counted.
+         Non-Telugu text (English, numbers, URLs) is handled entirely by BPE.
+         This prevents vocab explosion from millions of unique non-Telugu surface forms.
 
     Parallelized: streams lines into chunks, dispatches to workers.
 
     Args:
         corpus_path: Path to a .seg.txt file or a directory containing them.
-        separator: The morpheme boundary marker (e.g. '@@'). Used for logging only.
+        separator: The morpheme boundary marker (e.g. '@@').
         num_workers: Number of parallel workers (0 = auto).
 
     Returns:
@@ -111,11 +145,14 @@ def build_vocab_from_corpus(corpus_path: Path, separator: str, num_workers: int 
         num_workers = max(1, cpu_count() - 1)
 
     CHUNK_SIZE = 50_000  # lines per chunk
+    sep_len = len(separator)
 
-    logger.info("Scanning %d segmented file(s) to build vocabulary (%d workers)...",
+    logger.info("Scanning %d segmented file(s) for Telugu morphemes (%d workers)...",
                 len(seg_files), num_workers)
+    logger.info("  (Non-Telugu tokens skipped — handled by BPE)")
     token_freq: Counter = Counter()
     total_tokens = 0
+    telugu_tokens = 0
 
     for fpath in seg_files:
         logger.info("  Scanning %s", fpath.name)
@@ -136,17 +173,18 @@ def build_vocab_from_corpus(corpus_path: Path, separator: str, num_workers: int 
                     line_count += 1
                     pbar.update(1)
                     if len(current_chunk) >= CHUNK_SIZE:
-                        futures.append(executor.submit(_count_chunk, current_chunk))
+                        futures.append(executor.submit(_count_chunk, (current_chunk, separator, sep_len)))
                         current_chunk = []
             if current_chunk:
-                futures.append(executor.submit(_count_chunk, current_chunk))
+                futures.append(executor.submit(_count_chunk, (current_chunk, separator, sep_len)))
 
             pbar.set_description(f"{fpath.name} (merging {len(futures)} chunks)")
 
             for fut in as_completed(futures):
-                freq, total = fut.result()
+                freq, total, tel_count = fut.result()
                 token_freq += freq
                 total_tokens += total
+                telugu_tokens += tel_count
 
             executor.shutdown(wait=False)
             pbar.close()
@@ -157,16 +195,28 @@ def build_vocab_from_corpus(corpus_path: Path, separator: str, num_workers: int 
             with open(fpath, "r", encoding="utf-8") as f:
                 for line in tqdm(f, desc=fpath.name, unit=" lines"):
                     for token in line.split():
-                        if token:
-                            token_freq[token] += 1
-                            total_tokens += 1
+                        if not token:
+                            continue
+                        total_tokens += 1
+                        # Strip @@ suffix to check for Telugu characters
+                        if token.endswith(separator):
+                            base = token[:-sep_len]
+                        else:
+                            base = token
+                        if _has_telugu(base):
+                            token_freq[token] += 1  # Keep @@ as part of the key
+                            telugu_tokens += 1
 
     # Count how many are continuation vs word-final
     continuation = sum(1 for t in token_freq if t.endswith(separator))
     word_final = len(token_freq) - continuation
 
-    logger.info("Scanned %d total tokens", total_tokens)
-    logger.info("Unique token types: %d (%d continuation, %d word-final)",
+    logger.info("Total tokens scanned: %d", total_tokens)
+    logger.info("Telugu tokens: %d (%.1f%%)", telugu_tokens,
+                100 * telugu_tokens / total_tokens if total_tokens else 0)
+    logger.info("Non-Telugu tokens skipped: %d (%.1f%%)", total_tokens - telugu_tokens,
+                100 * (total_tokens - telugu_tokens) / total_tokens if total_tokens else 0)
+    logger.info("Unique Telugu morpheme types: %d (%d continuation, %d word-final)",
                 len(token_freq), continuation, word_final)
 
     morphemes = sorted(token_freq.items(), key=lambda x: x[1], reverse=True)
@@ -218,12 +268,16 @@ def build_tokenizer(
     """Build a unified tokenizer from Morfessor morphemes + BPE subwords.
 
     Vocabulary structure:
-        [special tokens] + [morfessor morphemes with @@] + [BPE subwords] + [char fallbacks]
+        [special tokens] + [Telugu morphemes with @@] + [BPE subwords] + [char fallbacks]
+
+    The corpus scan only collects Telugu-containing tokens (~33K morphemes).
+    Non-Telugu text is handled entirely by BPE subwords (~8K).
+    This gives a predictable vocab size of ~42K instead of millions.
 
     Args:
         output_dir: Where to save tokenizer files.
         separator: Continuation marker (default: @@).
-        segmented_corpus: Path to .seg.txt files (recommended, ensures zero UNK).
+        segmented_corpus: Path to .seg.txt files — scanned for Telugu morphemes only.
         morfessor_dir: Fallback — directory containing morpheme_vocab.tsv.
         vocab_size: Cap vocab at this size (0 = use all).
         bpe_vocab_path: Path to bpe_vocab.tsv from train_bpe.py.
@@ -262,7 +316,7 @@ def build_tokenizer(
         logger.error("Must provide either --segmented-corpus or --morfessor-dir")
         sys.exit(1)
 
-    logger.info("Morfessor morphemes: %d types", len(morphemes))
+    logger.info("Telugu morphemes to add: %d types", len(morphemes))
 
     # Sort by frequency
     morphemes.sort(key=lambda x: x[1], reverse=True)
