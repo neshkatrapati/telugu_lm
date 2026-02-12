@@ -643,6 +643,7 @@ def segment_corpus(
     output_dir: Path,
     separator: str,
     num_workers: int = 0,
+    num_docs: int = 0,
 ):
     """
     Apply Morfessor segmentation to all corpus files.
@@ -700,7 +701,9 @@ def segment_corpus(
             logger.info("SKIPPING %s — already segmented", rel)
             continue
 
-        logger.info("Segmenting %s -> %s (%d workers)", rel, out_file.name, num_workers)
+        total_str = f"/{num_docs}" if num_docs > 0 else ""
+        logger.info("Segmenting %s -> %s (%d workers%s)", rel, out_file.name, num_workers,
+                     f", limit {num_docs} docs" if num_docs > 0 else "")
         start = time.time()
         doc_count = 0
 
@@ -711,12 +714,15 @@ def segment_corpus(
                     _iter_text_from_file(fpath),
                     desc=fpath.name,
                     unit=" docs",
+                    total=num_docs if num_docs > 0 else None,
                 ):
                     segmented_text = _segment_text_cached(
                         cache, model, text, separator
                     )
                     fout.write(segmented_text + "\n")
                     doc_count += 1
+                    if num_docs > 0 and doc_count >= num_docs:
+                        break
         else:
             # ---- Parallel: stream docs through imap_unordered for responsiveness ----
             with Pool(
@@ -725,7 +731,8 @@ def segment_corpus(
                 initargs=(cache, model, separator),
             ) as pool, open(out_file, "w", encoding="utf-8") as fout:
 
-                pbar = tqdm(desc=fpath.name, unit=" docs")
+                pbar = tqdm(desc=fpath.name, unit=" docs",
+                            total=num_docs if num_docs > 0 else None)
 
                 # imap_unordered streams results as they complete — no blocking on slow docs
                 # chunksize=1 ensures one stuck doc cannot block any other results
@@ -741,6 +748,10 @@ def segment_corpus(
                     # Flush periodically so file size visibly grows
                     if doc_count % 50000 == 0:
                         fout.flush()
+
+                    if num_docs > 0 and doc_count >= num_docs:
+                        pool.terminate()
+                        break
 
                 pbar.close()
 
@@ -873,6 +884,12 @@ Examples:
         default=0,
         help="Number of parallel workers for corpus segmentation (default: auto = cpu_count - 1)",
     )
+    parser.add_argument(
+        "--num-docs",
+        type=int,
+        default=0,
+        help="Limit segmentation to first N documents (0 = all, default: 0). Useful for quick tests.",
+    )
 
     args = parser.parse_args()
 
@@ -917,7 +934,7 @@ Examples:
         logger.info("  Separator: '%s'", args.separator)
         logger.info("=" * 70)
 
-        segment_corpus(input_dir, model_path, output_dir, args.separator, args.workers)
+        segment_corpus(input_dir, model_path, output_dir, args.separator, args.workers, args.num_docs)
 
     else:
         # Full pipeline or train-only
@@ -950,7 +967,7 @@ Examples:
 
         # Step 4: Segment full corpus (unless train-only)
         if not args.train_only:
-            segment_corpus(input_dir, model_path, output_dir, args.separator, args.workers)
+            segment_corpus(input_dir, model_path, output_dir, args.separator, args.workers, args.num_docs)
 
     elapsed_total = time.time() - start_total
     print_summary(output_dir)
