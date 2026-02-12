@@ -264,50 +264,58 @@ def prepare_data(
                 logger.info("  Tokenizing %s ...", fpath.name)
 
                 if num_workers > 1:
-                    # Generator that yields (chunk_lines, temp_dir, chunk_idx) lazily
-                    def chunk_generator(filepath, tmp_d):
-                        """Stream lines from file, yield chunks lazily."""
-                        current_chunk = []
-                        chunk_idx = 0
-                        with open(filepath, "r", encoding="utf-8") as f:
-                            for line in f:
-                                current_chunk.append(line)
-                                if len(current_chunk) >= CHUNK_SIZE:
-                                    yield (current_chunk, tmp_d, chunk_idx)
-                                    chunk_idx += 1
-                                    current_chunk = []
-                        if current_chunk:
-                            yield (current_chunk, tmp_d, chunk_idx)
-
-                    # Count lines first for progress bar (fast — just counts newlines)
-                    with open(fpath, "rb") as f:
-                        line_count = sum(1 for _ in f)
-                    n_chunks = (line_count + CHUNK_SIZE - 1) // CHUNK_SIZE
-
-                    logger.info("    %d lines → ~%d chunks", line_count, n_chunks)
-
-                    # Create pool (workers load tokenizer once each via initializer)
+                    # --- Step A: Stream lines, build chunks, submit to pool ---
+                    # Progress bar ticks per line as file is read (user sees 7M lines ticking)
                     pool = Pool(
                         processes=num_workers,
                         initializer=_init_worker,
                         initargs=(tokenizer_path_str, script_dir),
                     )
 
-                    # imap preserves order AND streams lazily (no pickle of all chunks at once)
-                    pbar = tqdm(total=n_chunks, desc=fpath.name, unit=" chunks")
-                    for chunk_path, total, unk in pool.imap(
-                        _tokenize_chunk,
-                        chunk_generator(fpath, tmp_dir),
-                    ):
-                        # Read chunk temp file and append to main output
+                    current_chunk = []
+                    chunk_idx = 0
+                    async_results = []  # (AsyncResult, chunk_idx) in submission order
+                    line_count = 0
+
+                    pbar = tqdm(desc=f"{fpath.name} (reading)", unit=" lines")
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        for line in f:
+                            current_chunk.append(line)
+                            line_count += 1
+                            pbar.update(1)
+                            if len(current_chunk) >= CHUNK_SIZE:
+                                ar = pool.apply_async(
+                                    _tokenize_chunk,
+                                    ((current_chunk, tmp_dir, chunk_idx),),
+                                )
+                                async_results.append(ar)
+                                chunk_idx += 1
+                                current_chunk = []
+                    if current_chunk:
+                        ar = pool.apply_async(
+                            _tokenize_chunk,
+                            ((current_chunk, tmp_dir, chunk_idx),),
+                        )
+                        async_results.append(ar)
+                        chunk_idx += 1
+                    pbar.close()
+
+                    logger.info("    %d lines → %d chunks, waiting for %d workers...",
+                                line_count, len(async_results), num_workers)
+
+                    # --- Step B: Collect results IN ORDER, write to output ---
+                    encode_pbar = tqdm(total=len(async_results),
+                                       desc=f"{fpath.name} (encoding)", unit=" chunks")
+                    for ar in async_results:
+                        chunk_path, total, unk = ar.get()  # blocks in submission order
                         with open(chunk_path, "rb") as cf:
                             shutil.copyfileobj(cf, out_f)
-                        os.unlink(chunk_path)  # clean up immediately
+                        os.unlink(chunk_path)
                         total_tokens += total
                         total_unk += unk
-                        pbar.update(1)
+                        encode_pbar.update(1)
 
-                    pbar.close()
+                    encode_pbar.close()
                     pool.close()
                     pool.join()
 
