@@ -101,42 +101,53 @@ def extract_non_telugu(seg_corpus_path: Path, separator: str = "@@", num_workers
     for fpath in seg_files:
         logger.info("  Scanning %s", fpath.name)
 
-        # Read all lines and split into chunks
-        chunks = []
-        current_chunk = []
-        line_count = 0
+        if num_workers > 1:
+            # Stream lines into chunks, submit to pool as they fill up
+            from concurrent.futures import ProcessPoolExecutor, as_completed
 
-        with open(fpath, "r", encoding="utf-8") as f:
-            for line in f:
-                current_chunk.append(line)
-                line_count += 1
-                if len(current_chunk) >= CHUNK_SIZE:
-                    chunks.append((current_chunk, separator, sep_len))
-                    current_chunk = []
-        if current_chunk:
-            chunks.append((current_chunk, separator, sep_len))
+            futures = []
+            current_chunk = []
+            line_count = 0
 
-        logger.info("    %d lines -> %d chunks", line_count, len(chunks))
+            pbar = tqdm(desc=fpath.name, unit=" lines")
+            executor = ProcessPoolExecutor(max_workers=num_workers)
 
-        # Process chunks in parallel
-        if num_workers > 1 and len(chunks) > 1:
-            with Pool(processes=min(num_workers, len(chunks))) as pool:
-                for freq, total, non_tel in tqdm(
-                    pool.imap_unordered(_scan_chunk, chunks),
-                    total=len(chunks),
-                    desc=fpath.name,
-                    unit=" chunks",
-                ):
-                    word_freq += freq
-                    total_tokens += total
-                    non_telugu_tokens += non_tel
-        else:
-            # Single-threaded fallback
-            for chunk_args in tqdm(chunks, desc=fpath.name, unit=" chunks"):
-                freq, total, non_tel = _scan_chunk(chunk_args)
+            with open(fpath, "r", encoding="utf-8") as f:
+                for line in f:
+                    current_chunk.append(line)
+                    line_count += 1
+                    pbar.update(1)
+                    if len(current_chunk) >= CHUNK_SIZE:
+                        futures.append(executor.submit(_scan_chunk, (current_chunk, separator, sep_len)))
+                        current_chunk = []
+            if current_chunk:
+                futures.append(executor.submit(_scan_chunk, (current_chunk, separator, sep_len)))
+
+            pbar.set_description(f"{fpath.name} (merging {len(futures)} chunks)")
+
+            for fut in as_completed(futures):
+                freq, total, non_tel = fut.result()
                 word_freq += freq
                 total_tokens += total
                 non_telugu_tokens += non_tel
+
+            executor.shutdown(wait=False)
+            pbar.close()
+            logger.info("    %d lines, %d chunks", line_count, len(futures))
+
+        else:
+            # Single-threaded: direct scan with progress bar per line
+            with open(fpath, "r", encoding="utf-8") as f:
+                for line in tqdm(f, desc=fpath.name, unit=" lines"):
+                    for token in line.split():
+                        total_tokens += 1
+                        if token.endswith(separator):
+                            base = token[:-sep_len]
+                        else:
+                            base = token
+                        if not _has_telugu(base):
+                            word_freq[base] += 1
+                            non_telugu_tokens += 1
 
     logger.info("Total tokens scanned: %d", total_tokens)
     logger.info("Non-Telugu tokens: %d (%.1f%%)", non_telugu_tokens,
