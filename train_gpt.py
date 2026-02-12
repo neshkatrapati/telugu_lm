@@ -161,8 +161,8 @@ def prepare_data(
     train_bin = output_dir / "train.bin"
     val_bin = output_dir / "val.bin"
     if train_bin.exists() and val_bin.exists():
-        train_tokens = os.path.getsize(train_bin) // 2  # uint16
-        val_tokens = os.path.getsize(val_bin) // 2
+        train_tokens = os.path.getsize(train_bin) // 4  # uint32
+        val_tokens = os.path.getsize(val_bin) // 4
         logger.info("Data already prepared:")
         logger.info("  train.bin: %d tokens (%.2f GB)", train_tokens, os.path.getsize(train_bin) / 1e9)
         logger.info("  val.bin:   %d tokens (%.2f GB)", val_tokens, os.path.getsize(val_bin) / 1e9)
@@ -202,11 +202,8 @@ def prepare_data(
     logger.info("Total tokens: %d", total_tokens)
     logger.info("UNK tokens:   %d (%.2f%%)", total_unk, 100 * total_unk / total_tokens if total_tokens else 0)
 
-    # Verify vocab fits in uint16
-    assert tokenizer.vocab_size < 65536, f"Vocab too large for uint16: {tokenizer.vocab_size}"
-
-    # Convert to numpy uint16
-    all_ids_np = np.array(all_ids, dtype=np.uint16)
+    # Convert to numpy uint32 (supports vocab > 65K)
+    all_ids_np = np.array(all_ids, dtype=np.uint32)
 
     # Split train/val
     n_val = int(len(all_ids_np) * val_split)
@@ -237,6 +234,7 @@ def prepare_data(
         "val_tokens": int(n_val),
         "total_tokens": int(total_tokens),
         "unk_rate": total_unk / total_tokens if total_tokens else 0,
+        "dtype": "uint32",
     }
     with open(output_dir / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
@@ -437,7 +435,7 @@ class MemmapDataset:
     """Memory-mapped dataset for pretraining. Zero RAM overhead."""
 
     def __init__(self, data_path: Path, block_size: int):
-        self.data = np.memmap(str(data_path), dtype=np.uint16, mode="r")
+        self.data = np.memmap(str(data_path), dtype=np.uint32, mode="r")
         self.block_size = block_size
         self.n_tokens = len(self.data)
 
@@ -496,7 +494,7 @@ def train(
     train_data = MemmapDataset(data_dir / "train.bin", model_config.block_size)
     val_data = MemmapDataset(data_dir / "val.bin", model_config.block_size)
 
-    logger.info("  Train tokens: %d (%.2f GB)", train_data.n_tokens, train_data.n_tokens * 2 / 1e9)
+    logger.info("  Train tokens: %d (%.2f GB)", train_data.n_tokens, train_data.n_tokens * 4 / 1e9)
     logger.info("  Val tokens:   %d", val_data.n_tokens)
 
     # Read vocab size from metadata (saved during prepare step)
@@ -540,7 +538,7 @@ def train(
     steps_per_epoch = tokens_per_epoch / tokens_per_step
     n_epochs = total_tokens_trained / tokens_per_epoch
 
-    logger.info("  Tokens/epoch: %d (%.2f GB)", tokens_per_epoch, tokens_per_epoch * 2 / 1e9)
+    logger.info("  Tokens/epoch: %d (%.2f GB)", tokens_per_epoch, tokens_per_epoch * 4 / 1e9)
     logger.info("  Steps/epoch:  %.0f", steps_per_epoch)
     logger.info("  Epochs:       %.2f", n_epochs)
 

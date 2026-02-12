@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-Telugu LLaMA — Interactive Inference
-=====================================
-Full pipeline: raw text → Morfessor segmentation → tokenize → model → detokenize → text
+Telugu LLaMA — Interactive Inference (v2)
+==========================================
+Full pipeline: raw text -> Morfessor segmentation -> tokenize -> model -> decode -> text
+
+The v2 tokenizer preserves @@ continuation markers, so decode is trivial:
+just replace "@@ " with "" to merge morphemes back into words.
+No Desegmenter needed.
 
 Usage:
     python inference.py --checkpoint ./checkpoints/best.pt
@@ -39,10 +43,20 @@ def load_morfessor_model(model_path: Path):
 
 
 def segment_text(text: str, morf_model, separator: str = "@@") -> str:
-    """Segment raw text using Morfessor.
+    """Segment raw text using Morfessor with @@ continuation markers.
 
-    Telugu words → morpheme segments with @@ boundaries
-    Non-Telugu words → kept as-is
+    - Pure Telugu words -> Morfessor morpheme segments with @@ boundaries
+    - Pure non-Telugu words -> kept as-is
+    - Mixed-script tokens (e.g. "2024లో") -> split at script boundary with @@
+      e.g. "2024లో" -> "2024@@ లో"
+
+    Args:
+        text: Raw input text.
+        morf_model: Loaded Morfessor model.
+        separator: Continuation marker (default: @@).
+
+    Returns:
+        Segmented text with @@ continuation markers.
     """
     tokens = text.split()
     seg_tokens = []
@@ -56,22 +70,38 @@ def segment_text(text: str, morf_model, separator: str = "@@") -> str:
                     seg_tokens.append(seg + separator)
                 else:
                     seg_tokens.append(seg)
+
         elif TELUGU_WORD_RE.search(token):
-            # Mixed token — split on Telugu boundaries
+            # Mixed-script token — split at Telugu/non-Telugu boundaries
+            # e.g. "2024లో" -> ["2024", "లో"]
+            # e.g. "IPLలో" -> ["IPL", "లో"]
             parts = re.split(r"([\u0C00-\u0C7F]+)", token)
-            for part in parts:
-                if not part:
-                    continue
+            parts = [p for p in parts if p]
+
+            for part_idx, part in enumerate(parts):
+                is_last_part = (part_idx == len(parts) - 1)
+
                 if TELUGU_WORD_RE.fullmatch(part):
+                    # Telugu part — segment with Morfessor
                     segments = morf_model.viterbi_segment(part)[0]
                     for i, seg in enumerate(segments):
                         if i < len(segments) - 1:
                             seg_tokens.append(seg + separator)
                         else:
-                            seg_tokens.append(seg)
+                            # Last segment of Telugu part
+                            if not is_last_part:
+                                # Not the last part of the mixed token — add @@
+                                seg_tokens.append(seg + separator)
+                            else:
+                                seg_tokens.append(seg)
                 else:
-                    seg_tokens.append(part)
+                    # Non-Telugu part
+                    if not is_last_part:
+                        seg_tokens.append(part + separator)
+                    else:
+                        seg_tokens.append(part)
         else:
+            # Pure non-Telugu word — keep as-is
             seg_tokens.append(token)
 
     return " ".join(seg_tokens)
@@ -79,8 +109,6 @@ def segment_text(text: str, morf_model, separator: str = "@@") -> str:
 
 def load_model(checkpoint_path: Path, device: str):
     """Load trained model from checkpoint."""
-    import torch
-
     sys.path.insert(0, str(Path(__file__).parent))
     from train_gpt import GPTConfig, build_model
 
@@ -128,59 +156,6 @@ def generate(model, token_ids: list[int], max_new_tokens: int, temperature: floa
     return idx[0].tolist()
 
 
-def desegment(text: str, morf_model, separator: str = "@@") -> str:
-    """Reconstruct natural text from space-separated morphemes.
-
-    The tokenizer stores bare morphemes (no @@), so at decode time we can't
-    tell which morphemes belong to the same word. We use Morfessor to
-    reconstruct: greedily join consecutive Telugu morphemes and check if
-    Morfessor would segment the joined form back into those same morphemes.
-    If yes, they're one word. If not, they're separate words.
-    """
-    if not text:
-        return text
-
-    TELUGU_CHAR = re.compile(r"[\u0C00-\u0C7F]")
-    tokens = text.split()
-    if not tokens:
-        return text
-
-    # Group consecutive Telugu tokens, keep non-Telugu tokens as-is
-    groups = []  # each group is (is_telugu, [tokens])
-    for token in tokens:
-        is_telugu = bool(TELUGU_CHAR.search(token))
-        if groups and groups[-1][0] == is_telugu and is_telugu:
-            groups[-1][1].append(token)
-        else:
-            groups.append((is_telugu, [token]))
-
-    # For each group of Telugu morphemes, try to reconstruct words
-    result_parts = []
-    for is_telugu, group_tokens in groups:
-        if not is_telugu:
-            result_parts.append(" ".join(group_tokens))
-            continue
-
-        # Greedily build words from morphemes using Morfessor validation
-        words = []
-        i = 0
-        while i < len(group_tokens):
-            # Try joining morphemes starting from position i
-            # Start with longest possible, shrink until Morfessor agrees
-            best_end = i + 1  # at minimum, one morpheme = one word
-            for j in range(min(i + 8, len(group_tokens)), i, -1):
-                candidate = "".join(group_tokens[i:j])
-                segments = morf_model.viterbi_segment(candidate)[0]
-                if segments == group_tokens[i:j]:
-                    best_end = j
-                    break
-            words.append("".join(group_tokens[i:best_end]))
-            i = best_end
-        result_parts.append(" ".join(words))
-
-    return " ".join(result_parts)
-
-
 def run_inference(
     prompt: str,
     model,
@@ -193,7 +168,11 @@ def run_inference(
     separator: str = "@@",
     verbose: bool = False,
 ):
-    """Full inference pipeline: text → segment → tokenize → generate → decode → desegment → text."""
+    """Full inference pipeline: text -> segment -> tokenize -> generate -> decode -> text.
+
+    With v2 tokenizer, decode is trivial — just tokenizer.decode() handles
+    everything via @@ marker replacement. No Desegmenter needed.
+    """
 
     # Step 1: Morfessor segmentation
     segmented = segment_text(prompt, morf_model, separator)
@@ -208,26 +187,20 @@ def run_inference(
     # Step 3: Generate
     output_ids = generate(model, token_ids, max_tokens, temperature, top_k, device)
 
-    # Step 4: Decode token IDs → morphemes
-    raw_text = tokenizer.decode(output_ids)
-    raw_generated = tokenizer.decode(output_ids[len(token_ids):])
+    # Step 4: Decode — trivial with v2 tokenizer
+    full_text = tokenizer.decode(output_ids)
+    generated_text = tokenizer.decode(output_ids[len(token_ids):])
 
     if verbose:
-        print(f"  [Raw decode] {raw_generated[:200]}")
-
-    # Step 5: Desegment — merge morphemes back into words using Morfessor
-    generated_text = desegment(raw_text, morf_model, separator)
-    generated_only = desegment(raw_generated, morf_model, separator)
-
-    if verbose:
+        print(f"  [Raw decode] {generated_text[:200]}")
         print(f"  [Generated]  {len(output_ids) - len(token_ids)} new tokens")
 
-    return generated_text, generated_only
+    return full_text, generated_text
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Telugu LLaMA — Interactive Inference",
+        description="Telugu LLaMA — Interactive Inference (v2)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -277,7 +250,7 @@ Examples:
     else:
         # Interactive mode
         print("=" * 60)
-        print("Telugu LLaMA — Interactive Generation")
+        print("Telugu LLaMA — Interactive Generation (v2)")
         print("Type your prompt and press Enter. Type 'quit' to exit.")
         print("=" * 60)
 

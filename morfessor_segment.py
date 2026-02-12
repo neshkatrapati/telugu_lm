@@ -512,11 +512,42 @@ def _build_segmentation_cache(model, freq_path: Path, separator: str) -> dict[st
 MAX_TOKEN_LEN = 80  # Skip viterbi for tokens longer than this (URLs, garbage, etc.)
 
 
+def _segment_telugu_word(cache: dict, model, word: str, separator: str) -> list[str]:
+    """Segment a pure-Telugu word into morphemes using cache.
+
+    Returns a list of sub-tokens, e.g. ["విద్యార్థు@@", "ల@@", "కు"].
+    The LAST sub-token does NOT have @@ (it is word-final).
+    """
+    cached = cache.get(word)
+    if cached is not None:
+        return cached.split()
+
+    if len(word) > MAX_TOKEN_LEN:
+        return [word]
+
+    segments = model.viterbi_segment(word)[0]
+    if len(segments) > 1:
+        sub_tokens = []
+        for i, seg in enumerate(segments):
+            if i < len(segments) - 1:
+                sub_tokens.append(seg + separator)
+            else:
+                sub_tokens.append(seg)
+        cache[word] = " ".join(sub_tokens)
+        return sub_tokens
+    else:
+        cache[word] = word
+        return [word]
+
+
 def _segment_text_cached(cache: dict, model, text: str, separator: str) -> str:
     """
-    Segment Telugu words in text using cache for known words.
-    Falls back to viterbi_segment for unknown words (cache miss).
-    Skips viterbi for tokens longer than MAX_TOKEN_LEN to avoid hangs.
+    Segment text into sub-word tokens using Morfessor for Telugu words.
+
+    - Pure Telugu words → Morfessor morphemes with @@ continuation markers
+    - Non-Telugu tokens → kept as-is
+    - Mixed-script tokens (e.g. 2024లో, IPLలో) → split at script boundary,
+      non-final parts get @@ to preserve the fact they were one token.
     """
     tokens = text.split()
     result = []
@@ -527,55 +558,31 @@ def _segment_text_cached(cache: dict, model, text: str, separator: str) -> str:
             result.append(token)
             continue
 
-        # Purely Telugu token — use cache
+        # Purely Telugu token
         if TELUGU_WORD_RE.fullmatch(token):
-            cached = cache.get(token)
-            if cached is not None:
-                result.append(cached)
-            elif len(token) > MAX_TOKEN_LEN:
-                # Too long — skip viterbi, keep as-is
-                result.append(token)
+            result.extend(_segment_telugu_word(cache, model, token, separator))
+            continue
+
+        # Mixed token — split on Telugu boundaries
+        # e.g. "2024లో" → ["2024", "లో"], "IPLలో" → ["IPL", "లో"]
+        parts = re.split(r"([\u0C00-\u0C7F]+)", token)
+        parts = [p for p in parts if p]  # remove empties
+
+        for part_idx, part in enumerate(parts):
+            is_last_part = (part_idx == len(parts) - 1)
+
+            if TELUGU_WORD_RE.fullmatch(part):
+                sub_tokens = _segment_telugu_word(cache, model, part, separator)
+                if not is_last_part:
+                    # Not the last fragment — ensure final sub-token has @@
+                    # so decode knows this Telugu fragment was glued to the next part
+                    if sub_tokens and not sub_tokens[-1].endswith(separator):
+                        sub_tokens[-1] = sub_tokens[-1] + separator
+                result.extend(sub_tokens)
             else:
-                # Cache miss — segment and cache for future
-                segments = model.viterbi_segment(token)[0]
-                if len(segments) > 1:
-                    parts = []
-                    for i, seg in enumerate(segments):
-                        if i < len(segments) - 1:
-                            parts.append(seg + separator)
-                        else:
-                            parts.append(seg)
-                    segmented = " ".join(parts)
-                else:
-                    segmented = token
-                cache[token] = segmented
-                result.append(segmented)
-        else:
-            # Mixed token — split on Telugu boundaries
-            parts = re.split(r"([\u0C00-\u0C7F]+)", token)
-            for part in parts:
-                if not part:
-                    continue
-                if TELUGU_WORD_RE.fullmatch(part):
-                    cached = cache.get(part)
-                    if cached is not None:
-                        result.append(cached)
-                    elif len(part) > MAX_TOKEN_LEN:
-                        result.append(part)
-                    else:
-                        segments = model.viterbi_segment(part)[0]
-                        if len(segments) > 1:
-                            seg_parts = []
-                            for i, seg in enumerate(segments):
-                                if i < len(segments) - 1:
-                                    seg_parts.append(seg + separator)
-                                else:
-                                    seg_parts.append(seg)
-                            segmented = " ".join(seg_parts)
-                        else:
-                            segmented = part
-                        cache[part] = segmented
-                        result.append(segmented)
+                # Non-Telugu fragment
+                if not is_last_part:
+                    result.append(part + separator)
                 else:
                     result.append(part)
 
