@@ -637,7 +637,21 @@ def train(
 
     model.to(device)
 
-    # Compile
+    # Resume BEFORE compile — checkpoint has raw keys (no _orig_mod. prefix)
+    start_step = 0
+    best_val_loss = float("inf")
+    tokens_processed = 0
+    if resume_from and os.path.exists(resume_from):
+        logger.info("Resuming from %s", resume_from)
+        checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["model"])
+        start_step = checkpoint["step"]
+        best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+        tokens_processed = checkpoint.get("tokens_processed", start_step * tokens_per_step)
+        logger.info("Resumed at step %d (epoch %.2f), best_val_loss=%.4f",
+                     start_step, tokens_processed / tokens_per_epoch, best_val_loss)
+
+    # Compile (after loading weights so keys match)
     if train_config.compile_model and hasattr(torch, "compile"):
         logger.info("Compiling model with torch.compile...")
         model = torch.compile(model)
@@ -661,6 +675,14 @@ def train(
         fused=True if device == "cuda" else False,
     )
 
+    # Load optimizer state if resuming (after optimizer is created with compiled model params)
+    if resume_from and os.path.exists(resume_from):
+        checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
+        if checkpoint.get("optimizer") is not None:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            logger.info("Restored optimizer state")
+        del checkpoint  # free memory
+
     # LR schedule
     def get_lr(step):
         if step < train_config.warmup_steps:
@@ -670,21 +692,6 @@ def train(
         decay_ratio = (step - train_config.warmup_steps) / (train_config.lr_decay_steps - train_config.warmup_steps)
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
         return train_config.min_lr + coeff * (train_config.learning_rate - train_config.min_lr)
-
-    # Resume
-    start_step = 0
-    best_val_loss = float("inf")
-    tokens_processed = 0
-    if resume_from and os.path.exists(resume_from):
-        logger.info("Resuming from %s", resume_from)
-        checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        start_step = checkpoint["step"]
-        best_val_loss = checkpoint.get("best_val_loss", float("inf"))
-        tokens_processed = checkpoint.get("tokens_processed", start_step * tokens_per_step)
-        logger.info("Resumed at step %d (epoch %.2f), best_val_loss=%.4f",
-                     start_step, tokens_processed / tokens_per_epoch, best_val_loss)
 
     # Save dir
     save_dir = Path(train_config.save_dir)
