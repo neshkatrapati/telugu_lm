@@ -350,7 +350,7 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
     tokenizer_config = {
         "tokenizer_class": "PreTrainedTokenizerFast",
         "auto_map": {
-            "AutoTokenizer": "tokenizer_class.TeluguTokenizer"
+            "AutoTokenizer": [None, "tokenizer_class.TeluguTokenizer"]
         },
         "model_type": "llama",
         "bos_token": "<bos>",
