@@ -322,30 +322,16 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
         special_tokens=[("<bos>", 2)],
     )
 
-    # Decoder: join with spaces, then strip @@ markers
-    # Metaspace with no prefix adds a space before each token during decode,
-    # giving us space-separated tokens. Then Replace strips the @@ markers.
-    tok.decoder = decoders.Sequence([
-        decoders.WordPiece(prefix="@@", cleanup=True),
-    ])
-
-    # The WordPiece decoder treats "@@" as a continuation prefix and joins
-    # tokens accordingly. But our @@ is a SUFFIX, not a prefix.
-    # So we need a different approach: use a custom decoder.
+    # Decoder: WordLevel with no decoder already joins tokens with spaces.
+    # We just need Replace decoders to strip @@ continuation markers.
     #
-    # Simplest correct approach: transform the vocab so that word-final tokens
-    # get a space prefix (like SentencePiece), then use Metaspace decoder.
-    # But that changes encoding. Instead, we'll use the Replace decoder
-    # approach but handle the space-joining properly.
-    #
-    # The trick: Metaspace decoder with replacement=" " prepend_scheme="never"
-    # adds spaces between tokens during decode. Then we replace "@@ " -> "".
-
+    # How it works:
+    #   1. WordLevel decode (built-in): "రెడ్డి@@" "గారు" → "రెడ్డి@@ గారు"
+    #   2. Replace("@@ ", ""):  "రెడ్డి@@ గారు" → "రెడ్డిగారు"
+    #   3. Replace("@@", ""):   handle trailing @@ on last token (edge case)
     tok.decoder = decoders.Sequence([
-        decoders.Metaspace(replacement=" ", prepend_scheme="never", add_prefix_space=False),
         decoders.Replace("@@ ", ""),
         decoders.Replace("@@", ""),
-        decoders.Strip(content=" ", left=1, right=0),
     ])
 
     # Add special tokens
