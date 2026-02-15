@@ -31,7 +31,7 @@ Usage:
     python -c "
     from transformers import AutoModelForCausalLM, AutoTokenizer
     model = AutoModelForCausalLM.from_pretrained('./telugu-llama-300m')
-    tok = AutoTokenizer.from_pretrained('./telugu-llama-300m')
+    tok = AutoTokenizer.from_pretrained('./telugu-llama-300m', trust_remote_code=True)
     print(model)
     print(tok)
     "
@@ -301,7 +301,7 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
     #   2. Replace "@@ " with "":        "రెడ్డిగారు ప్రభుత్వం"
     #   3. Strip any trailing "@@":       (edge case for last token)
 
-    from tokenizers import Tokenizer, models, pre_tokenizers, decoders, processors
+    from tokenizers import Tokenizer, models, pre_tokenizers
     from tokenizers.processors import TemplateProcessing
 
     # Build vocab dict
@@ -322,17 +322,18 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
         special_tokens=[("<bos>", 2)],
     )
 
-    # Decoder: WordLevel with no decoder already joins tokens with spaces.
-    # We just need Replace decoders to strip @@ continuation markers.
+    # Decoder: set to None (default).
+    # With decoder=None, WordLevel decode joins tokens with spaces:
+    #   "రెడ్డి@@" "గారు" → "రెడ్డి@@ గారు"
+    # The @@ stripping is handled by our custom TeluguTokenizer Python class
+    # (see create_tokenizer_class below), which overrides decode() to do:
+    #   text.replace("@@ ", "").rstrip("@@")
+    # This gives: "రెడ్డిగారు" — correct!
     #
-    # How it works:
-    #   1. WordLevel decode (built-in): "రెడ్డి@@" "గారు" → "రెడ్డి@@ గారు"
-    #   2. Replace("@@ ", ""):  "రెడ్డి@@ గారు" → "రెడ్డిగారు"
-    #   3. Replace("@@", ""):   handle trailing @@ on last token (edge case)
-    tok.decoder = decoders.Sequence([
-        decoders.Replace("@@ ", ""),
-        decoders.Replace("@@", ""),
-    ])
+    # We can't use a Sequence decoder because setting ANY custom decoder
+    # in the tokenizers library replaces the default space-joining with
+    # direct concatenation (no spaces between tokens).
+    tok.decoder = None
 
     # Add special tokens
     tok.add_special_tokens(["<pad>", "<unk>", "<bos>", "<eos>"])
@@ -344,8 +345,13 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
     logger.info("Saved tokenizer.json (hf_vocab_size=%d, model=WordLevel)", hf_vocab_size)
 
     # --- tokenizer_config.json ---
+    # Use auto_map to point to our custom TeluguTokenizer class which
+    # overrides decode() to strip @@ continuation markers.
     tokenizer_config = {
         "tokenizer_class": "PreTrainedTokenizerFast",
+        "auto_map": {
+            "AutoTokenizer": "tokenizer_class.TeluguTokenizer"
+        },
         "model_type": "llama",
         "bos_token": "<bos>",
         "eos_token": "<eos>",
@@ -385,6 +391,45 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
     logger.info("Saved special_tokens_map.json")
 
     return hf_vocab_size
+
+
+# ===========================================================================
+# Part 3b: Custom tokenizer class (handles @@ stripping in decode)
+# ===========================================================================
+def create_tokenizer_class(output_dir: Path):
+    """Create a custom tokenizer class that strips @@ markers during decode.
+
+    The tokenizers library's WordLevel decoder with decoder=None joins tokens
+    with spaces (correct), but keeps @@ markers in the output. Our custom
+    class overrides decode() to strip @@ after the default decode.
+    """
+    code = '''\
+"""Custom Telugu tokenizer that handles @@ continuation marker stripping."""
+from transformers import PreTrainedTokenizerFast
+
+
+class TeluguTokenizer(PreTrainedTokenizerFast):
+    """Telugu tokenizer with Morfessor @@ continuation marker support.
+
+    Tokens ending with @@ are continuation pieces that join to the next token.
+    This class overrides decode() to strip @@ markers and join morphemes:
+        "రెడ్డి@@ గారు" → "రెడ్డిగారు"
+    """
+
+    def decode(self, token_ids, skip_special_tokens=False, **kwargs):
+        text = super().decode(token_ids, skip_special_tokens=skip_special_tokens, **kwargs)
+        # Strip @@ continuation markers:
+        # "@@ " between tokens means "join to next token" (no space)
+        text = text.replace("@@ ", "")
+        # Handle trailing @@ on last token (edge case)
+        if text.endswith("@@"):
+            text = text[:-2]
+        return text
+'''
+    path = output_dir / "tokenizer_class.py"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(code)
+    logger.info("Saved tokenizer_class.py (custom TeluguTokenizer)")
 
 
 # ===========================================================================
@@ -485,7 +530,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
 model = AutoModelForCausalLM.from_pretrained("YOUR_USERNAME/telugu-llama-{param_str.lower()}")
-tokenizer = AutoTokenizer.from_pretrained("YOUR_USERNAME/telugu-llama-{param_str.lower()}")
+tokenizer = AutoTokenizer.from_pretrained("YOUR_USERNAME/telugu-llama-{param_str.lower()}", trust_remote_code=True)
 
 # Input must be Morfessor-segmented (with @@ continuation markers)
 segmented_text = "తెలుగు భాష చాలా అందమైన@@ ది"
@@ -597,7 +642,7 @@ def verify_conversion(output_dir: Path, checkpoint: dict, tokenizer_dir: Path):
     # 2. Load tokenizer with HF
     try:
         from transformers import AutoTokenizer
-        hf_tokenizer = AutoTokenizer.from_pretrained(str(output_dir))
+        hf_tokenizer = AutoTokenizer.from_pretrained(str(output_dir), trust_remote_code=True)
         logger.info("[PASS] Tokenizer loads with AutoTokenizer (vocab_size=%d)",
                      hf_tokenizer.vocab_size)
     except Exception as e:
@@ -703,11 +748,13 @@ def verify_conversion(output_dir: Path, checkpoint: dict, tokenizer_dir: Path):
     logger.info("Usage:")
     logger.info('  from transformers import AutoModelForCausalLM, AutoTokenizer')
     logger.info('  model = AutoModelForCausalLM.from_pretrained("%s")', output_dir)
-    logger.info('  tokenizer = AutoTokenizer.from_pretrained("%s")', output_dir)
+    logger.info('  tokenizer = AutoTokenizer.from_pretrained("%s", trust_remote_code=True)', output_dir)
     logger.info("")
     logger.info("To push to HuggingFace Hub:")
     logger.info('  model.push_to_hub("your-username/telugu-llama-300m")')
     logger.info('  tokenizer.push_to_hub("your-username/telugu-llama-300m")')
+    logger.info("")
+    logger.info("Note: trust_remote_code=True is needed for the custom @@ decoder.")
 
     return True
 
@@ -806,6 +853,11 @@ Examples:
     logger.info("--- Part 3: Converting weights ---")
     hf_state_dict = convert_weights(checkpoint, config, output_dir,
                                      original_vocab_size=original_vocab_size)
+
+    # Part 3b: Custom tokenizer class
+    logger.info("")
+    logger.info("--- Part 3b: Creating tokenizer_class.py ---")
+    create_tokenizer_class(output_dir)
 
     # Part 4: generation_config.json
     logger.info("")
