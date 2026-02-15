@@ -257,17 +257,17 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
     """Convert our custom tokenizer to HuggingFace format.
 
     Our tokenizer is a Morfessor+BPE hybrid with @@ continuation markers.
-    We create an HF-compatible tokenizer that:
-      - Uses the same vocab (token → id mapping)
-      - Uses BPE model (with our merge rules)
-      - Has a decoder that strips @@ markers to reconstruct text
-      - Adds <bos> prefix via post-processor
+    We create an HF-compatible tokenizer using WordLevel model (exact lookup):
+      - Uses the same vocab (token → id mapping, direct lookup)
+      - Pre-tokenizer: WhitespaceSplit (input is already segmented)
+      - Decoder: replaces "@@  " with "" to rejoin morphemes
+      - Post-processor: prepends <bos>
 
-    BPE merges reference intermediate tokens (merge results) that may not be
-    in our original vocab. HF requires ALL tokens in merge rules to exist in
-    the vocab, so we add any missing ones with new IDs.
+    We use WordLevel instead of BPE because our tokenizer does direct vocab
+    lookup on whole morpheme tokens (e.g. "విద్యార్థు@@" → ID). HF's BPE
+    model would re-split these into characters and merge up, giving wrong IDs.
 
-    Returns the final HF vocab size (may be > original if merge tokens added).
+    Returns the final HF vocab size.
 
     Note: HF tokenizer handles pre-segmented text. For raw Telugu text,
     users need to run Morfessor segmentation first (morfessor_telugu.bin).
@@ -289,41 +289,19 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
                 vocab_size, separator, len(bpe_merges))
 
     # --- Build HF tokenizer.json ---
-    # HF tokenizer.json format for BPE model
-    # We'll construct it manually for full control
+    # We use WordLevel model (exact token → id lookup), NOT BPE.
+    #
+    # Why: Our tokenizer does direct vocab lookup on whitespace-split tokens.
+    # The input is already Morfessor-segmented, so "విద్యార్థు@@" is a single
+    # vocab entry looked up directly. HF's BPE model would re-split it into
+    # characters and try to merge up — producing completely wrong IDs.
+    # WordLevel matches our actual encode() behavior: split on whitespace,
+    # look up each piece in the vocab, return <unk> if missing.
 
     # Build vocab dict for HF (token → id)
     hf_vocab = {}
     for token, tid in token_to_id.items():
         hf_vocab[token] = tid
-
-    # BPE merges produce intermediate tokens (e.g. merging "f"+"estival" needs
-    # "estival" in the vocab). HF requires EVERY token referenced in merges to
-    # exist in the vocab. Replay all merges and add any missing tokens.
-    next_id = max(hf_vocab.values()) + 1
-    added_for_merges = 0
-    for merge in bpe_merges:
-        if not isinstance(merge, (list, tuple)) or len(merge) != 2:
-            continue
-        a, b = merge[0], merge[1]
-        merged = a + b
-        # Ensure both inputs and the merge result are in the vocab
-        for token in (a, b, merged):
-            if token not in hf_vocab:
-                hf_vocab[token] = next_id
-                next_id += 1
-                added_for_merges += 1
-
-    if added_for_merges:
-        logger.info("Added %d intermediate BPE tokens to vocab (required by HF merge rules)",
-                     added_for_merges)
-        logger.info("  HF vocab size: %d (was %d)", len(hf_vocab), vocab_size)
-
-    # Build merges list for HF format (list of "a b" strings)
-    hf_merges = []
-    for merge in bpe_merges:
-        if isinstance(merge, (list, tuple)) and len(merge) == 2:
-            hf_merges.append(f"{merge[0]} {merge[1]}")
 
     # Construct the HF tokenizer.json
     hf_tokenizer = {
@@ -393,15 +371,9 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
             "content": "",
         },
         "model": {
-            "type": "BPE",
-            "dropout": None,
-            "unk_token": "<unk>",
-            "continuing_subword_prefix": None,
-            "end_of_word_suffix": None,
-            "fuse_unk": False,
-            "byte_fallback": False,
+            "type": "WordLevel",
             "vocab": hf_vocab,
-            "merges": hf_merges,
+            "unk_token": "<unk>",
         },
     }
 
@@ -410,8 +382,7 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
     with open(hf_tok_path, "w", encoding="utf-8") as f:
         json.dump(hf_tokenizer, f, ensure_ascii=False, indent=2)
     hf_vocab_size = len(hf_vocab)
-    logger.info("Saved tokenizer.json (hf_vocab_size=%d, original=%d, %d merges)",
-                hf_vocab_size, original_vocab_size, len(hf_merges))
+    logger.info("Saved tokenizer.json (hf_vocab_size=%d, model=WordLevel)", hf_vocab_size)
 
     # --- tokenizer_config.json ---
     tokenizer_config = {
@@ -479,6 +450,157 @@ def create_generation_config(output_dir: Path):
     with open(path, "w") as f:
         json.dump(gen_config, f, indent=2)
     logger.info("Saved generation_config.json")
+
+
+# ===========================================================================
+# Part 5: Model card (README.md)
+# ===========================================================================
+def create_model_card(config: dict, output_dir: Path):
+    """Create a HuggingFace model card (README.md)."""
+
+    vocab_size = config["vocab_size"]
+    n_layers = config["num_hidden_layers"]
+    n_heads = config["num_attention_heads"]
+    hidden = config["hidden_size"]
+    intermediate = config["intermediate_size"]
+    ctx_len = config["max_position_embeddings"]
+
+    # Rough param count (same formula as GPTConfig.param_count)
+    emb = vocab_size * hidden
+    attn_per_layer = 4 * hidden ** 2
+    mlp_per_layer = 3 * hidden * intermediate
+    tfm = n_layers * (attn_per_layer + mlp_per_layer)
+    norms = (2 * n_layers + 1) * hidden
+    n_params = emb + tfm + norms
+    param_str = f"{n_params / 1e6:.0f}M"
+
+    card = f"""---
+language:
+  - te
+license: apache-2.0
+tags:
+  - telugu
+  - llama
+  - causal-lm
+  - morfessor
+  - from-scratch
+library_name: transformers
+pipeline_tag: text-generation
+---
+
+# Telugu LLaMA ({param_str})
+
+A **{param_str} parameter** LLaMA-style language model trained **from scratch** on Telugu text.
+
+## Model Details
+
+| | |
+|---|---|
+| **Architecture** | LLaMA (RoPE + SwiGLU + RMSNorm) |
+| **Parameters** | {param_str} |
+| **Hidden size** | {hidden} |
+| **Layers** | {n_layers} |
+| **Attention heads** | {n_heads} |
+| **Intermediate size** | {intermediate} |
+| **Context length** | {ctx_len} |
+| **Vocab size** | {vocab_size:,} |
+| **Tokenizer** | Morfessor + BPE (Telugu morpheme-aware) |
+| **Training** | Single GPU, bf16 mixed precision |
+
+## Tokenizer
+
+This model uses a **Morfessor + BPE hybrid tokenizer** designed for Telugu:
+
+- **Telugu text**: Segmented into morphemes using [Morfessor](https://github.com/aalto-speech/morfessor) with `@@` continuation markers
+- **Non-Telugu text** (English, numbers, URLs): Handled by BPE subword encoding
+- **Fallback**: Character-level encoding for out-of-vocabulary tokens
+
+**Important**: The tokenizer expects **pre-segmented** input (with `@@` markers). For raw Telugu text, you need to run Morfessor segmentation first.
+
+## Usage
+
+### Basic usage (with pre-segmented text)
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+model = AutoModelForCausalLM.from_pretrained("YOUR_USERNAME/telugu-llama-{param_str.lower()}")
+tokenizer = AutoTokenizer.from_pretrained("YOUR_USERNAME/telugu-llama-{param_str.lower()}")
+
+# Input must be Morfessor-segmented (with @@ continuation markers)
+segmented_text = "తెలుగు భాష చాలా అందమైన@@ ది"
+inputs = tokenizer(segmented_text, return_tensors="pt")
+
+with torch.no_grad():
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=100,
+        temperature=0.8,
+        top_k=50,
+        do_sample=True,
+    )
+
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+```
+
+### Full pipeline (raw Telugu text)
+
+For raw Telugu text, segment with Morfessor first:
+
+```python
+import morfessor
+
+# Load Morfessor model
+io = morfessor.MorfessorIO()
+morf_model = io.read_binary_model_file("morfessor_telugu.bin")
+
+def segment_telugu(text, separator="@@"):
+    import re
+    TELUGU_RE = re.compile(r"[\\u0C00-\\u0C7F]+")
+    tokens = []
+    for word in text.split():
+        if TELUGU_RE.fullmatch(word):
+            segments = morf_model.viterbi_segment(word)[0]
+            for i, seg in enumerate(segments):
+                tokens.append(seg + separator if i < len(segments) - 1 else seg)
+        else:
+            tokens.append(word)
+    return " ".join(tokens)
+
+# Segment, then tokenize and generate
+raw_text = "తెలుగు భాష చాలా అందమైనది"
+segmented = segment_telugu(raw_text)
+inputs = tokenizer(segmented, return_tensors="pt")
+outputs = model.generate(**inputs, max_new_tokens=100, do_sample=True)
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+```
+
+## Training
+
+- **Data**: Telugu text corpus (Sangraha dataset)
+- **Preprocessing**: Morfessor morpheme segmentation + BPE for non-Telugu
+- **Optimizer**: AdamW (lr=3e-4, weight_decay=0.1, beta1=0.9, beta2=0.95)
+- **Schedule**: Cosine LR decay with 500-step warmup
+- **Precision**: bf16 mixed precision
+- **Hardware**: Single GPU
+
+## Limitations
+
+- This is a **base model** (not instruction-tuned) — it performs text completion, not instruction following
+- The tokenizer requires **Morfessor-segmented input** for best results
+- Trained primarily on Telugu text; limited multilingual capability
+- Small model size ({param_str}) limits reasoning and knowledge capacity
+
+## License
+
+Apache 2.0
+"""
+
+    readme_path = output_dir / "README.md"
+    with open(readme_path, "w", encoding="utf-8") as f:
+        f.write(card)
+    logger.info("Saved README.md (model card)")
 
 
 # ===========================================================================
@@ -713,6 +835,11 @@ Examples:
     logger.info("")
     logger.info("--- Part 4: Creating generation_config.json ---")
     create_generation_config(output_dir)
+
+    # Part 5: Model card
+    logger.info("")
+    logger.info("--- Part 5: Creating README.md (model card) ---")
+    create_model_card(config, output_dir)
 
     # Copy Morfessor model if provided
     if args.morfessor_model:
