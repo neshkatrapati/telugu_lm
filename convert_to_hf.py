@@ -548,6 +548,17 @@ with torch.no_grad():
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 ```
 
+### Using pipeline
+
+```python
+from transformers import pipeline
+
+pipe = pipeline("text-generation", model="YOUR_USERNAME/telugu-llama-{param_str.lower()}", trust_remote_code=True)
+print(pipe("తెలుగు భాష", max_new_tokens=50))
+```
+
+> **Note**: `trust_remote_code=True` is required for the custom tokenizer that handles `@@` morpheme joining. Without it, `@@` markers will appear in the output.
+
 ### Full pipeline (raw Telugu text)
 
 For raw Telugu text, segment with Morfessor first:
