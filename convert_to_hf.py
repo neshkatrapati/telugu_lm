@@ -491,8 +491,6 @@ tags:
   - from-scratch
 library_name: transformers
 pipeline_tag: text-generation
-model-index:
-  - name: {model_name}
 ---
 
 # Pothana Base 300M
