@@ -478,6 +478,8 @@ def create_model_card(config: dict, output_dir: Path):
     n_params = emb + tfm + norms
     param_str = f"{n_params / 1e6:.0f}M"
 
+    model_name = "pothana-base-300M"
+
     card = f"""---
 language:
   - te
@@ -492,9 +494,9 @@ library_name: transformers
 pipeline_tag: text-generation
 ---
 
-# Telugu LLaMA ({param_str})
+# Pothana Base ({param_str})
 
-A **{param_str} parameter** LLaMA-style language model trained **from scratch** on Telugu text.
+A **{param_str} parameter** LLaMA-style language model trained **from scratch** on Telugu text. Named after [Pothana](https://en.wikipedia.org/wiki/Bammera_Pothana), the celebrated Telugu poet who authored the Andhra Maha Bhagavatamu.
 
 ## Model Details
 
@@ -529,8 +531,8 @@ This model uses a **Morfessor + BPE hybrid tokenizer** designed for Telugu:
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
-model = AutoModelForCausalLM.from_pretrained("YOUR_USERNAME/telugu-llama-{param_str.lower()}")
-tokenizer = AutoTokenizer.from_pretrained("YOUR_USERNAME/telugu-llama-{param_str.lower()}", trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained("YOUR_USERNAME/{model_name}")
+tokenizer = AutoTokenizer.from_pretrained("YOUR_USERNAME/{model_name}", trust_remote_code=True)
 
 # Input must be Morfessor-segmented (with @@ continuation markers)
 segmented_text = "తెలుగు భాష చాలా అందమైన@@ ది"
@@ -553,7 +555,7 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 ```python
 from transformers import pipeline
 
-pipe = pipeline("text-generation", model="YOUR_USERNAME/telugu-llama-{param_str.lower()}", trust_remote_code=True)
+pipe = pipeline("text-generation", model="YOUR_USERNAME/{model_name}", trust_remote_code=True)
 print(pipe("తెలుగు భాష", max_new_tokens=50))
 ```
 
@@ -762,8 +764,8 @@ def verify_conversion(output_dir: Path, checkpoint: dict, tokenizer_dir: Path):
     logger.info('  tokenizer = AutoTokenizer.from_pretrained("%s", trust_remote_code=True)', output_dir)
     logger.info("")
     logger.info("To push to HuggingFace Hub:")
-    logger.info('  model.push_to_hub("your-username/telugu-llama-300m")')
-    logger.info('  tokenizer.push_to_hub("your-username/telugu-llama-300m")')
+    logger.info('  model.push_to_hub("your-username/pothana-base-300M")')
+    logger.info('  tokenizer.push_to_hub("your-username/pothana-base-300M")')
     logger.info("")
     logger.info("Note: trust_remote_code=True is needed for the custom @@ decoder.")
 
