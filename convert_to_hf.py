@@ -421,9 +421,8 @@ class TeluguTokenizer(PreTrainedTokenizerFast):
         # Strip @@ continuation markers:
         # "@@ " between tokens means "join to next token" (no space)
         text = text.replace("@@ ", "")
-        # Handle trailing @@ on last token (edge case)
-        if text.endswith("@@"):
-            text = text[:-2]
+        # Handle remaining @@ (before punctuation, end of string, etc.)
+        text = text.replace("@@", "")
         return text
 '''
     path = output_dir / "tokenizer_class.py"
