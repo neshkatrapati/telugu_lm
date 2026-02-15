@@ -491,16 +491,23 @@ tags:
   - from-scratch
 library_name: transformers
 pipeline_tag: text-generation
+model-index:
+  - name: {model_name}
 ---
 
-# Pothana Base ({param_str})
+# Pothana Base 300M
 
-A **{param_str} parameter** LLaMA-style language model trained **from scratch** on Telugu text. Named after [Pothana](https://en.wikipedia.org/wiki/Bammera_Pothana), the celebrated Telugu poet who authored the Andhra Maha Bhagavatamu.
+A **{param_str} parameter** LLaMA-style language model trained **from scratch** on Telugu text.
+
+Named after [Bammera Pothana](https://en.wikipedia.org/wiki/Bammera_Pothana), the celebrated 15th-century Telugu poet who authored the *Andhra Maha Bhagavatamu*.
+
+Developed by **[Dvitva AI](https://dvitva.ai)**.
 
 ## Model Details
 
 | | |
 |---|---|
+| **Model** | {model_name} |
 | **Architecture** | LLaMA (RoPE + SwiGLU + RMSNorm) |
 | **Parameters** | {param_str} |
 | **Hidden size** | {hidden} |
@@ -511,27 +518,30 @@ A **{param_str} parameter** LLaMA-style language model trained **from scratch** 
 | **Vocab size** | {vocab_size:,} |
 | **Tokenizer** | Morfessor + BPE (Telugu morpheme-aware) |
 | **Training** | Single GPU, bf16 mixed precision |
+| **Developed by** | [Dvitva AI](https://dvitva.ai) |
 
-## Tokenizer
+## Quick Start
 
-This model uses a **Morfessor + BPE hybrid tokenizer** designed for Telugu:
+### Using pipeline
 
-- **Telugu text**: Segmented into morphemes using [Morfessor](https://github.com/aalto-speech/morfessor) with `@@` continuation markers
-- **Non-Telugu text** (English, numbers, URLs): Handled by BPE subword encoding
-- **Fallback**: Character-level encoding for out-of-vocabulary tokens
+```python
+from transformers import pipeline
 
-**Important**: The tokenizer expects **pre-segmented** input (with `@@` markers). For raw Telugu text, you need to run Morfessor segmentation first.
+pipe = pipeline("text-generation", model="dvitva/{model_name}", trust_remote_code=True)
+result = pipe("తెలుగు భాష", max_new_tokens=50, do_sample=True, temperature=0.8)
+print(result[0]["generated_text"])
+```
 
-## Usage
+> **Note**: `trust_remote_code=True` is required for the custom tokenizer that handles `@@` morpheme joining. Without it, `@@` markers will appear in the output.
 
-### Basic usage (with pre-segmented text)
+### Manual loading
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
-model = AutoModelForCausalLM.from_pretrained("YOUR_USERNAME/{model_name}")
-tokenizer = AutoTokenizer.from_pretrained("YOUR_USERNAME/{model_name}", trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained("dvitva/{model_name}")
+tokenizer = AutoTokenizer.from_pretrained("dvitva/{model_name}", trust_remote_code=True)
 
 # Input must be Morfessor-segmented (with @@ continuation markers)
 segmented_text = "తెలుగు భాష చాలా అందమైన@@ ది"
@@ -549,16 +559,15 @@ with torch.no_grad():
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 ```
 
-### Using pipeline
+## Tokenizer
 
-```python
-from transformers import pipeline
+This model uses a **Morfessor + BPE hybrid tokenizer** designed for Telugu:
 
-pipe = pipeline("text-generation", model="YOUR_USERNAME/{model_name}", trust_remote_code=True)
-print(pipe("తెలుగు భాష", max_new_tokens=50))
-```
+- **Telugu text**: Segmented into morphemes using [Morfessor](https://github.com/aalto-speech/morfessor) with `@@` continuation markers
+- **Non-Telugu text** (English, numbers, URLs): Handled by BPE subword encoding
+- **Fallback**: Character-level encoding for out-of-vocabulary tokens
 
-> **Note**: `trust_remote_code=True` is required for the custom tokenizer that handles `@@` morpheme joining. Without it, `@@` markers will appear in the output.
+**Important**: The tokenizer expects **pre-segmented** input (with `@@` markers). For raw Telugu text, you need to run Morfessor segmentation first.
 
 ### Full pipeline (raw Telugu text)
 
@@ -611,6 +620,19 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 ## License
 
 Apache 2.0
+
+## Citation
+
+If you use this model, please cite:
+
+```
+@misc{{pothana-base-300M,
+  title={{Pothana Base 300M: A Telugu Language Model}},
+  author={{Dvitva AI}},
+  year={{2025}},
+  url={{https://huggingface.co/dvitva/{model_name}}}
+}}
+```
 """
 
     readme_path = output_dir / "README.md"
