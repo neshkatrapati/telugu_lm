@@ -131,7 +131,8 @@ def create_config(checkpoint: dict, output_dir: Path):
 # ===========================================================================
 # Part 2: Convert weights
 # ===========================================================================
-def convert_weights(checkpoint: dict, config: dict, output_dir: Path):
+def convert_weights(checkpoint: dict, config: dict, output_dir: Path,
+                    original_vocab_size: int = 0):
     """Convert our state_dict to HF LlamaForCausalLM format.
 
     Key operations:
@@ -139,6 +140,7 @@ def convert_weights(checkpoint: dict, config: dict, output_dir: Path):
       - Rename all keys to HF naming convention
       - Skip freqs_cis buffer (HF recomputes RoPE)
       - Skip lm_head.weight (tied to embed_tokens)
+      - Pad embedding if vocab was expanded (BPE merge intermediates)
       - Save as model.safetensors
     """
     import torch
@@ -147,11 +149,19 @@ def convert_weights(checkpoint: dict, config: dict, output_dir: Path):
     state_dict = checkpoint["model"]
     n_embd = config["hidden_size"]
     n_layer = config["num_hidden_layers"]
+    hf_vocab_size = config["vocab_size"]
 
     hf_state_dict = {}
 
-    # Embedding
-    hf_state_dict["model.embed_tokens.weight"] = state_dict["transformer.wte.weight"]
+    # Embedding — pad with zeros if vocab was expanded for BPE merge intermediates
+    embed_weight = state_dict["transformer.wte.weight"]
+    if hf_vocab_size > embed_weight.shape[0]:
+        n_extra = hf_vocab_size - embed_weight.shape[0]
+        logger.info("Padding embedding: %d → %d rows (+%d zero rows for BPE merge tokens)",
+                     embed_weight.shape[0], hf_vocab_size, n_extra)
+        padding = torch.zeros(n_extra, n_embd, dtype=embed_weight.dtype)
+        embed_weight = torch.cat([embed_weight, padding], dim=0)
+    hf_state_dict["model.embed_tokens.weight"] = embed_weight
 
     # Transformer layers
     for i in range(n_layer):
@@ -243,7 +253,7 @@ def convert_weights(checkpoint: dict, config: dict, output_dir: Path):
 # ===========================================================================
 # Part 3: Convert tokenizer
 # ===========================================================================
-def convert_tokenizer(tokenizer_dir: Path, output_dir: Path):
+def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size: int):
     """Convert our custom tokenizer to HuggingFace format.
 
     Our tokenizer is a Morfessor+BPE hybrid with @@ continuation markers.
@@ -252,6 +262,12 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path):
       - Uses BPE model (with our merge rules)
       - Has a decoder that strips @@ markers to reconstruct text
       - Adds <bos> prefix via post-processor
+
+    BPE merges reference intermediate tokens (merge results) that may not be
+    in our original vocab. HF requires ALL tokens in merge rules to exist in
+    the vocab, so we add any missing ones with new IDs.
+
+    Returns the final HF vocab size (may be > original if merge tokens added).
 
     Note: HF tokenizer handles pre-segmented text. For raw Telugu text,
     users need to run Morfessor segmentation first (morfessor_telugu.bin).
@@ -280,6 +296,28 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path):
     hf_vocab = {}
     for token, tid in token_to_id.items():
         hf_vocab[token] = tid
+
+    # BPE merges produce intermediate tokens (e.g. merging "f"+"estival" needs
+    # "estival" in the vocab). HF requires EVERY token referenced in merges to
+    # exist in the vocab. Replay all merges and add any missing tokens.
+    next_id = max(hf_vocab.values()) + 1
+    added_for_merges = 0
+    for merge in bpe_merges:
+        if not isinstance(merge, (list, tuple)) or len(merge) != 2:
+            continue
+        a, b = merge[0], merge[1]
+        merged = a + b
+        # Ensure both inputs and the merge result are in the vocab
+        for token in (a, b, merged):
+            if token not in hf_vocab:
+                hf_vocab[token] = next_id
+                next_id += 1
+                added_for_merges += 1
+
+    if added_for_merges:
+        logger.info("Added %d intermediate BPE tokens to vocab (required by HF merge rules)",
+                     added_for_merges)
+        logger.info("  HF vocab size: %d (was %d)", len(hf_vocab), vocab_size)
 
     # Build merges list for HF format (list of "a b" strings)
     hf_merges = []
@@ -371,7 +409,9 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path):
     hf_tok_path = output_dir / "tokenizer.json"
     with open(hf_tok_path, "w", encoding="utf-8") as f:
         json.dump(hf_tokenizer, f, ensure_ascii=False, indent=2)
-    logger.info("Saved tokenizer.json (vocab_size=%d, %d merges)", vocab_size, len(hf_merges))
+    hf_vocab_size = len(hf_vocab)
+    logger.info("Saved tokenizer.json (hf_vocab_size=%d, original=%d, %d merges)",
+                hf_vocab_size, original_vocab_size, len(hf_merges))
 
     # --- tokenizer_config.json ---
     tokenizer_config = {
@@ -413,6 +453,8 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path):
     with open(stm_path, "w") as f:
         json.dump(special_tokens_map, f, indent=2)
     logger.info("Saved special_tokens_map.json")
+
+    return hf_vocab_size
 
 
 # ===========================================================================
@@ -645,20 +687,27 @@ Examples:
                 checkpoint.get("step", "?"),
                 {k: v for k, v in checkpoint["config"].items()})
 
-    # Part 1: config.json
+    original_vocab_size = checkpoint["config"]["vocab_size"]
+
+    # Part 1: Convert tokenizer FIRST — may add extra vocab entries for BPE merge intermediates
     logger.info("")
-    logger.info("--- Part 1: Creating config.json ---")
+    logger.info("--- Part 1: Converting tokenizer ---")
+    hf_vocab_size = convert_tokenizer(tokenizer_dir, output_dir, original_vocab_size)
+
+    # Part 2: config.json — use the (possibly expanded) HF vocab size
+    logger.info("")
+    logger.info("--- Part 2: Creating config.json ---")
+    if hf_vocab_size > original_vocab_size:
+        logger.info("Vocab expanded: %d → %d (BPE merge intermediates added)",
+                     original_vocab_size, hf_vocab_size)
+        checkpoint["config"]["vocab_size"] = hf_vocab_size
     config = create_config(checkpoint, output_dir)
 
-    # Part 2: Convert weights
+    # Part 3: Convert weights — pad embedding if vocab was expanded
     logger.info("")
-    logger.info("--- Part 2: Converting weights ---")
-    hf_state_dict = convert_weights(checkpoint, config, output_dir)
-
-    # Part 3: Convert tokenizer
-    logger.info("")
-    logger.info("--- Part 3: Converting tokenizer ---")
-    convert_tokenizer(tokenizer_dir, output_dir)
+    logger.info("--- Part 3: Converting weights ---")
+    hf_state_dict = convert_weights(checkpoint, config, output_dir,
+                                     original_vocab_size=original_vocab_size)
 
     # Part 4: generation_config.json
     logger.info("")
