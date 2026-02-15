@@ -527,7 +527,7 @@ Developed by **[Dvitva AI](https://dvitva.ai)**.
 ```python
 from transformers import pipeline
 
-pipe = pipeline("text-generation", model="dvitva/{model_name}", trust_remote_code=True)
+pipe = pipeline("text-generation", model="dvitvaai/{model_name}", trust_remote_code=True)
 result = pipe("తెలుగు భాష", max_new_tokens=50, do_sample=True, temperature=0.8)
 print(result[0]["generated_text"])
 ```
@@ -540,8 +540,8 @@ print(result[0]["generated_text"])
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
-model = AutoModelForCausalLM.from_pretrained("dvitva/{model_name}")
-tokenizer = AutoTokenizer.from_pretrained("dvitva/{model_name}", trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained("dvitvaai/{model_name}")
+tokenizer = AutoTokenizer.from_pretrained("dvitvaai/{model_name}", trust_remote_code=True)
 
 # Input must be Morfessor-segmented (with @@ continuation markers)
 segmented_text = "తెలుగు భాష చాలా అందమైన@@ ది"
@@ -630,7 +630,7 @@ If you use this model, please cite:
   title={{Pothana Base 300M: A Telugu Language Model}},
   author={{Dvitva AI}},
   year={{2025}},
-  url={{https://huggingface.co/dvitva/{model_name}}}
+  url={{https://huggingface.co/dvitvaai/{model_name}}}
 }}
 ```
 """
@@ -785,8 +785,8 @@ def verify_conversion(output_dir: Path, checkpoint: dict, tokenizer_dir: Path):
     logger.info('  tokenizer = AutoTokenizer.from_pretrained("%s", trust_remote_code=True)', output_dir)
     logger.info("")
     logger.info("To push to HuggingFace Hub:")
-    logger.info('  model.push_to_hub("your-username/pothana-base-300M")')
-    logger.info('  tokenizer.push_to_hub("your-username/pothana-base-300M")')
+    logger.info('  model.push_to_hub("dvitvaai/pothana-base-300M")')
+    logger.info('  tokenizer.push_to_hub("dvitvaai/pothana-base-300M")')
     logger.info("")
     logger.info("Note: trust_remote_code=True is needed for the custom @@ decoder.")
 
