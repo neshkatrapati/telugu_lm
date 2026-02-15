@@ -365,21 +365,7 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
                 "<bos>": {"id": "<bos>", "ids": [2], "tokens": ["<bos>"]},
             },
         },
-        "decoder": {
-            "type": "Sequence",
-            "decoders": [
-                {
-                    "type": "Replace",
-                    "pattern": {"String": f"{separator} "},
-                    "content": "",
-                },
-                {
-                    "type": "Replace",
-                    "pattern": {"String": separator},
-                    "content": "",
-                },
-            ],
-        },
+        "decoder": None,
         "model": {
             "type": "WordLevel",
             "vocab": hf_vocab,
