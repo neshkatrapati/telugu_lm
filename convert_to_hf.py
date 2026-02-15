@@ -288,95 +288,72 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
     logger.info("Our tokenizer: vocab_size=%d, separator='%s', %d BPE merges",
                 vocab_size, separator, len(bpe_merges))
 
-    # --- Build HF tokenizer.json ---
+    # --- Build HF tokenizer using the `tokenizers` library ---
     # We use WordLevel model (exact token → id lookup), NOT BPE.
     #
     # Why: Our tokenizer does direct vocab lookup on whitespace-split tokens.
     # The input is already Morfessor-segmented, so "విద్యార్థు@@" is a single
     # vocab entry looked up directly. HF's BPE model would re-split it into
     # characters and try to merge up — producing completely wrong IDs.
-    # WordLevel matches our actual encode() behavior: split on whitespace,
-    # look up each piece in the vocab, return <unk> if missing.
+    #
+    # Decode logic (matches our tokenizer.decode()):
+    #   1. Join all tokens with spaces:  "రెడ్డి@@ గారు ప్రభుత్వం"
+    #   2. Replace "@@ " with "":        "రెడ్డిగారు ప్రభుత్వం"
+    #   3. Strip any trailing "@@":       (edge case for last token)
 
-    # Build vocab dict for HF (token → id)
+    from tokenizers import Tokenizer, models, pre_tokenizers, decoders, processors
+    from tokenizers.processors import TemplateProcessing
+
+    # Build vocab dict
     hf_vocab = {}
     for token, tid in token_to_id.items():
         hf_vocab[token] = tid
 
-    # Construct the HF tokenizer.json
-    hf_tokenizer = {
-        "version": "1.0",
-        "truncation": None,
-        "padding": None,
-        "added_tokens": [
-            {
-                "id": 0,
-                "content": "<pad>",
-                "single_word": False,
-                "lstrip": False,
-                "rstrip": False,
-                "normalized": False,
-                "special": True,
-            },
-            {
-                "id": 1,
-                "content": "<unk>",
-                "single_word": False,
-                "lstrip": False,
-                "rstrip": False,
-                "normalized": False,
-                "special": True,
-            },
-            {
-                "id": 2,
-                "content": "<bos>",
-                "single_word": False,
-                "lstrip": False,
-                "rstrip": False,
-                "normalized": False,
-                "special": True,
-            },
-            {
-                "id": 3,
-                "content": "<eos>",
-                "single_word": False,
-                "lstrip": False,
-                "rstrip": False,
-                "normalized": False,
-                "special": True,
-            },
-        ],
-        "normalizer": None,
-        "pre_tokenizer": {
-            "type": "WhitespaceSplit",
-        },
-        "post_processor": {
-            "type": "TemplateProcessing",
-            "single": [
-                {"SpecialToken": {"id": "<bos>", "type_id": 0}},
-                {"Sequence": {"id": "A", "type_id": 0}},
-            ],
-            "pair": [
-                {"SpecialToken": {"id": "<bos>", "type_id": 0}},
-                {"Sequence": {"id": "A", "type_id": 0}},
-                {"Sequence": {"id": "B", "type_id": 1}},
-            ],
-            "special_tokens": {
-                "<bos>": {"id": "<bos>", "ids": [2], "tokens": ["<bos>"]},
-            },
-        },
-        "decoder": None,
-        "model": {
-            "type": "WordLevel",
-            "vocab": hf_vocab,
-            "unk_token": "<unk>",
-        },
-    }
+    # Create WordLevel tokenizer
+    tok = Tokenizer(models.WordLevel(vocab=hf_vocab, unk_token="<unk>"))
 
-    # Save HF tokenizer.json
+    # Pre-tokenizer: split on whitespace (input is already segmented)
+    tok.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+
+    # Post-processor: prepend <bos>
+    tok.post_processor = TemplateProcessing(
+        single="<bos> $A",
+        pair="<bos> $A $B:1",
+        special_tokens=[("<bos>", 2)],
+    )
+
+    # Decoder: join with spaces, then strip @@ markers
+    # Metaspace with no prefix adds a space before each token during decode,
+    # giving us space-separated tokens. Then Replace strips the @@ markers.
+    tok.decoder = decoders.Sequence([
+        decoders.WordPiece(prefix="@@", cleanup=True),
+    ])
+
+    # The WordPiece decoder treats "@@" as a continuation prefix and joins
+    # tokens accordingly. But our @@ is a SUFFIX, not a prefix.
+    # So we need a different approach: use a custom decoder.
+    #
+    # Simplest correct approach: transform the vocab so that word-final tokens
+    # get a space prefix (like SentencePiece), then use Metaspace decoder.
+    # But that changes encoding. Instead, we'll use the Replace decoder
+    # approach but handle the space-joining properly.
+    #
+    # The trick: Metaspace decoder with replacement=" " prepend_scheme="never"
+    # adds spaces between tokens during decode. Then we replace "@@ " -> "".
+
+    tok.decoder = decoders.Sequence([
+        decoders.Metaspace(replacement=" ", prepend_scheme="never", add_prefix_space=False),
+        decoders.Replace("@@ ", ""),
+        decoders.Replace("@@", ""),
+        decoders.Strip(content=" ", left=1, right=0),
+    ])
+
+    # Add special tokens
+    tok.add_special_tokens(["<pad>", "<unk>", "<bos>", "<eos>"])
+
+    # Save
     hf_tok_path = output_dir / "tokenizer.json"
-    with open(hf_tok_path, "w", encoding="utf-8") as f:
-        json.dump(hf_tokenizer, f, ensure_ascii=False, indent=2)
+    tok.save(str(hf_tok_path))
     hf_vocab_size = len(hf_vocab)
     logger.info("Saved tokenizer.json (hf_vocab_size=%d, model=WordLevel)", hf_vocab_size)
 
