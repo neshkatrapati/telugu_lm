@@ -5,11 +5,15 @@ Verify HF converted model produces same logits as original checkpoint.
 Run this on the REMOTE machine where you have the SFT checkpoint and PyTorch.
 
 Usage:
-    python verify_hf_weights.py --checkpoint ./sft_checkpoints/best.pt
+    # After re-converting with fixed convert_to_hf.py:
+    python verify_hf_weights.py --checkpoint ./sft_checkpoints/best.pt --hf-dir ./pothana-chat-300M-hf
+
+    # Or compare against the Hub model:
+    python verify_hf_weights.py --checkpoint ./sft_checkpoints/best.pt --hf-dir dvitvaai/pothana-chat-300M
 
 This will:
 1. Load the original checkpoint with our GPT model
-2. Load the HF model from dvitvaai/pothana-chat-300M
+2. Load the HF model from the specified directory/Hub
 3. Feed the same input to both
 4. Compare the logits
 """
@@ -26,8 +30,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", "-c", type=Path, required=True)
+    parser.add_argument("--hf-dir", type=str, default="dvitvaai/pothana-chat-300M",
+                        help="Path to local HF model dir or Hub model ID")
     parser.add_argument("--tokenizer", "-t", type=Path, default=Path("./tokenizer"))
     args = parser.parse_args()
+
+    hf_model_path = args.hf_dir
 
     # ---- Load original model ----
     print("=" * 70)
@@ -49,10 +57,10 @@ def main():
     print(f"  Loaded: vocab={config.vocab_size}, layers={config.n_layer}, hidden={config.n_embd}")
 
     # ---- Load HF model ----
-    print("\nLoading HF model from dvitvaai/pothana-chat-300M...")
+    print(f"\nLoading HF model from {hf_model_path}...")
     from transformers import AutoModelForCausalLM
     model_hf = AutoModelForCausalLM.from_pretrained(
-        "dvitvaai/pothana-chat-300M", torch_dtype=torch.float32
+        hf_model_path, torch_dtype=torch.float32
     ).eval()
     print(f"  Loaded: vocab={model_hf.config.vocab_size}")
 
@@ -66,9 +74,7 @@ def main():
     # ---- Forward pass: original model ----
     print("\nOriginal model forward pass...")
     with torch.no_grad():
-        # Our model's forward: logits, loss = model(idx, targets)
-        logits_ours = model_ours(input_tensor)[0]  # (B, T, V) when targets=None -> (B, 1, V) for last token
-        # Actually check what our model returns without targets
+        logits_ours = model_ours(input_tensor)[0]
         print(f"  Our logits shape: {logits_ours.shape}")
 
     # ---- Forward pass: HF model ----
@@ -122,7 +128,6 @@ def main():
         print("     The weight conversion has a bug.")
 
         # Try to identify where the mismatch starts
-        # Compare embedding output
         print("\n  Debugging: comparing intermediate outputs...")
 
         with torch.no_grad():
@@ -150,7 +155,7 @@ def main():
                 ln1_diff = (ln1_ours - ln1_hf).abs().max().item()
                 print(f"    Layer 0 LN1 diff: {ln1_diff:.6f}")
 
-                # QKV
+                # QKV raw (before RoPE)
                 attn_ours = model_ours.transformer.h[0].attn
                 qkv_ours = attn_ours.c_attn(ln1_ours)
                 q_ours, k_ours, v_ours = qkv_ours.split(config.n_embd, dim=2)
@@ -160,12 +165,39 @@ def main():
                 k_hf = attn_hf.k_proj(ln1_hf)
                 v_hf = attn_hf.v_proj(ln1_hf)
 
-                q_diff = (q_ours - q_hf).abs().max().item()
-                k_diff = (k_ours - k_hf).abs().max().item()
+                # V should match exactly (no RoPE permutation)
                 v_diff = (v_ours - v_hf).abs().max().item()
-                print(f"    Layer 0 Q diff: {q_diff:.6f}")
-                print(f"    Layer 0 K diff: {k_diff:.6f}")
                 print(f"    Layer 0 V diff: {v_diff:.6f}")
+
+                # Q and K won't match raw (due to RoPE permutation),
+                # but they should match after applying their respective RoPE
+                B, T, C = ln1_ours.shape
+                H = config.n_head
+                D = C // H
+
+                # Our RoPE: view_as_complex on consecutive pairs
+                q_ours_r = q_ours.view(B, T, H, D).transpose(1, 2)
+                k_ours_r = k_ours.view(B, T, H, D).transpose(1, 2)
+                from train_gpt import apply_rotary_emb
+                q_ours_rope, k_ours_rope = apply_rotary_emb(q_ours_r, k_ours_r, freqs_cis)
+
+                # HF RoPE: rotate_half on half-split
+                q_hf_r = q_hf.view(B, T, H, D).transpose(1, 2)
+                k_hf_r = k_hf.view(B, T, H, D).transpose(1, 2)
+                cos_sin = model_hf.model.layers[0].self_attn.rotary_emb(q_hf_r, torch.arange(T).unsqueeze(0))
+                cos, sin = cos_sin
+                from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+                q_hf_rope, k_hf_rope = apply_rotary_pos_emb(q_hf_r, k_hf_r, cos, sin)
+
+                q_rope_diff = (q_ours_rope - q_hf_rope).abs().max().item()
+                k_rope_diff = (k_ours_rope - k_hf_rope).abs().max().item()
+                print(f"    Layer 0 Q (after RoPE) diff: {q_rope_diff:.6f}")
+                print(f"    Layer 0 K (after RoPE) diff: {k_rope_diff:.6f}")
+
+                if q_rope_diff < 0.001 and k_rope_diff < 0.001:
+                    print("    → Q/K match after RoPE! RoPE permutation is correct.")
+                else:
+                    print("    → Q/K still differ after RoPE. Check permutation logic.")
 
     print("\n" + "=" * 70)
 

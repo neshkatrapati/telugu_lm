@@ -142,12 +142,59 @@ def create_config(checkpoint: dict, output_dir: Path, is_sft: bool = False):
 # ===========================================================================
 # Part 2: Convert weights
 # ===========================================================================
+def _interleaved_to_half_rotation(weight: "torch.Tensor",
+                                   n_heads: int, dim: int = 0):
+    """Permute Q/K weight rows from interleaved RoPE to HF's half-rotation RoPE.
+
+    Our model pairs consecutive elements for RoPE (view_as_complex):
+        (d0, d1), (d2, d3), (d4, d5), ... → complex pairs
+
+    HF LLaMA pairs first-half with second-half (rotate_half):
+        (d0, d_{D/2}), (d1, d_{D/2+1}), ...
+
+    For Q/K projection weights (shape [n_heads * head_dim, hidden]):
+        We permute output rows within each head so that what was at position
+        [d0, d1, d2, d3, ..., d_{D-1}] becomes [d0, d2, d4, ..., d1, d3, d5, ...]
+
+    For o_proj weights (shape [hidden, n_heads * head_dim]):
+        Same permutation but applied to columns (dim=1), because o_proj reads
+        the attention output in the same head_dim layout.
+
+    Args:
+        weight: The weight tensor to permute
+        n_heads: Number of attention heads
+        dim: 0 for Q/K (permute rows), 1 for o_proj (permute columns)
+    """
+    head_dim = weight.shape[dim] // n_heads
+
+    if dim == 0:
+        # Q/K: shape (n_heads * head_dim, hidden) — permute rows
+        w = weight.view(n_heads, head_dim, -1)
+        # Reshape to pairs: (n_heads, head_dim//2, 2, hidden)
+        w = w.view(n_heads, head_dim // 2, 2, -1)
+        # Reorder: even indices first, then odd → (n_heads, 2, head_dim//2, hidden)
+        w = w.transpose(1, 2).contiguous()
+        # Flatten back: (n_heads * head_dim, hidden)
+        return w.view(weight.shape)
+    else:
+        # o_proj: shape (hidden, n_heads * head_dim) — permute columns
+        w = weight.view(-1, n_heads, head_dim)
+        # Reshape to pairs: (hidden, n_heads, head_dim//2, 2)
+        w = w.view(-1, n_heads, head_dim // 2, 2)
+        # Reorder: (hidden, n_heads, 2, head_dim//2)
+        w = w.transpose(2, 3).contiguous()
+        # Flatten back: (hidden, n_heads * head_dim)
+        return w.view(weight.shape)
+
+
 def convert_weights(checkpoint: dict, config: dict, output_dir: Path,
                     original_vocab_size: int = 0):
     """Convert our state_dict to HF LlamaForCausalLM format.
 
     Key operations:
       - Split fused c_attn.weight (3*n_embd, n_embd) → q_proj, k_proj, v_proj
+      - Permute Q/K rows and o_proj cols for RoPE convention difference
+        (our interleaved complex pairs → HF's rotate_half half-split)
       - Rename all keys to HF naming convention
       - Skip freqs_cis buffer (HF recomputes RoPE)
       - Skip lm_head.weight (tied to embed_tokens)
@@ -160,6 +207,7 @@ def convert_weights(checkpoint: dict, config: dict, output_dir: Path,
     state_dict = checkpoint["model"]
     n_embd = config["hidden_size"]
     n_layer = config["num_hidden_layers"]
+    n_heads = config["num_attention_heads"]
     hf_vocab_size = config["vocab_size"]
 
     hf_state_dict = {}
@@ -192,11 +240,19 @@ def convert_weights(checkpoint: dict, config: dict, output_dir: Path,
         )
         q_proj, k_proj, v_proj = c_attn_weight.split(n_embd, dim=0)
 
+        # Permute Q and K for RoPE convention:
+        # Our model: interleaved complex pairs [(d0,d1), (d2,d3), ...]
+        # HF LLaMA:  half-split rotate_half [(d0,d_{D/2}), (d1,d_{D/2+1}), ...]
+        q_proj = _interleaved_to_half_rotation(q_proj, n_heads, dim=0)
+        k_proj = _interleaved_to_half_rotation(k_proj, n_heads, dim=0)
+
         hf_state_dict[f"{prefix_hf}.self_attn.q_proj.weight"] = q_proj
         hf_state_dict[f"{prefix_hf}.self_attn.k_proj.weight"] = k_proj
         hf_state_dict[f"{prefix_hf}.self_attn.v_proj.weight"] = v_proj
 
-        # Output projection
+        # Output projection — no permutation needed.
+        # o_proj reads attention output which has same shape as V (not RoPE'd),
+        # so the dimension ordering is unchanged.
         hf_state_dict[f"{prefix_hf}.self_attn.o_proj.weight"] = (
             state_dict[f"{prefix_ours}.attn.c_proj.weight"]
         )
