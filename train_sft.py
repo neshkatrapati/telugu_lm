@@ -636,19 +636,28 @@ def train_sft(
 
                 # ---- Sample generation ----
                 samples = []
+                # Stop at <eos> or <|end|>
+                eos_id = special_tokens.get("<eos>", 3)
+                end_id = special_tokens.get("<|end|>")
+                stop_ids = {eos_id}
+                if end_id is not None:
+                    stop_ids.add(end_id)
+
                 if sample_prompts:
                     with torch.no_grad():
                         raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
                         for prompt_ids in sample_prompts:
                             x = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-                            y = raw_model.generate(x, max_new_tokens=80, temperature=0.7, top_k=40)
-                            gen_ids = y[0].tolist()
+                            gen_ids = _generate_with_stop(
+                                raw_model, x, max_new_tokens=150,
+                                stop_ids=stop_ids, temperature=0.7, top_k=40,
+                            )
                             # Decode with special token handling
                             prompt_text = _decode_with_specials(prompt_ids, tokenizer, id_to_special)
-                            gen_text = _decode_with_specials(gen_ids[len(prompt_ids):], tokenizer, id_to_special)
+                            gen_text = _decode_with_specials(gen_ids, tokenizer, id_to_special)
                             samples.append({"prompt": prompt_text, "generated": gen_text})
                             logger.info("  [sample] %s → %s",
-                                        prompt_text[:80], gen_text[:100])
+                                        prompt_text[:80], gen_text[:120])
 
                 model.train()
 
@@ -718,6 +727,39 @@ def train_sft(
             "final/total_minutes": total_time / 60,
         }, step=global_step)
         wandb.finish()
+
+
+# ============================================================================
+# Generate with stop tokens
+# ============================================================================
+def _generate_with_stop(model, idx, max_new_tokens, stop_ids, temperature=0.7, top_k=40):
+    """Generate tokens, stopping at any token in stop_ids (e.g. <eos>, <|end|>).
+
+    Returns list of generated token IDs (not including prompt).
+    """
+    import torch
+    import torch.nn.functional as F
+
+    block_size = model.config.block_size
+    generated = []
+
+    for _ in range(max_new_tokens):
+        idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
+        logits, _ = model(idx_cond)
+        logits = logits[:, -1, :] / temperature
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = -float("Inf")
+        probs = F.softmax(logits, dim=-1)
+        idx_next = torch.multinomial(probs, num_samples=1)
+        idx = torch.cat((idx, idx_next), dim=1)
+
+        next_id = idx_next.item()
+        generated.append(next_id)
+        if next_id in stop_ids:
+            break
+
+    return generated
 
 
 # ============================================================================
