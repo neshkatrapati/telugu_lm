@@ -32,12 +32,12 @@ def main():
     # ---- Load original model ----
     print("=" * 70)
     print("Loading original checkpoint...")
-    from train_gpt import GPT, GPTConfig
+    from train_gpt import GPTConfig, build_model
 
     checkpoint = torch.load(str(args.checkpoint), map_location="cpu", weights_only=False)
     config_dict = checkpoint["config"]
     config = GPTConfig(**config_dict)
-    model_ours = GPT(config)
+    model_ours = build_model(config, device="cpu")
 
     state_dict = checkpoint["model"]
     # Handle torch.compile wrapped models
