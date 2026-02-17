@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 # ===========================================================================
 # Part 1: Create config.json (LlamaConfig)
 # ===========================================================================
-def create_config(checkpoint: dict, output_dir: Path):
+def create_config(checkpoint: dict, output_dir: Path, is_sft: bool = False):
     """Create HuggingFace LlamaConfig from our GPTConfig."""
     cfg = checkpoint["config"]
 
@@ -70,6 +70,15 @@ def create_config(checkpoint: dict, output_dir: Path):
     # SwiGLU intermediate_size: same formula as in train_gpt.py
     hidden_dim = int(2 * n_embd * 4 / 3)
     hidden_dim = ((hidden_dim + 255) // 256) * 256  # round up to 256
+
+    # For SFT models, <|end|> is the stop token during generation
+    eos_token_id = 3  # <eos>
+    if is_sft:
+        special_tokens = checkpoint.get("special_tokens", {})
+        end_id = special_tokens.get("<|end|>")
+        if end_id is not None:
+            # HF supports a list of eos_token_id values
+            eos_token_id = [3, end_id]
 
     config = {
         "architectures": ["LlamaForCausalLM"],
@@ -101,10 +110,10 @@ def create_config(checkpoint: dict, output_dir: Path):
         "vocab_size": vocab_size,
         "tie_word_embeddings": True,
 
-        # Token IDs (from our SPECIAL_TOKENS)
+        # Token IDs
         "pad_token_id": 0,
         "bos_token_id": 2,
-        "eos_token_id": 3,
+        "eos_token_id": eos_token_id,
 
         # Standard LLaMA settings
         "attention_dropout": 0.0,
@@ -124,6 +133,8 @@ def create_config(checkpoint: dict, output_dir: Path):
     logger.info("  hidden_size=%d, intermediate_size=%d", n_embd, hidden_dim)
     logger.info("  num_layers=%d, num_heads=%d, vocab_size=%d", n_layer, n_head, vocab_size)
     logger.info("  max_position_embeddings=%d, rope_theta=%.1f", block_size, rope_theta)
+    if is_sft:
+        logger.info("  eos_token_id=%s (SFT — includes <|end|>)", eos_token_id)
 
     return config
 
@@ -253,7 +264,8 @@ def convert_weights(checkpoint: dict, config: dict, output_dir: Path,
 # ===========================================================================
 # Part 3: Convert tokenizer
 # ===========================================================================
-def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size: int):
+def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size: int,
+                      is_sft: bool = False, sft_special_tokens: dict = None):
     """Convert our custom tokenizer to HuggingFace format.
 
     Our tokenizer is a Morfessor+BPE hybrid with @@ continuation markers.
@@ -262,6 +274,10 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
       - Pre-tokenizer: WhitespaceSplit (input is already segmented)
       - Decoder: replaces "@@  " with "" to rejoin morphemes
       - Post-processor: prepends <bos>
+
+    For SFT models, also:
+      - Adds <|system|>, <|user|>, <|assistant|>, <|end|> to vocab
+      - Adds chat_template to tokenizer_config.json
 
     We use WordLevel instead of BPE because our tokenizer does direct vocab
     lookup on whole morpheme tokens (e.g. "విద్యార్థు@@" → ID). HF's BPE
@@ -309,6 +325,13 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
     for token, tid in token_to_id.items():
         hf_vocab[token] = tid
 
+    # For SFT: add the 4 new chat special tokens to vocab
+    if is_sft and sft_special_tokens:
+        for name, tid in sft_special_tokens.items():
+            if name not in hf_vocab:
+                hf_vocab[name] = tid
+                logger.info("  Added SFT special token: %s = %d", name, tid)
+
     # Create WordLevel tokenizer
     tok = Tokenizer(models.WordLevel(vocab=hf_vocab, unk_token="<unk>"))
 
@@ -336,7 +359,10 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
     tok.decoder = None
 
     # Add special tokens
-    tok.add_special_tokens(["<pad>", "<unk>", "<bos>", "<eos>"])
+    base_specials = ["<pad>", "<unk>", "<bos>", "<eos>"]
+    if is_sft and sft_special_tokens:
+        base_specials.extend(sft_special_tokens.keys())
+    tok.add_special_tokens(base_specials)
 
     # Save
     hf_tok_path = output_dir / "tokenizer.json"
@@ -373,6 +399,32 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
             ),
         },
     }
+
+    # For SFT: add chat_template and additional_special_tokens
+    if is_sft and sft_special_tokens:
+        tokenizer_config["additional_special_tokens"] = list(sft_special_tokens.keys())
+
+        # Jinja2 chat template matching our SFT training format:
+        #   <bos> <|system|> {sys} <|end|> <|user|> {user} <|end|> <|assistant|> {asst} <|end|> ...
+        # The template takes messages in OpenAI format:
+        #   [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}, ...]
+        tokenizer_config["chat_template"] = (
+            "{{ bos_token }}"
+            "{% for message in messages %}"
+            "{% if message['role'] == 'system' %}"
+            "<|system|>{{ message['content'] }}<|end|>"
+            "{% elif message['role'] == 'user' %}"
+            "<|user|>{{ message['content'] }}<|end|>"
+            "{% elif message['role'] == 'assistant' %}"
+            "<|assistant|>{{ message['content'] }}<|end|>"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}"
+            "<|assistant|>"
+            "{% endif %}"
+        )
+        logger.info("  Added chat_template for SFT model")
+
     config_path = output_dir / "tokenizer_config.json"
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(tokenizer_config, f, ensure_ascii=False, indent=2)
@@ -385,6 +437,8 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
         "unk_token": "<unk>",
         "pad_token": "<pad>",
     }
+    if is_sft and sft_special_tokens:
+        special_tokens_map["additional_special_tokens"] = list(sft_special_tokens.keys())
     stm_path = output_dir / "special_tokens_map.json"
     with open(stm_path, "w") as f:
         json.dump(special_tokens_map, f, indent=2)
@@ -396,12 +450,14 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
 # ===========================================================================
 # Part 3b: Custom tokenizer class (handles @@ stripping in decode)
 # ===========================================================================
-def create_tokenizer_class(output_dir: Path):
+def create_tokenizer_class(output_dir: Path, is_sft: bool = False):
     """Create a custom tokenizer class that strips @@ markers during decode.
 
     The tokenizers library's WordLevel decoder with decoder=None joins tokens
     with spaces (correct), but keeps @@ markers in the output. Our custom
     class overrides decode() to strip @@ after the default decode.
+
+    For SFT models, also strips chat special tokens from decoded output.
     """
     code = '''\
 """Custom Telugu tokenizer that handles @@ continuation marker stripping."""
@@ -414,7 +470,13 @@ class TeluguTokenizer(PreTrainedTokenizerFast):
     Tokens ending with @@ are continuation pieces that join to the next token.
     This class overrides decode() to strip @@ markers and join morphemes:
         "రెడ్డి@@ గారు" → "రెడ్డిగారు"
+
+    Also strips chat special tokens (<|system|>, <|user|>, <|assistant|>, <|end|>)
+    from decoded output for clean text.
     """
+
+    # Chat special tokens to strip from output
+    _CHAT_SPECIALS = ["<|system|>", "<|user|>", "<|assistant|>", "<|end|>"]
 
     def decode(self, token_ids, skip_special_tokens=False, **kwargs):
         text = super().decode(token_ids, skip_special_tokens=skip_special_tokens, **kwargs)
@@ -423,6 +485,12 @@ class TeluguTokenizer(PreTrainedTokenizerFast):
         text = text.replace("@@ ", "")
         # Handle remaining @@ (before punctuation, end of string, etc.)
         text = text.replace("@@", "")
+        # Strip chat special tokens
+        for special in self._CHAT_SPECIALS:
+            text = text.replace(special, "")
+        # Clean up extra whitespace from removed tokens
+        import re
+        text = re.sub(r"  +", " ", text).strip()
         return text
 '''
     path = output_dir / "tokenizer_class.py"
@@ -434,18 +502,25 @@ class TeluguTokenizer(PreTrainedTokenizerFast):
 # ===========================================================================
 # Part 4: generation_config.json
 # ===========================================================================
-def create_generation_config(output_dir: Path):
+def create_generation_config(output_dir: Path, is_sft: bool = False,
+                             sft_special_tokens: dict = None):
     """Create default generation config for the model."""
+    eos_token_id = 3
+    if is_sft and sft_special_tokens:
+        end_id = sft_special_tokens.get("<|end|>")
+        if end_id is not None:
+            eos_token_id = [3, end_id]
+
     gen_config = {
         "_from_model_config": True,
         "bos_token_id": 2,
-        "eos_token_id": 3,
+        "eos_token_id": eos_token_id,
         "pad_token_id": 0,
         "do_sample": True,
-        "temperature": 0.8,
+        "temperature": 0.7 if is_sft else 0.8,
         "top_k": 50,
         "top_p": 0.95,
-        "max_new_tokens": 200,
+        "max_new_tokens": 256 if is_sft else 200,
         "repetition_penalty": 1.1,
         "transformers_version": "4.40.0",
     }
@@ -637,6 +712,270 @@ If you use this model, please cite:
     with open(readme_path, "w", encoding="utf-8") as f:
         f.write(card)
     logger.info("Saved README.md (model card)")
+
+
+# ===========================================================================
+# Part 5b: SFT Model card (README.md)
+# ===========================================================================
+def create_sft_model_card(config: dict, output_dir: Path,
+                          sft_special_tokens: dict, checkpoint: dict):
+    """Create a HuggingFace model card for the SFT chat model."""
+
+    vocab_size = config["vocab_size"]
+    n_layers = config["num_hidden_layers"]
+    n_heads = config["num_attention_heads"]
+    hidden = config["hidden_size"]
+    intermediate = config["intermediate_size"]
+    ctx_len = config["max_position_embeddings"]
+
+    # Param count
+    emb = vocab_size * hidden
+    attn_per_layer = 4 * hidden ** 2
+    mlp_per_layer = 3 * hidden * intermediate
+    tfm = n_layers * (attn_per_layer + mlp_per_layer)
+    norms = (2 * n_layers + 1) * hidden
+    n_params = emb + tfm + norms
+    param_str = f"{n_params / 1e6:.0f}M"
+
+    model_name = "pothana-chat-300M"
+    base_name = "pothana-base-300M"
+
+    val_loss = checkpoint.get("best_val_loss", checkpoint.get("val_loss", "?"))
+    step = checkpoint.get("step", "?")
+
+    # Build special tokens table
+    special_rows = ""
+    for name, tid in sorted(sft_special_tokens.items(), key=lambda x: x[1]):
+        special_rows += f"| `{name}` | {tid} |\n"
+
+    card = f"""---
+language:
+  - te
+license: apache-2.0
+tags:
+  - telugu
+  - llama
+  - causal-lm
+  - chat
+  - sft
+  - instruction-tuned
+  - morfessor
+  - from-scratch
+library_name: transformers
+pipeline_tag: text-generation
+base_model: dvitvaai/{base_name}
+---
+
+# Pothana Chat 300M
+
+A **{param_str} parameter** LLaMA-style chat model for Telugu, instruction-tuned from [Pothana Base 300M](https://huggingface.co/dvitvaai/{base_name}).
+
+Named after [Bammera Pothana](https://en.wikipedia.org/wiki/Bammera_Pothana), the celebrated 15th-century Telugu poet who authored the *Andhra Maha Bhagavatamu*.
+
+Developed by **[Dvitva AI](https://dvitva.ai)**.
+
+## Model Details
+
+| | |
+|---|---|
+| **Model** | {model_name} |
+| **Base model** | [{base_name}](https://huggingface.co/dvitvaai/{base_name}) |
+| **Architecture** | LLaMA (RoPE + SwiGLU + RMSNorm) |
+| **Parameters** | {param_str} |
+| **Hidden size** | {hidden} |
+| **Layers** | {n_layers} |
+| **Attention heads** | {n_heads} |
+| **Intermediate size** | {intermediate} |
+| **Context length** | {ctx_len} |
+| **Vocab size** | {vocab_size:,} (base + 4 chat tokens) |
+| **Tokenizer** | Morfessor + BPE (Telugu morpheme-aware) |
+| **Fine-tuning** | Full SFT on Telugu conversations |
+| **Best val loss** | {val_loss} |
+| **Developed by** | [Dvitva AI](https://dvitva.ai) |
+
+## Chat Template
+
+This model uses the following chat format (matching its SFT training):
+
+```
+<bos><|system|> {{system instruction}} <|end|><|user|> {{user message}} <|end|><|assistant|> {{response}} <|end|>
+```
+
+### Multi-turn example
+
+```
+<bos><|system|> మీరు ఒక సహాయకరమైన తెలుగు AI అసిస్టెంట్. <|end|>
+<|user|> తెలంగాణ రాజధాని ఏది? <|end|>
+<|assistant|> తెలంగాణ రాజధాని హైదరాబాద్. <|end|>
+<|user|> దాని జనాభా ఎంత? <|end|>
+<|assistant|>
+```
+
+The model generates after `<|assistant|>` and stops at `<|end|>`.
+
+### Special Tokens
+
+| Token | ID |
+|---|---|
+{special_rows}| `<bos>` | 2 |
+| `<eos>` | 3 |
+| `<pad>` | 0 |
+
+## Quick Start
+
+### Using the chat template (recommended)
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+model = AutoModelForCausalLM.from_pretrained("dvitvaai/{model_name}")
+tokenizer = AutoTokenizer.from_pretrained("dvitvaai/{model_name}", trust_remote_code=True)
+
+messages = [
+    {{"role": "system", "content": "మీరు ఒక సహాయకరమైన తెలుగు AI అసిస్టెంట్."}},
+    {{"role": "user", "content": "తెలంగాణ రాజధాని ఏది?"}},
+]
+
+# Apply chat template (handles formatting automatically)
+prompt = tokenizer.apply_chat_template(
+    messages, tokenize=False, add_generation_prompt=True
+)
+inputs = tokenizer(prompt, return_tensors="pt")
+
+with torch.no_grad():
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=256,
+        temperature=0.7,
+        top_k=50,
+        do_sample=True,
+    )
+
+response = tokenizer.decode(outputs[0], skip_special_tokens=False)
+print(response)
+```
+
+> **Note**: `trust_remote_code=True` is required for the custom tokenizer that handles `@@` morpheme joining.
+
+### Manual prompt construction
+
+If you prefer to build the prompt manually:
+
+```python
+# For Morfessor-segmented text:
+prompt = "<bos><|system|> మీరు ఒక సహాయ@@ కరమైన తెలుగు AI అసిస్టెంట్. <|end|><|user|> తెలం@@ గాణ రాజ@@ ధాని ఏది? <|end|><|assistant|>"
+
+inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+outputs = model.generate(**inputs, max_new_tokens=256, do_sample=True, temperature=0.7)
+print(tokenizer.decode(outputs[0], skip_special_tokens=False))
+```
+
+### Using the CLI chat script
+
+For the best experience, use the included `chat.py` CLI:
+
+```bash
+# Interactive multi-turn chat
+python chat.py --checkpoint ./sft_checkpoints/best.pt
+
+# Single question
+python chat.py -c ./sft_checkpoints/best.pt -p "తెలంగాణ రాజధాని ఏది?"
+
+# With custom system instruction
+python chat.py -c ./sft_checkpoints/best.pt \\
+    --system "మీరు తెలుగు సహాయకుడు. సంక్షిప్తంగా సమాధానం ఇవ్వండి."
+```
+
+The CLI supports: streaming output, KV-cache for fast generation, multi-turn context, adjustable temperature/top-k/top-p, and in-session commands (`/reset`, `/config`, `/set`, `/history`).
+
+## Tokenizer
+
+This model uses a **Morfessor + BPE hybrid tokenizer** designed for Telugu:
+
+- **Telugu text**: Segmented into morphemes using [Morfessor](https://github.com/aalto-speech/morfessor) with `@@` continuation markers
+- **Non-Telugu text** (English, numbers): Handled by BPE subword encoding
+- **Fallback**: Character-level encoding for out-of-vocabulary tokens
+
+**Important**: The tokenizer expects **pre-segmented** input (with `@@` markers). For raw Telugu text, you need to run Morfessor segmentation first using the included `morfessor_telugu.bin`.
+
+### Full pipeline (raw Telugu text)
+
+```python
+import morfessor, re
+
+# Load Morfessor model
+io = morfessor.MorfessorIO()
+morf_model = io.read_binary_model_file("morfessor_telugu.bin")
+
+TELUGU_RE = re.compile(r"[\\u0C00-\\u0C7F]+")
+
+def segment_telugu(text, separator="@@"):
+    tokens = []
+    for word in text.split():
+        if TELUGU_RE.fullmatch(word):
+            segments = morf_model.viterbi_segment(word)[0]
+            for i, seg in enumerate(segments):
+                tokens.append(seg + separator if i < len(segments) - 1 else seg)
+        else:
+            tokens.append(word)
+    return " ".join(tokens)
+
+# Segment, format as chat, tokenize, generate
+raw_text = "భారతదేశ ప్రధానమంత్రి ఎవరు?"
+segmented = segment_telugu(raw_text)
+
+messages = [
+    {{"role": "system", "content": segment_telugu("మీరు ఒక సహాయకరమైన తెలుగు AI అసిస్టెంట్.")}},
+    {{"role": "user", "content": segmented}},
+]
+prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+outputs = model.generate(**inputs, max_new_tokens=256, do_sample=True, temperature=0.7)
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+```
+
+## Training
+
+- **Base model**: [Pothana Base 300M](https://huggingface.co/dvitvaai/{base_name}) (pretrained on Telugu text corpus)
+- **Fine-tuning method**: Full SFT (all parameters updated)
+- **Data**: ~1000 multi-turn Telugu conversations (~6,700 turn pairs, windowed into ~6,700 training examples)
+- **Chat template**: System instruction + multi-turn context + user/assistant turns
+- **Loss masking**: Only assistant response tokens contribute to loss
+- **Optimizer**: AdamW (lr=2e-5, weight_decay=0.01)
+- **Schedule**: Cosine LR decay with 50-step warmup
+- **Effective batch size**: 16 (8 micro-batch x 2 gradient accumulation)
+- **Precision**: bf16 mixed precision
+- **Early stopping**: Patience 3 on validation loss
+
+## Limitations
+
+- **Small model** ({param_str}) — limited reasoning and knowledge capacity
+- **Limited training data** (~1000 conversations) — may struggle with topics not covered in training
+- **Requires Morfessor segmentation** — raw Telugu text must be segmented before tokenization
+- **Telugu-only** — primarily trained on Telugu; limited multilingual capability
+- **May hallucinate** — as with all small LMs, responses may contain inaccurate information
+
+## License
+
+Apache 2.0
+
+## Citation
+
+```
+@misc{{{model_name},
+  title={{Pothana Chat 300M: A Telugu Chat Language Model}},
+  author={{Dvitva AI}},
+  year={{2025}},
+  url={{https://huggingface.co/dvitvaai/{model_name}}}
+}}
+```
+"""
+
+    readme_path = output_dir / "README.md"
+    with open(readme_path, "w", encoding="utf-8") as f:
+        f.write(card)
+    logger.info("Saved README.md (SFT model card)")
 
 
 # ===========================================================================
@@ -866,10 +1205,21 @@ Examples:
 
     original_vocab_size = checkpoint["config"]["vocab_size"]
 
+    # Detect SFT checkpoint
+    is_sft = checkpoint.get("training_type") == "sft"
+    sft_special_tokens = checkpoint.get("special_tokens", {}) if is_sft else {}
+
+    if is_sft:
+        logger.info("Detected SFT checkpoint (training_type='sft')")
+        logger.info("  Special tokens: %s", sft_special_tokens)
+    else:
+        logger.info("Detected base (pretrained) checkpoint")
+
     # Part 1: Convert tokenizer FIRST — may add extra vocab entries for BPE merge intermediates
     logger.info("")
     logger.info("--- Part 1: Converting tokenizer ---")
-    hf_vocab_size = convert_tokenizer(tokenizer_dir, output_dir, original_vocab_size)
+    hf_vocab_size = convert_tokenizer(tokenizer_dir, output_dir, original_vocab_size,
+                                       is_sft=is_sft, sft_special_tokens=sft_special_tokens)
 
     # Part 2: config.json — use the (possibly expanded) HF vocab size
     logger.info("")
@@ -878,7 +1228,7 @@ Examples:
         logger.info("Vocab expanded: %d → %d (BPE merge intermediates added)",
                      original_vocab_size, hf_vocab_size)
         checkpoint["config"]["vocab_size"] = hf_vocab_size
-    config = create_config(checkpoint, output_dir)
+    config = create_config(checkpoint, output_dir, is_sft=is_sft)
 
     # Part 3: Convert weights — pad embedding if vocab was expanded
     logger.info("")
@@ -889,17 +1239,21 @@ Examples:
     # Part 3b: Custom tokenizer class
     logger.info("")
     logger.info("--- Part 3b: Creating tokenizer_class.py ---")
-    create_tokenizer_class(output_dir)
+    create_tokenizer_class(output_dir, is_sft=is_sft)
 
     # Part 4: generation_config.json
     logger.info("")
     logger.info("--- Part 4: Creating generation_config.json ---")
-    create_generation_config(output_dir)
+    create_generation_config(output_dir, is_sft=is_sft,
+                             sft_special_tokens=sft_special_tokens)
 
     # Part 5: Model card
     logger.info("")
     logger.info("--- Part 5: Creating README.md (model card) ---")
-    create_model_card(config, output_dir)
+    if is_sft:
+        create_sft_model_card(config, output_dir, sft_special_tokens, checkpoint)
+    else:
+        create_model_card(config, output_dir)
 
     # Copy Morfessor model if provided
     if args.morfessor_model:
