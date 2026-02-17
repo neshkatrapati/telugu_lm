@@ -453,16 +453,21 @@ class ChatSession:
             return ""
         return self.tokenizer.decode(regular_ids)
 
+    def init_streaming_state(self):
+        """Reset streaming decode state before a new generation."""
+        self._prev_was_continuation = False
+
     def decode_token_streaming(self, tid: int) -> str | None:
         """Decode a single token for streaming display.
 
-        Returns the text to print, or None if this is a special token.
         The tokenizer uses @@ continuation markers:
-          - token ending with @@ means "continuation" (no space after)
-          - otherwise, a space is expected before this token
+          - "విద్యార్థు@@" means the NEXT token joins without a space
+          - "కు" (no @@) is a word-final token
 
-        We accumulate a small buffer and flush when we can determine
-        word boundaries.
+        So the rule is: add a leading space UNLESS the previous token
+        ended with @@ (i.e. was a continuation marker).
+
+        Must call init_streaming_state() before each generation.
         """
         if tid in self.id_to_special:
             return None
@@ -471,12 +476,22 @@ class ChatSession:
         if not tok_str:
             return None
 
+        # Determine if we need a leading space
+        needs_space = not self._prev_was_continuation
+
         if tok_str.endswith("@@"):
-            # Continuation — part of a word, strip marker
-            return tok_str[:-2]
+            # This is a continuation piece — strip marker, next token joins
+            self._prev_was_continuation = True
+            text = tok_str[:-2]
         else:
-            # Complete token — add leading space (word boundary)
-            return " " + tok_str
+            # Word-final token
+            self._prev_was_continuation = False
+            text = tok_str
+
+        if needs_space:
+            return " " + text
+        else:
+            return text
 
     def add_turn(self, user_text: str, assistant_text: str):
         """Record a completed turn in conversation history."""
@@ -494,6 +509,69 @@ def decode_plain(token_ids: list[int], tokenizer) -> str:
     """Decode token IDs from base model (strip BOS/EOS only)."""
     filtered = [tid for tid in token_ids if tid not in (BOS_ID, EOS_ID)]
     return tokenizer.decode(filtered)
+
+
+# ============================================================================
+# Debug: print full prompt breakdown
+# ============================================================================
+# Built-in special tokens
+_BUILTIN_SPECIALS = {BOS_ID: "<bos>", EOS_ID: "<eos>", 0: "<pad>", 1: "<unk>"}
+
+
+def debug_print_prompt(prompt_ids: list[int], tokenizer, special_tokens: dict):
+    """Print a human-readable breakdown of the tokenized prompt.
+
+    Shows: token index, token ID, token string (with special tokens highlighted),
+    and a reconstructed text view with markers.
+    """
+    # Build combined ID → name map
+    id_to_name = {**_BUILTIN_SPECIALS}
+    for name, tid in special_tokens.items():
+        id_to_name[tid] = name
+
+    print()
+    print("=" * 70)
+    print("DEBUG: Prompt sent to model")
+    print("=" * 70)
+    print(f"  Total tokens: {len(prompt_ids)}")
+    print()
+
+    # --- Token-by-token table ---
+    print("  idx  |   id   | token")
+    print("  " + "-" * 40)
+    for i, tid in enumerate(prompt_ids):
+        special_name = id_to_name.get(tid)
+        if special_name:
+            label = f"  {special_name}"
+        else:
+            tok_str = tokenizer.id_to_token.get(tid, f"[UNK:{tid}]")
+            label = f"  {tok_str}"
+        print(f"  {i:4d}  | {tid:5d}  |{label}")
+
+    # --- Reconstructed text view ---
+    print()
+    print("  " + "-" * 40)
+    print("  Reconstructed prompt (special tokens shown as markers):")
+    print()
+    parts = []
+    regular_buf = []
+    for tid in prompt_ids:
+        special_name = id_to_name.get(tid)
+        if special_name:
+            # Flush buffered regular tokens
+            if regular_buf:
+                parts.append(tokenizer.decode(regular_buf))
+                regular_buf = []
+            parts.append(f"\n    {special_name}\n  ")
+        else:
+            regular_buf.append(tid)
+    if regular_buf:
+        parts.append(tokenizer.decode(regular_buf))
+
+    print("  " + "".join(parts))
+    print()
+    print("=" * 70)
+    print()
 
 
 # ============================================================================
@@ -535,6 +613,7 @@ def main():
 
     # Misc
     parser.add_argument("--verbose", "-v", action="store_true", help="Show token IDs and debug info")
+    parser.add_argument("--debug", action="store_true", help="Print the full tokenized prompt sent to the model")
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
 
     args = parser.parse_args()
@@ -601,6 +680,9 @@ def main():
         else:
             segmented = segment_text(args.prompt, morf_model)
             prompt_ids = tokenizer.encode(segmented, add_bos=True, add_eos=False)
+
+        if args.debug:
+            debug_print_prompt(prompt_ids, tokenizer, special_tokens)
 
         t0 = time.time()
         gen_ids = generate(
@@ -734,7 +816,11 @@ def main():
                 logger.info("Prompt tokens: %d | History: %d turns",
                             len(prompt_ids), len(session.history))
 
+            if args.debug:
+                debug_print_prompt(prompt_ids, tokenizer, special_tokens)
+
             print("\nAssistant: ", end="", flush=True)
+            session.init_streaming_state()
             t_start = time.time()
             gen_ids = []
             first_token_time = None
@@ -771,6 +857,9 @@ def main():
             # Base model — text completion (non-streaming for simplicity)
             segmented = segment_text(user_input, morf_model)
             prompt_ids = tokenizer.encode(segmented, add_bos=True, add_eos=False)
+
+            if args.debug:
+                debug_print_prompt(prompt_ids, tokenizer, special_tokens)
 
             t_start = time.time()
             gen_ids = generate(
