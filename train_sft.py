@@ -556,8 +556,10 @@ def train_sft(
                 tokens_in_step += input_ids.numel()
 
                 with ctx:
-                    logits, _ = model(input_ids)
-                    # Compute masked loss manually (model's built-in uses ignore_index=-1)
+                    # We need full-sequence logits. The model only returns them
+                    # when targets is not None. Pass input_ids as dummy targets
+                    # (model's internal loss is discarded — we compute our own).
+                    logits, _ = model(input_ids, input_ids)
                     loss = F.cross_entropy(
                         logits.view(-1, logits.size(-1)),
                         targets.view(-1),
@@ -619,7 +621,7 @@ def train_sft(
                         n_loss_tokens = (targets != -100).sum().item()
 
                         with ctx:
-                            logits, _ = model(input_ids)
+                            logits, _ = model(input_ids, input_ids)
                             loss = F.cross_entropy(
                                 logits.view(-1, logits.size(-1)),
                                 targets.view(-1),
