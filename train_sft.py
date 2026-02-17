@@ -656,8 +656,8 @@ def train_sft(
                             prompt_text = _decode_with_specials(prompt_ids, tokenizer, id_to_special)
                             gen_text = _decode_with_specials(gen_ids, tokenizer, id_to_special)
                             samples.append({"prompt": prompt_text, "generated": gen_text})
-                            logger.info("  [sample] %s → %s",
-                                        prompt_text[:80], gen_text[:120])
+                            logger.info("  [sample prompt]  %s", prompt_text[-120:])
+                            logger.info("  [sample output]  %s", gen_text[:200])
 
                 model.train()
 
