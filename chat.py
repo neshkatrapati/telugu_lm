@@ -34,6 +34,7 @@ Usage:
 
 import sys
 import re
+import time
 import argparse
 import logging
 from pathlib import Path
@@ -143,8 +144,129 @@ def load_sft_model(checkpoint_path: Path, device: str):
 
 
 # ============================================================================
-# Generation
+# KV-Cache Generation
 # ============================================================================
+def _apply_rotary_emb(xq, xk, freqs_cis):
+    """Apply rotary embeddings to Q and K. Matches train_gpt.py exactly."""
+    B, H, T, D = xq.shape
+    xq_ = xq.float().reshape(B, H, T, D // 2, 2)
+    xk_ = xk.float().reshape(B, H, T, D // 2, 2)
+    xq_complex = torch.view_as_complex(xq_)
+    xk_complex = torch.view_as_complex(xk_)
+    freqs = freqs_cis.unsqueeze(0).unsqueeze(0)  # (1, 1, T, D//2)
+    xq_out = torch.view_as_real(xq_complex * freqs).flatten(-2)
+    xk_out = torch.view_as_real(xk_complex * freqs).flatten(-2)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+def _cached_forward(model, idx, kv_cache, start_pos):
+    """Forward pass with KV-cache for fast autoregressive generation.
+
+    On prefill (start_pos=0): processes full sequence, populates cache.
+    On decode (start_pos>0):  processes 1 token, appends to cache.
+
+    Args:
+        model: GPT model (unwrapped — not torch.compiled)
+        idx: (B, T) token IDs — full sequence on prefill, (B, 1) on decode
+        kv_cache: list of (K, V) tensors per layer, or None for first call
+        start_pos: position offset for RoPE
+
+    Returns:
+        logits: (B, 1, V) — logits for last position only
+        kv_cache: updated cache
+    """
+    B, T = idx.size()
+    config = model.config
+    n_head = config.n_head
+    head_dim = config.n_embd // n_head
+
+    # Embedding
+    x = model.transformer.wte(idx)
+    x = model.transformer.drop(x)
+
+    # RoPE frequencies for current positions
+    freqs_real = model.freqs_cis[start_pos : start_pos + T]  # stored as real
+    freqs_cis = torch.view_as_complex(freqs_real)
+
+    if kv_cache is None:
+        kv_cache = [None] * len(model.transformer.h)
+
+    new_cache = []
+    for i, block in enumerate(model.transformer.h):
+        # --- Attention with KV-cache ---
+        residual = x
+        x_norm = block.ln_1(x)
+
+        attn = block.attn
+        q, k, v = attn.c_attn(x_norm).split(config.n_embd, dim=2)
+        q = q.view(B, T, n_head, head_dim).transpose(1, 2)
+        k = k.view(B, T, n_head, head_dim).transpose(1, 2)
+        v = v.view(B, T, n_head, head_dim).transpose(1, 2)
+
+        # RoPE on new Q, K
+        q, k = _apply_rotary_emb(q, k, freqs_cis)
+
+        # Append to cache
+        if kv_cache[i] is not None:
+            prev_k, prev_v = kv_cache[i]
+            k = torch.cat([prev_k, k], dim=2)
+            v = torch.cat([prev_v, v], dim=2)
+        new_cache.append((k, v))
+
+        # Attention — Q is only the new positions, K/V include history
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=0,
+            is_causal=(kv_cache[i] is None),  # only causal on prefill
+        )
+        y = y.transpose(1, 2).contiguous().view(B, T, config.n_embd)
+        y = attn.resid_dropout(attn.c_proj(y))
+        x = residual + y
+
+        # --- MLP ---
+        residual = x
+        x_norm = block.ln_2(x)
+        x = residual + block.mlp(x_norm)
+
+    x = model.transformer.ln_f(x)
+    logits = model.lm_head(x[:, [-1], :])  # last position only
+
+    return logits, new_cache
+
+
+def _sample_token(logits, temperature, top_k, top_p, repetition_penalty, generated):
+    """Sample a single token from logits with all the bells and whistles."""
+    logits = logits[:, -1, :]  # (1, V)
+
+    # Repetition penalty
+    if repetition_penalty != 1.0 and generated:
+        prev_tokens = set(generated[-64:])
+        for tid in prev_tokens:
+            if logits[0, tid] > 0:
+                logits[0, tid] /= repetition_penalty
+            else:
+                logits[0, tid] *= repetition_penalty
+
+    logits = logits / temperature
+
+    # Top-k
+    if top_k > 0:
+        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+        logits[logits < v[:, [-1]]] = -float("Inf")
+
+    # Top-p (nucleus)
+    if top_p > 0.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        sorted_mask = cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p
+        sorted_logits[sorted_mask] = -float("Inf")
+        logits = sorted_logits.scatter(1, sorted_indices, sorted_logits)
+
+    probs = F.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
+
+
 @torch.no_grad()
 def generate(
     model,
@@ -157,47 +279,39 @@ def generate(
     repetition_penalty: float = 1.0,
     device: str = "cuda",
 ) -> list[int]:
-    """Autoregressive generation with stop tokens, top-p, and repetition penalty."""
+    """Autoregressive generation with KV-cache for fast CPU inference.
+
+    Prefill: one forward pass over the full prompt.
+    Decode:  one token at a time, reusing cached K/V from prior steps.
+    """
+    # Unwrap torch.compile if present
+    raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+
     idx = torch.tensor([token_ids], dtype=torch.long, device=device)
-    block_size = model.config.block_size
     generated = []
 
-    for _ in range(max_new_tokens):
-        idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
-        logits, _ = model(idx_cond)
-        logits = logits[:, -1, :]  # (1, V)
+    # --- Prefill: process full prompt, populate KV-cache ---
+    logits, kv_cache = _cached_forward(raw_model, idx, None, 0)
+    seq_len = idx.size(1)
 
-        # Repetition penalty
-        if repetition_penalty != 1.0 and len(generated) > 0:
-            prev_tokens = set(generated[-64:])  # penalise recent tokens
-            for tid in prev_tokens:
-                if logits[0, tid] > 0:
-                    logits[0, tid] /= repetition_penalty
-                else:
-                    logits[0, tid] *= repetition_penalty
+    # Sample first token
+    idx_next = _sample_token(logits, temperature, top_k, top_p,
+                             repetition_penalty, generated)
+    next_id = idx_next.item()
+    generated.append(next_id)
 
-        # Temperature
-        logits = logits / temperature
+    if next_id in stop_ids:
+        return generated
 
-        # Top-k
-        if top_k > 0:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits[logits < v[:, [-1]]] = -float("Inf")
+    # --- Decode: one token at a time with cached K/V ---
+    for _ in range(max_new_tokens - 1):
+        logits, kv_cache = _cached_forward(
+            raw_model, idx_next, kv_cache, seq_len
+        )
+        seq_len += 1
 
-        # Top-p (nucleus)
-        if top_p > 0.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            # Remove tokens with cumulative probability above threshold
-            sorted_mask = cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p
-            sorted_logits[sorted_mask] = -float("Inf")
-            # Scatter back
-            logits = sorted_logits.scatter(1, sorted_indices, sorted_logits)
-
-        probs = F.softmax(logits, dim=-1)
-        idx_next = torch.multinomial(probs, num_samples=1)
-        idx = torch.cat((idx, idx_next), dim=1)
-
+        idx_next = _sample_token(logits, temperature, top_k, top_p,
+                                 repetition_penalty, generated)
         next_id = idx_next.item()
         generated.append(next_id)
 
@@ -205,6 +319,54 @@ def generate(
             break
 
     return generated
+
+
+@torch.no_grad()
+def generate_streaming(
+    model,
+    token_ids: list[int],
+    max_new_tokens: int,
+    stop_ids: set[int],
+    temperature: float = 0.7,
+    top_k: int = 50,
+    top_p: float = 0.0,
+    repetition_penalty: float = 1.0,
+    device: str = "cuda",
+):
+    """Streaming version of generate — yields one token ID at a time."""
+    raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+
+    idx = torch.tensor([token_ids], dtype=torch.long, device=device)
+    generated = []
+
+    # Prefill
+    logits, kv_cache = _cached_forward(raw_model, idx, None, 0)
+    seq_len = idx.size(1)
+
+    idx_next = _sample_token(logits, temperature, top_k, top_p,
+                             repetition_penalty, generated)
+    next_id = idx_next.item()
+    generated.append(next_id)
+    yield next_id
+
+    if next_id in stop_ids:
+        return
+
+    # Decode
+    for _ in range(max_new_tokens - 1):
+        logits, kv_cache = _cached_forward(
+            raw_model, idx_next, kv_cache, seq_len
+        )
+        seq_len += 1
+
+        idx_next = _sample_token(logits, temperature, top_k, top_p,
+                                 repetition_penalty, generated)
+        next_id = idx_next.item()
+        generated.append(next_id)
+        yield next_id
+
+        if next_id in stop_ids:
+            return
 
 
 # ============================================================================
@@ -291,6 +453,31 @@ class ChatSession:
             return ""
         return self.tokenizer.decode(regular_ids)
 
+    def decode_token_streaming(self, tid: int) -> str | None:
+        """Decode a single token for streaming display.
+
+        Returns the text to print, or None if this is a special token.
+        The tokenizer uses @@ continuation markers:
+          - token ending with @@ means "continuation" (no space after)
+          - otherwise, a space is expected before this token
+
+        We accumulate a small buffer and flush when we can determine
+        word boundaries.
+        """
+        if tid in self.id_to_special:
+            return None
+
+        tok_str = self.tokenizer.id_to_token.get(tid, "")
+        if not tok_str:
+            return None
+
+        if tok_str.endswith("@@"):
+            # Continuation — part of a word, strip marker
+            return tok_str[:-2]
+        else:
+            # Complete token — add leading space (word boundary)
+            return " " + tok_str
+
     def add_turn(self, user_text: str, assistant_text: str):
         """Record a completed turn in conversation history."""
         self.history.append((user_text, assistant_text))
@@ -368,9 +555,11 @@ def main():
     logger.info("Loading model...")
     model, config, special_tokens = load_sft_model(args.checkpoint, device)
 
-    if not args.no_compile and hasattr(torch, "compile"):
+    if not args.no_compile and device == "cuda" and hasattr(torch, "compile"):
         logger.info("Compiling model with torch.compile...")
         model = torch.compile(model)
+    elif device == "cpu":
+        logger.info("Skipping torch.compile on CPU")
 
     # ---- Determine mode ----
     is_chat = not args.base and bool(special_tokens)
@@ -409,24 +598,26 @@ def main():
             prompt_ids = session.build_prompt(args.prompt)
             if args.verbose:
                 logger.info("Prompt tokens: %d", len(prompt_ids))
-
-            gen_ids = generate(
-                model, prompt_ids, args.max_tokens, stop_ids,
-                args.temperature, args.top_k, args.top_p,
-                args.repetition_penalty, device,
-            )
-            response = session.decode_response(gen_ids)
         else:
             segmented = segment_text(args.prompt, morf_model)
             prompt_ids = tokenizer.encode(segmented, add_bos=True, add_eos=False)
-            gen_ids = generate(
-                model, prompt_ids, args.max_tokens, stop_ids,
-                args.temperature, args.top_k, args.top_p,
-                args.repetition_penalty, device,
-            )
+
+        t0 = time.time()
+        gen_ids = generate(
+            model, prompt_ids, args.max_tokens, stop_ids,
+            args.temperature, args.top_k, args.top_p,
+            args.repetition_penalty, device,
+        )
+        dt = time.time() - t0
+
+        if is_chat:
+            response = session.decode_response(gen_ids)
+        else:
             response = decode_plain(gen_ids, tokenizer)
 
+        tok_per_s = len(gen_ids) / dt if dt > 0 else 0
         print(f"\n{response}")
+        print(f"\n[{len(gen_ids)} tokens | {tok_per_s:.1f} tok/s | {dt:.1f}s]")
         return
 
     # ---- Interactive mode ----
@@ -535,7 +726,7 @@ def main():
                 print(f"[Unknown command: {cmd_name}]")
                 continue
 
-        # ---- Generate response ----
+        # ---- Generate response (streaming) ----
         if is_chat:
             prompt_ids = session.build_prompt(user_input)
 
@@ -543,31 +734,59 @@ def main():
                 logger.info("Prompt tokens: %d | History: %d turns",
                             len(prompt_ids), len(session.history))
 
-            gen_ids = generate(
+            print("\nAssistant: ", end="", flush=True)
+            t_start = time.time()
+            gen_ids = []
+            first_token_time = None
+
+            for tid in generate_streaming(
                 model, prompt_ids, gen_params["max_tokens"], stop_ids,
                 gen_params["temperature"], gen_params["top_k"],
                 gen_params["top_p"], gen_params["repetition_penalty"],
                 device,
-            )
-            response = session.decode_response(gen_ids)
+            ):
+                if first_token_time is None:
+                    first_token_time = time.time()
+                gen_ids.append(tid)
+                # Stream decoded text to terminal
+                chunk = session.decode_token_streaming(tid)
+                if chunk is not None:
+                    print(chunk, end="", flush=True)
 
-            # Record turn
+            t_end = time.time()
+            n_gen = len(gen_ids)
+            prefill_ms = (first_token_time - t_start) * 1000 if first_token_time else 0
+            total_s = t_end - t_start
+            tok_per_s = (n_gen / (t_end - first_token_time)) if first_token_time and t_end > first_token_time else 0
+
+            print()  # newline after streamed response
+            print(f"  [{n_gen} tokens | prefill {prefill_ms:.0f}ms | {tok_per_s:.1f} tok/s | {total_s:.1f}s total]")
+            print()
+
+            # Decode full response for history
+            response = session.decode_response(gen_ids)
             session.add_turn(user_input, response)
 
         else:
-            # Base model — text completion
+            # Base model — text completion (non-streaming for simplicity)
             segmented = segment_text(user_input, morf_model)
             prompt_ids = tokenizer.encode(segmented, add_bos=True, add_eos=False)
 
+            t_start = time.time()
             gen_ids = generate(
                 model, prompt_ids, gen_params["max_tokens"], stop_ids,
                 gen_params["temperature"], gen_params["top_k"],
                 gen_params["top_p"], gen_params["repetition_penalty"],
                 device,
             )
+            t_end = time.time()
             response = decode_plain(gen_ids, tokenizer)
 
-        print(f"\nAssistant: {response}\n")
+            n_gen = len(gen_ids)
+            tok_per_s = n_gen / (t_end - t_start) if t_end > t_start else 0
+            print(f"\nAssistant: {response}")
+            print(f"  [{n_gen} tokens | {tok_per_s:.1f} tok/s | {t_end - t_start:.1f}s total]")
+            print()
 
 
 if __name__ == "__main__":
