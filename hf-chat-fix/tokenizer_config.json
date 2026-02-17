@@ -1,0 +1,25 @@
+{
+  "tokenizer_class": "PreTrainedTokenizerFast",
+  "auto_map": {
+    "AutoTokenizer": [
+      null,
+      "tokenizer_class.TeluguTokenizer"
+    ]
+  },
+  "model_type": "llama",
+  "bos_token": "<bos>",
+  "eos_token": "<eos>",
+  "unk_token": "<unk>",
+  "pad_token": "<pad>",
+  "add_bos_token": true,
+  "add_eos_token": false,
+  "clean_up_tokenization_spaces": false,
+  "model_max_length": 2048,
+  "additional_special_tokens": ["<|system|>", "<|user|>", "<|assistant|>", "<|end|>"],
+  "chat_template": "{% for message in messages %}{% if loop.first %}<bos>{% endif %}{% if message['role'] == 'system' %}<|system|> {{ message['content'] }} <|end|>{% elif message['role'] == 'user' %}<|user|> {{ message['content'] }} <|end|>{% elif message['role'] == 'assistant' %}<|assistant|> {{ message['content'] }} <|end|>{% endif %}{% endfor %}{% if add_generation_prompt %}<|assistant|>{% endif %}",
+  "extra_info": {
+    "type": "morfessor_bpe_telugu",
+    "separator": "@@",
+    "note": "This tokenizer expects Morfessor-segmented text as input. For raw Telugu text, run Morfessor segmentation first using the included morfessor_telugu.bin model. Tokens ending with '@@' are continuation pieces that join to the next token. The decoder handles @@ removal automatically."
+  }
+}
