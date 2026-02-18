@@ -48,23 +48,23 @@ MAX_TOKEN = np.int64(100_000)
 
 # ── Phase 1: Chunk, deduplicate, write to disk ──────────────────────────────
 
-def _write_deduped_chunks(data_path: Path, n_tokens: int, order: int,
-                          chunk_size: int, tmp_dir: str):
+def _write_sorted_chunks(data_path: Path, n_tokens: int, order: int,
+                         chunk_size: int, tmp_dir: str):
     """
     Stream through data in chunks. For each chunk:
-      1. Build packed int64 N-gram keys
-      2. np.unique → (unique_keys, counts) — deduplicates within chunk
-      3. Write (key, count) pairs as int64 + int32 to temp file
+      1. Build packed int64 N-gram keys (vectorized multiply + add)
+      2. Sort keys
+      3. Write sorted keys to temp file (no dedup — merge phase handles it)
 
-    This is fast (numpy vectorized) and memory-bounded (one chunk at a time).
-    The output files are MUCH smaller than raw keys since unique << raw.
+    Skipping per-chunk np.unique saves significant time. Writing raw sorted
+    keys is larger on disk but the merge phase uses np.unique on the
+    concatenated sorted data which is very fast (nearly-sorted input).
 
-    Returns: list of (tmp_path, n_unique_in_chunk) tuples, total raw N-grams
+    Returns: list of tmp_paths, total raw N-grams
     """
     data = np.memmap(str(data_path), dtype=np.uint32, mode="r")
     chunk_files = []
     total_raw = 0
-    total_unique_across_chunks = 0
     label = "bigram" if order == 2 else "trigram"
     overlap = order - 1
 
@@ -78,7 +78,7 @@ def _write_deduped_chunks(data_path: Path, n_tokens: int, order: int,
                 pbar.update(end - start - overlap)
                 break
 
-            # Build packed keys
+            # Build packed keys (vectorized)
             if order == 2:
                 keys = chunk[:own_len] * MAX_TOKEN + chunk[1:own_len + 1]
             else:
@@ -86,39 +86,32 @@ def _write_deduped_chunks(data_path: Path, n_tokens: int, order: int,
                         + chunk[1:own_len + 1] * MAX_TOKEN
                         + chunk[2:own_len + 2])
 
-            # Deduplicate within chunk
-            unique_keys, counts = np.unique(keys, return_counts=True)
-            counts = counts.astype(np.int64)
-
-            # Interleave (key, count) pairs and write
-            # Layout: [key0, count0, key1, count1, ...]
-            pairs = np.empty(len(unique_keys) * 2, dtype=np.int64)
-            pairs[0::2] = unique_keys
-            pairs[1::2] = counts
+            # Sort and write — no dedup here, merge phase handles it
+            keys.sort()
 
             tmp_path = os.path.join(tmp_dir, f"{label}_{len(chunk_files)}.bin")
-            pairs.tofile(tmp_path)
-            chunk_files.append((tmp_path, len(unique_keys)))
+            keys.tofile(tmp_path)
+            chunk_files.append(tmp_path)
 
             total_raw += own_len
-            total_unique_across_chunks += len(unique_keys)
 
-            del chunk, keys, unique_keys, counts, pairs
+            del chunk, keys
             pbar.update(own_len)
 
-    logger.info("  %d chunks, %d total raw %ss, %d unique entries across chunks",
-                len(chunk_files), total_raw, label, total_unique_across_chunks)
-    return chunk_files, total_raw, total_unique_across_chunks
+    logger.info("  %d chunks, %d total raw %ss",
+                len(chunk_files), total_raw, label)
+    return chunk_files, total_raw
 
 
-# ── Phase 2: Load deduped chunks, merge with numpy ──────────────────────────
+# ── Phase 2: Load sorted chunks, merge with numpy ───────────────────────────
 
-def _merge_deduped_chunks(chunk_files, min_count, order, total_unique_entries):
+def _merge_sorted_chunks(chunk_files, min_count, order):
     """
-    Load all deduped (key, count) pairs from chunk files, concatenate,
-    and use fully vectorized numpy to merge duplicate keys and filter.
+    Load all sorted key arrays from chunk files, concatenate, then use
+    np.unique with return_counts to get global counts in one shot.
 
-    No Python loops over millions of entries — everything is numpy.
+    Since each chunk is already sorted, the concatenated array is
+    nearly sorted → np.unique (which sorts internally) is very fast.
 
     Returns: (filtered_ngrams_as_tuples, total_occurrences, kept_occurrences)
     """
@@ -129,51 +122,37 @@ def _merge_deduped_chunks(chunk_files, min_count, order, total_unique_entries):
 
     # ── Load all chunk files ──
     logger.info("  Loading %d %s chunk files ...", len(chunk_files), label)
-    all_keys = []
-    all_counts = []
-    for path, n_unique in tqdm(chunk_files, desc=f"Loading {label} chunks", unit="file"):
-        data = np.fromfile(path, dtype=np.int64)
-        all_keys.append(data[0::2])
-        all_counts.append(data[1::2])
-        del data
+    arrays = []
+    total_keys = 0
+    for path in tqdm(chunk_files, desc=f"Loading {label} chunks", unit="file"):
+        arr = np.fromfile(path, dtype=np.int64)
+        arrays.append(arr)
+        total_keys += len(arr)
 
-    keys = np.concatenate(all_keys)
-    counts = np.concatenate(all_counts)
-    del all_keys, all_counts
-    logger.info("  Total deduped entries: %d (%.1f MB)",
-                len(keys), len(keys) * 16 / 1e6)
+    logger.info("  Concatenating %d keys (%.1f MB) ...", total_keys, total_keys * 8 / 1e6)
+    all_keys = np.concatenate(arrays)
+    del arrays
 
-    # ── Sort by key ──
-    logger.info("  Sorting %d entries ...", len(keys))
-    sort_idx = np.argsort(keys)
-    keys = keys[sort_idx]
-    counts = counts[sort_idx]
-    del sort_idx
+    # ── Global unique + count (one shot) ──
+    logger.info("  Computing unique keys and counts ...")
+    unique_keys, counts = np.unique(all_keys, return_counts=True)
+    del all_keys
 
-    # ── Sum counts per unique key (fully vectorized) ──
-    logger.info("  Summing counts per unique key ...")
-
-    # np.unique with return_index gives us the first occurrence of each key
-    # np.add.reduceat sums counts between those indices — no Python loop
-    unique_keys, first_idx = np.unique(keys, return_index=True)
-    summed_counts = np.add.reduceat(counts, first_idx)
-
-    del keys, counts, first_idx
     n_unique = len(unique_keys)
     logger.info("  Unique %ss: %d", label, n_unique)
 
     # ── Filter by min_count (vectorized) ──
-    total_occ = int(summed_counts.sum())
-    mask = summed_counts >= min_count
+    total_occ = int(counts.sum())
+    mask = counts >= min_count
     kept_keys = unique_keys[mask]
-    kept_occ = int(summed_counts[mask].sum())
+    kept_occ = int(counts[mask].sum())
 
-    del unique_keys, summed_counts, mask
+    del unique_keys, counts, mask
     logger.info("  After min_count=%d: %d %ss (%.2f%% coverage)",
                 min_count, len(kept_keys), label,
                 100 * kept_occ / total_occ if total_occ else 0)
 
-    # ── Decode packed keys to tuples ──
+    # ── Decode packed keys to tuples (vectorized) ──
     logger.info("  Decoding keys ...")
     if order == 2:
         a = (kept_keys // MAX_TOKEN).astype(np.int64)
@@ -188,7 +167,7 @@ def _merge_deduped_chunks(chunk_files, min_count, order, total_unique_entries):
 
     del kept_keys
 
-    # Already sorted (came from np.unique which returns sorted keys)
+    # Already sorted (from np.unique)
     return results, total_occ, kept_occ
 
 
@@ -211,14 +190,14 @@ def count_and_filter(data_path: Path, min_count: int, order: int,
     logger.info("=" * 50)
 
     with tempfile.TemporaryDirectory(prefix=f"ngram_{label}_", dir=tmp_dir_base) as tmp_dir:
-        # Phase 1: chunk → dedupe → write sorted pairs to disk
-        chunk_files, total_raw, total_unique = _write_deduped_chunks(
+        # Phase 1: chunk → sort → write sorted keys to disk
+        chunk_files, total_raw = _write_sorted_chunks(
             data_path, n_tokens, order, chunk_size, tmp_dir
         )
 
-        # Phase 2: k-way merge + count + filter
-        ngrams, total_occ, kept_occ = _merge_deduped_chunks(
-            chunk_files, min_count, order, total_unique
+        # Phase 2: load all sorted keys → np.unique → filter
+        ngrams, total_occ, kept_occ = _merge_sorted_chunks(
+            chunk_files, min_count, order
         )
         # Temp files cleaned up here
 
