@@ -125,22 +125,24 @@ def count_ngrams(data_path: Path, min_count: int, num_workers: int = 0):
 
     if num_workers == 1:
         # Single-process mode (useful for debugging)
-        for chunk_args in tqdm(chunk_ranges, desc="Counting N-grams", unit="chunk"):
-            bi_dict, tri_dict, _ = _count_chunk(chunk_args)
-            bigram_counts.update(bi_dict)
-            trigram_counts.update(tri_dict)
+        with tqdm(total=n_tokens, desc="Counting N-grams", unit="tok", unit_scale=True) as pbar:
+            for chunk_args in chunk_ranges:
+                bi_dict, tri_dict, n_processed = _count_chunk(chunk_args)
+                bigram_counts.update(bi_dict)
+                trigram_counts.update(tri_dict)
+                pbar.update(n_processed)
     else:
-        # Parallel mode
+        # Parallel mode — progress bar tracks tokens processed
         with ProcessPoolExecutor(max_workers=num_workers) as pool:
             futures = {pool.submit(_count_chunk, args): i
                        for i, args in enumerate(chunk_ranges)}
 
-            with tqdm(total=len(chunk_ranges), desc="Counting N-grams", unit="chunk") as pbar:
+            with tqdm(total=n_tokens, desc="Counting N-grams", unit="tok", unit_scale=True) as pbar:
                 for future in as_completed(futures):
-                    bi_dict, tri_dict, _ = future.result()
+                    bi_dict, tri_dict, n_processed = future.result()
                     bigram_counts.update(bi_dict)
                     trigram_counts.update(tri_dict)
-                    pbar.update(1)
+                    pbar.update(n_processed)
 
     elapsed = time.time() - t0
     logger.info("Counting done in %.1fs", elapsed)
