@@ -188,7 +188,7 @@ def _merge_deduped_chunks(chunk_files, min_count, order, total_unique_entries):
 # ── Full pipeline for one N-gram order ───────────────────────────────────────
 
 def count_and_filter(data_path: Path, min_count: int, order: int,
-                     chunk_size: int = 10_000_000):
+                     chunk_size: int = 10_000_000, tmp_dir_base: str = None):
     """
     Count N-grams of given order, return filtered list.
     Uses disk-based sort+merge. RAM usage ≈ one chunk (~80MB) + merge iterators.
@@ -203,7 +203,7 @@ def count_and_filter(data_path: Path, min_count: int, order: int,
     logger.info(" %ss (order=%d)", label.capitalize(), order)
     logger.info("=" * 50)
 
-    with tempfile.TemporaryDirectory(prefix=f"ngram_{label}_") as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix=f"ngram_{label}_", dir=tmp_dir_base) as tmp_dir:
         # Phase 1: chunk → dedupe → write sorted pairs to disk
         chunk_files, total_raw, total_unique = _write_deduped_chunks(
             data_path, n_tokens, order, chunk_size, tmp_dir
@@ -266,6 +266,8 @@ def main():
                         help="Minimum frequency to include an N-gram (default: 50)")
     parser.add_argument("--chunk-size", type=int, default=10_000_000,
                         help="Tokens per chunk (default: 10M, lower = less RAM)")
+    parser.add_argument("--tmp-dir", type=str, default=None,
+                        help="Directory for temp files (default: system temp)")
     args = parser.parse_args()
 
     data_dir = Path(args.data)
@@ -283,14 +285,16 @@ def main():
 
     t0 = time.time()
 
-    # ── Bigrams first (memory freed before trigrams start) ──
+    # ── Bigrams first (temp files freed before trigrams start) ──
     bigrams, bi_total, bi_kept = count_and_filter(
-        train_bin, args.min_count, order=2, chunk_size=args.chunk_size
+        train_bin, args.min_count, order=2,
+        chunk_size=args.chunk_size, tmp_dir_base=args.tmp_dir
     )
 
     # ── Trigrams ──
     trigrams, tri_total, tri_kept = count_and_filter(
-        train_bin, args.min_count, order=3, chunk_size=args.chunk_size
+        train_bin, args.min_count, order=3,
+        chunk_size=args.chunk_size, tmp_dir_base=args.tmp_dir
     )
 
     elapsed = time.time() - t0
