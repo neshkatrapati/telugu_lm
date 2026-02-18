@@ -115,13 +115,10 @@ def _write_deduped_chunks(data_path: Path, n_tokens: int, order: int,
 
 def _merge_deduped_chunks(chunk_files, min_count, order, total_unique_entries):
     """
-    Load all deduped (key, count) pairs from chunk files, concatenate into
-    numpy arrays, sort by key, then scan to sum counts for duplicate keys.
+    Load all deduped (key, count) pairs from chunk files, concatenate,
+    and use fully vectorized numpy to merge duplicate keys and filter.
 
-    The deduped data is much smaller than raw data (unique per chunk), so
-    this fits in memory. For 500M tokens with 86K vocab:
-      - bigram unique-per-chunk across 50 chunks ≈ 5-10M entries
-      - 10M entries × 16 bytes = 160 MB — very manageable
+    No Python loops over millions of entries — everything is numpy.
 
     Returns: (filtered_ngrams_as_tuples, total_occurrences, kept_occurrences)
     """
@@ -130,7 +127,7 @@ def _merge_deduped_chunks(chunk_files, min_count, order, total_unique_entries):
     if not chunk_files:
         return [], 0, 0
 
-    # Load all chunk files and concatenate
+    # ── Load all chunk files ──
     logger.info("  Loading %d %s chunk files ...", len(chunk_files), label)
     all_keys = []
     all_counts = []
@@ -146,46 +143,52 @@ def _merge_deduped_chunks(chunk_files, min_count, order, total_unique_entries):
     logger.info("  Total deduped entries: %d (%.1f MB)",
                 len(keys), len(keys) * 16 / 1e6)
 
-    # Sort by key
-    logger.info("  Sorting ...")
+    # ── Sort by key ──
+    logger.info("  Sorting %d entries ...", len(keys))
     sort_idx = np.argsort(keys)
     keys = keys[sort_idx]
     counts = counts[sort_idx]
     del sort_idx
 
-    # Scan: find boundaries where key changes, sum counts within each group
-    logger.info("  Scanning for unique keys and summing counts ...")
-    # Find where key changes
-    diffs = np.diff(keys)
-    boundaries = np.nonzero(diffs)[0] + 1  # indices where a new key starts
-    boundaries = np.concatenate([[0], boundaries, [len(keys)]])
+    # ── Sum counts per unique key (fully vectorized) ──
+    logger.info("  Summing counts per unique key ...")
 
-    # For each unique key: sum counts between boundaries
-    n_unique = len(boundaries) - 1
+    # np.unique with return_index gives us the first occurrence of each key
+    # np.add.reduceat sums counts between those indices — no Python loop
+    unique_keys, first_idx = np.unique(keys, return_index=True)
+    summed_counts = np.add.reduceat(counts, first_idx)
+
+    del keys, counts, first_idx
+    n_unique = len(unique_keys)
     logger.info("  Unique %ss: %d", label, n_unique)
 
-    decode_bi = lambda k: (int(k // MAX_TOKEN), int(k % MAX_TOKEN))
-    decode_tri = lambda k: (int(k // (MAX_TOKEN * MAX_TOKEN)),
-                            int(k % (MAX_TOKEN * MAX_TOKEN) // MAX_TOKEN),
-                            int(k % MAX_TOKEN))
-    decode_fn = decode_bi if order == 2 else decode_tri
+    # ── Filter by min_count (vectorized) ──
+    total_occ = int(summed_counts.sum())
+    mask = summed_counts >= min_count
+    kept_keys = unique_keys[mask]
+    kept_occ = int(summed_counts[mask].sum())
 
-    results = []
-    total_occ = 0
-    kept_occ = 0
+    del unique_keys, summed_counts, mask
+    logger.info("  After min_count=%d: %d %ss (%.2f%% coverage)",
+                min_count, len(kept_keys), label,
+                100 * kept_occ / total_occ if total_occ else 0)
 
-    for i in tqdm(range(n_unique), desc=f"Filtering {label}s", unit="ngram", unit_scale=True):
-        start = boundaries[i]
-        end = boundaries[i + 1]
-        total_count = int(counts[start:end].sum())
-        total_occ += total_count
-        if total_count >= min_count:
-            results.append(decode_fn(int(keys[start])))
-            kept_occ += total_count
+    # ── Decode packed keys to tuples ──
+    logger.info("  Decoding keys ...")
+    if order == 2:
+        a = (kept_keys // MAX_TOKEN).astype(np.int64)
+        b = (kept_keys % MAX_TOKEN).astype(np.int64)
+        results = list(zip(a.tolist(), b.tolist()))
+    else:
+        a = (kept_keys // (MAX_TOKEN * MAX_TOKEN)).astype(np.int64)
+        rem = (kept_keys % (MAX_TOKEN * MAX_TOKEN)).astype(np.int64)
+        b = (rem // MAX_TOKEN).astype(np.int64)
+        c = (rem % MAX_TOKEN).astype(np.int64)
+        results = list(zip(a.tolist(), b.tolist(), c.tolist()))
 
-    del keys, counts, boundaries, diffs
+    del kept_keys
 
-    results.sort()
+    # Already sorted (came from np.unique which returns sorted keys)
     return results, total_occ, kept_occ
 
 
