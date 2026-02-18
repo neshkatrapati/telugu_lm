@@ -27,7 +27,6 @@ import os
 import sys
 import json
 import time
-import heapq
 import tempfile
 import argparse
 import logging
@@ -112,24 +111,17 @@ def _write_deduped_chunks(data_path: Path, n_tokens: int, order: int,
     return chunk_files, total_raw, total_unique_across_chunks
 
 
-# ── Phase 2: K-way merge of deduped chunks ──────────────────────────────────
-
-def _iter_chunk_file(path, n_unique):
-    """Yield (key, count) pairs from a deduped chunk file, in sorted order."""
-    data = np.fromfile(path, dtype=np.int64)
-    keys = data[0::2]
-    counts = data[1::2]
-    for i in range(n_unique):
-        yield (int(keys[i]), int(counts[i]))
-
+# ── Phase 2: Load deduped chunks, merge with numpy ──────────────────────────
 
 def _merge_deduped_chunks(chunk_files, min_count, order, total_unique_entries):
     """
-    K-way merge of sorted (key, count) chunk files.
-    Sum counts for the same key across chunks. Apply min_count filter.
+    Load all deduped (key, count) pairs from chunk files, concatenate into
+    numpy arrays, sort by key, then scan to sum counts for duplicate keys.
 
-    Much faster than merging raw keys because we're iterating over
-    unique-per-chunk entries, not raw occurrences.
+    The deduped data is much smaller than raw data (unique per chunk), so
+    this fits in memory. For 500M tokens with 86K vocab:
+      - bigram unique-per-chunk across 50 chunks ≈ 5-10M entries
+      - 10M entries × 16 bytes = 160 MB — very manageable
 
     Returns: (filtered_ngrams_as_tuples, total_occurrences, kept_occurrences)
     """
@@ -138,20 +130,39 @@ def _merge_deduped_chunks(chunk_files, min_count, order, total_unique_entries):
     if not chunk_files:
         return [], 0, 0
 
-    # Create iterators for each chunk file
-    iterators = []
-    for path, n_unique in chunk_files:
-        iterators.append(_iter_chunk_file(path, n_unique))
+    # Load all chunk files and concatenate
+    logger.info("  Loading %d %s chunk files ...", len(chunk_files), label)
+    all_keys = []
+    all_counts = []
+    for path, n_unique in tqdm(chunk_files, desc=f"Loading {label} chunks", unit="file"):
+        data = np.fromfile(path, dtype=np.int64)
+        all_keys.append(data[0::2])
+        all_counts.append(data[1::2])
+        del data
 
-    # K-way merge on the key (first element of each tuple)
-    merged = heapq.merge(*iterators, key=lambda x: x[0])
+    keys = np.concatenate(all_keys)
+    counts = np.concatenate(all_counts)
+    del all_keys, all_counts
+    logger.info("  Total deduped entries: %d (%.1f MB)",
+                len(keys), len(keys) * 16 / 1e6)
 
-    results = []
-    total_occ = 0
-    kept_occ = 0
+    # Sort by key
+    logger.info("  Sorting ...")
+    sort_idx = np.argsort(keys)
+    keys = keys[sort_idx]
+    counts = counts[sort_idx]
+    del sort_idx
 
-    current_key = None
-    current_count = 0
+    # Scan: find boundaries where key changes, sum counts within each group
+    logger.info("  Scanning for unique keys and summing counts ...")
+    # Find where key changes
+    diffs = np.diff(keys)
+    boundaries = np.nonzero(diffs)[0] + 1  # indices where a new key starts
+    boundaries = np.concatenate([[0], boundaries, [len(keys)]])
+
+    # For each unique key: sum counts between boundaries
+    n_unique = len(boundaries) - 1
+    logger.info("  Unique %ss: %d", label, n_unique)
 
     decode_bi = lambda k: (int(k // MAX_TOKEN), int(k % MAX_TOKEN))
     decode_tri = lambda k: (int(k // (MAX_TOKEN * MAX_TOKEN)),
@@ -159,27 +170,20 @@ def _merge_deduped_chunks(chunk_files, min_count, order, total_unique_entries):
                             int(k % MAX_TOKEN))
     decode_fn = decode_bi if order == 2 else decode_tri
 
-    with tqdm(total=total_unique_entries, desc=f"Merging {label}s", unit="entry", unit_scale=True) as pbar:
-        for key, count in merged:
-            pbar.update(1)
-            if key == current_key:
-                current_count += count
-            else:
-                # Flush previous
-                if current_key is not None:
-                    total_occ += current_count
-                    if current_count >= min_count:
-                        results.append(decode_fn(current_key))
-                        kept_occ += current_count
-                current_key = key
-                current_count = count
+    results = []
+    total_occ = 0
+    kept_occ = 0
 
-        # Flush last
-        if current_key is not None:
-            total_occ += current_count
-            if current_count >= min_count:
-                results.append(decode_fn(current_key))
-                kept_occ += current_count
+    for i in tqdm(range(n_unique), desc=f"Filtering {label}s", unit="ngram", unit_scale=True):
+        start = boundaries[i]
+        end = boundaries[i + 1]
+        total_count = int(counts[start:end].sum())
+        total_occ += total_count
+        if total_count >= min_count:
+            results.append(decode_fn(int(keys[start])))
+            kept_occ += total_count
+
+    del keys, counts, boundaries, diffs
 
     results.sort()
     return results, total_occ, kept_occ
