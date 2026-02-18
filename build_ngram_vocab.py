@@ -48,23 +48,23 @@ MAX_TOKEN = np.int64(100_000)
 
 # ── Phase 1: Chunk, deduplicate, write to disk ──────────────────────────────
 
-def _write_sorted_chunks(data_path: Path, n_tokens: int, order: int,
-                         chunk_size: int, tmp_dir: str):
+def _write_deduped_chunks(data_path: Path, n_tokens: int, order: int,
+                          chunk_size: int, tmp_dir: str):
     """
     Stream through data in chunks. For each chunk:
       1. Build packed int64 N-gram keys (vectorized multiply + add)
-      2. Sort keys
-      3. Write sorted keys to temp file (no dedup — merge phase handles it)
+      2. np.unique with return_counts → deduplicate within chunk
+      3. Write (unique_keys, counts) pair to temp files
 
-    Skipping per-chunk np.unique saves significant time. Writing raw sorted
-    keys is larger on disk but the merge phase uses np.unique on the
-    concatenated sorted data which is very fast (nearly-sorted input).
+    Per-chunk dedup dramatically reduces disk+RAM for the merge phase:
+    ~10M raw keys → ~1-3M unique keys+counts per chunk.
 
-    Returns: list of tmp_paths, total raw N-grams
+    Returns: list of (keys_path, counts_path) tuples, total raw N-grams
     """
     data = np.memmap(str(data_path), dtype=np.uint32, mode="r")
     chunk_files = []
     total_raw = 0
+    total_unique_written = 0
     label = "bigram" if order == 2 else "trigram"
     overlap = order - 1
 
@@ -86,89 +86,132 @@ def _write_sorted_chunks(data_path: Path, n_tokens: int, order: int,
                         + chunk[1:own_len + 1] * MAX_TOKEN
                         + chunk[2:own_len + 2])
 
-            # Sort and write — no dedup here, merge phase handles it
-            keys.sort()
+            # Deduplicate within chunk — reduces data written by ~3-5x
+            unique_keys, counts = np.unique(keys, return_counts=True)
+            counts = counts.astype(np.int32)  # counts fit in int32, saves space
 
-            tmp_path = os.path.join(tmp_dir, f"{label}_{len(chunk_files)}.bin")
-            keys.tofile(tmp_path)
-            chunk_files.append(tmp_path)
+            keys_path = os.path.join(tmp_dir, f"{label}_{len(chunk_files)}_keys.bin")
+            counts_path = os.path.join(tmp_dir, f"{label}_{len(chunk_files)}_counts.bin")
+            unique_keys.tofile(keys_path)
+            counts.tofile(counts_path)
+            chunk_files.append((keys_path, counts_path))
 
             total_raw += own_len
+            total_unique_written += len(unique_keys)
 
-            del chunk, keys
+            del chunk, keys, unique_keys, counts
             pbar.update(own_len)
 
-    logger.info("  %d chunks, %d total raw %ss",
-                len(chunk_files), total_raw, label)
+    logger.info("  %d chunks, %d raw %ss, %d unique written (%.1fx reduction)",
+                len(chunk_files), total_raw, label,
+                total_unique_written,
+                total_raw / total_unique_written if total_unique_written else 0)
     return chunk_files, total_raw
 
 
-# ── Phase 2: Load sorted chunks, merge with numpy ───────────────────────────
+# ── Phase 2: Streaming merge of sorted deduped chunks ────────────────────────
 
-def _merge_sorted_chunks(chunk_files, min_count, order):
+def _merge_deduped_chunks(chunk_files, min_count, order):
     """
-    Load all sorted key arrays from chunk files, concatenate, then use
-    np.unique with return_counts to get global counts in one shot.
+    Streaming k-way merge of sorted (key, count) chunk pairs.
 
-    Since each chunk is already sorted, the concatenated array is
-    nearly sorted → np.unique (which sorts internally) is very fast.
+    Each chunk file pair contains sorted unique keys + their counts.
+    We use heapq.merge on iterators that yield (key, count) tuples,
+    accumulate counts for the same key across chunks, and filter.
+
+    This NEVER loads all data at once — peak RAM is bounded by
+    (num_chunks × buffer_size) where buffer_size ≈ 100K entries.
 
     Returns: (filtered_ngrams_as_tuples, total_occurrences, kept_occurrences)
     """
+    import heapq
+
     label = "bigram" if order == 2 else "trigram"
 
     if not chunk_files:
         return [], 0, 0
 
-    # ── Load all chunk files ──
-    logger.info("  Loading %d %s chunk files ...", len(chunk_files), label)
-    arrays = []
-    total_keys = 0
-    for path in tqdm(chunk_files, desc=f"Loading {label} chunks", unit="file"):
-        arr = np.fromfile(path, dtype=np.int64)
-        arrays.append(arr)
-        total_keys += len(arr)
+    # ── Buffered iterator over a chunk file pair ──
+    BUFFER_SIZE = 100_000  # entries per read
 
-    logger.info("  Concatenating %d keys (%.1f MB) ...", total_keys, total_keys * 8 / 1e6)
-    all_keys = np.concatenate(arrays)
-    del arrays
+    def chunk_iter(keys_path, counts_path):
+        """Yield (key, count) from a chunk file pair in sorted order, buffered."""
+        file_size = os.path.getsize(keys_path) // 8  # int64
+        for offset in range(0, file_size, BUFFER_SIZE):
+            n = min(BUFFER_SIZE, file_size - offset)
+            keys = np.memmap(keys_path, dtype=np.int64, mode="r",
+                             offset=offset * 8, shape=(n,))
+            counts = np.memmap(counts_path, dtype=np.int32, mode="r",
+                               offset=offset * 4, shape=(n,))
+            # Yield as Python tuples for heapq
+            for i in range(n):
+                yield (int(keys[i]), int(counts[i]))
 
-    # ── Global unique + count (one shot) ──
-    logger.info("  Computing unique keys and counts ...")
-    unique_keys, counts = np.unique(all_keys, return_counts=True)
-    del all_keys
+    # ── K-way merge with heapq ──
+    logger.info("  Merging %d %s chunks (streaming) ...", len(chunk_files), label)
+    iterators = [chunk_iter(kp, cp) for kp, cp in chunk_files]
 
-    n_unique = len(unique_keys)
+    # heapq.merge on (key, count) — sorts by key first, then count
+    # We accumulate counts for same key
+    total_occ = 0
+    kept_occ = 0
+    results = []
+
+    current_key = None
+    current_count = 0
+    n_unique = 0
+    n_kept = 0
+
+    for key, count in heapq.merge(*iterators):
+        if key == current_key:
+            current_count += count
+        else:
+            # Flush previous key
+            if current_key is not None:
+                n_unique += 1
+                total_occ += current_count
+                if current_count >= min_count:
+                    results.append(current_key)
+                    kept_occ += current_count
+                    n_kept += 1
+            current_key = key
+            current_count = count
+
+    # Flush last key
+    if current_key is not None:
+        n_unique += 1
+        total_occ += current_count
+        if current_count >= min_count:
+            results.append(current_key)
+            kept_occ += current_count
+            n_kept += 1
+
     logger.info("  Unique %ss: %d", label, n_unique)
-
-    # ── Filter by min_count (vectorized) ──
-    total_occ = int(counts.sum())
-    mask = counts >= min_count
-    kept_keys = unique_keys[mask]
-    kept_occ = int(counts[mask].sum())
-
-    del unique_keys, counts, mask
     logger.info("  After min_count=%d: %d %ss (%.2f%% coverage)",
-                min_count, len(kept_keys), label,
+                min_count, n_kept, label,
                 100 * kept_occ / total_occ if total_occ else 0)
 
     # ── Decode packed keys to tuples (vectorized) ──
     logger.info("  Decoding keys ...")
+    kept_arr = np.array(results, dtype=np.int64)
+    del results
+
+    if len(kept_arr) == 0:
+        return [], total_occ, kept_occ
+
     if order == 2:
-        a = (kept_keys // MAX_TOKEN).astype(np.int64)
-        b = (kept_keys % MAX_TOKEN).astype(np.int64)
-        results = list(zip(a.tolist(), b.tolist()))
+        a = (kept_arr // MAX_TOKEN).astype(np.int64)
+        b = (kept_arr % MAX_TOKEN).astype(np.int64)
+        decoded = list(zip(a.tolist(), b.tolist()))
     else:
-        a = (kept_keys // (MAX_TOKEN * MAX_TOKEN)).astype(np.int64)
-        rem = (kept_keys % (MAX_TOKEN * MAX_TOKEN)).astype(np.int64)
+        a = (kept_arr // (MAX_TOKEN * MAX_TOKEN)).astype(np.int64)
+        rem = (kept_arr % (MAX_TOKEN * MAX_TOKEN)).astype(np.int64)
         b = (rem // MAX_TOKEN).astype(np.int64)
         c = (rem % MAX_TOKEN).astype(np.int64)
-        results = list(zip(a.tolist(), b.tolist(), c.tolist()))
+        decoded = list(zip(a.tolist(), b.tolist(), c.tolist()))
 
-    del kept_keys
-
-    # Already sorted (from np.unique)
-    return results, total_occ, kept_occ
+    del kept_arr
+    return decoded, total_occ, kept_occ
 
 
 # ── Full pipeline for one N-gram order ───────────────────────────────────────
@@ -177,7 +220,8 @@ def count_and_filter(data_path: Path, min_count: int, order: int,
                      chunk_size: int = 10_000_000, tmp_dir_base: str = None):
     """
     Count N-grams of given order, return filtered list.
-    Uses disk-based sort+merge. RAM usage ≈ one chunk (~80MB) + merge iterators.
+    Uses disk-based sort+merge. RAM usage ≈ one chunk (~80MB) during Phase 1,
+    then bounded by (num_chunks × buffer_size) during streaming merge.
     """
     data = np.memmap(str(data_path), dtype=np.uint32, mode="r")
     n_tokens = len(data)
@@ -190,13 +234,13 @@ def count_and_filter(data_path: Path, min_count: int, order: int,
     logger.info("=" * 50)
 
     with tempfile.TemporaryDirectory(prefix=f"ngram_{label}_", dir=tmp_dir_base) as tmp_dir:
-        # Phase 1: chunk → sort → write sorted keys to disk
-        chunk_files, total_raw = _write_sorted_chunks(
+        # Phase 1: chunk → deduplicate → write sorted (key, count) to disk
+        chunk_files, total_raw = _write_deduped_chunks(
             data_path, n_tokens, order, chunk_size, tmp_dir
         )
 
-        # Phase 2: load all sorted keys → np.unique → filter
-        ngrams, total_occ, kept_occ = _merge_sorted_chunks(
+        # Phase 2: streaming k-way merge → filter
+        ngrams, total_occ, kept_occ = _merge_deduped_chunks(
             chunk_files, min_count, order
         )
         # Temp files cleaned up here
