@@ -15,6 +15,10 @@ Known N-grams get unique indices (1-indexed). Unknown N-grams map to index 0
 (UNK). The unigram table (in the Engram module) always provides a valid signal,
 so missing bi/trigrams are not a problem.
 
+Memory-efficient: each chunk is deduplicated to (key, count) pairs before writing
+to disk. The merge step only processes unique N-grams per chunk, not raw
+occurrences, so it's fast even for large corpora.
+
 Usage:
     python build_ngram_vocab.py --data ./train_data --output ./tokenizer/ngram_vocab.json --min-count 50
 """
@@ -23,6 +27,8 @@ import os
 import sys
 import json
 import time
+import heapq
+import tempfile
 import argparse
 import logging
 from pathlib import Path
@@ -37,143 +43,183 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# With vocab ~86K, MAX_TOKEN = 100000 is safe (86K^3 = 6.4e14 < 2^63)
+MAX_TOKEN = np.int64(100_000)
 
-# ── N-gram counting ─────────────────────────────────────────────────────────
 
-def count_ngrams(data_path: Path, min_count: int):
+# ── Phase 1: Chunk, deduplicate, write to disk ──────────────────────────────
+
+def _write_deduped_chunks(data_path: Path, n_tokens: int, order: int,
+                          chunk_size: int, tmp_dir: str):
     """
-    Count bigram and trigram frequencies from a uint32 memmap file.
+    Stream through data in chunks. For each chunk:
+      1. Build packed int64 N-gram keys
+      2. np.unique → (unique_keys, counts) — deduplicates within chunk
+      3. Write (key, count) pairs as int64 + int32 to temp file
 
-    Strategy: stream through data in chunks, build packed uint64 keys for each
-    N-gram, and count them using numpy. The key insight is that we DON'T store
-    per-chunk dicts and merge them — instead we accumulate all keys across chunks,
-    then do a single global np.unique at the end. This avoids the RAM explosion
-    from Python dict merging.
+    This is fast (numpy vectorized) and memory-bounded (one chunk at a time).
+    The output files are MUCH smaller than raw keys since unique << raw.
 
-    For very large files where even storing all keys would be too much RAM,
-    we use a two-pass approach: first pass counts with numpy sort+diff on
-    chunk-sized arrays, writing intermediate (key, count) pairs to a temp file,
-    then second pass merges.
-
-    But the simplest approach that works for our scale (~500M tokens):
-    - Bigram keys: 500M uint64 values = 4 GB RAM
-    - Trigram keys: 500M uint64 values = 4 GB RAM
-    That's too much. So we chunk and use a single Python Counter, but feed it
-    efficiently using numpy's unique within each chunk (far fewer unique keys
-    than raw keys).
+    Returns: list of (tmp_path, n_unique_in_chunk) tuples, total raw N-grams
     """
-    logger.info("Loading %s ...", data_path)
+    data = np.memmap(str(data_path), dtype=np.uint32, mode="r")
+    chunk_files = []
+    total_raw = 0
+    total_unique_across_chunks = 0
+    label = "bigram" if order == 2 else "trigram"
+    overlap = order - 1
+
+    with tqdm(total=n_tokens, desc=f"Counting {label}s", unit="tok", unit_scale=True) as pbar:
+        for start in range(0, n_tokens - overlap, chunk_size):
+            end = min(start + chunk_size + overlap, n_tokens)
+            chunk = data[start:end].astype(np.int64)
+            own_len = min(chunk_size, n_tokens - overlap - start)
+
+            if own_len <= 0:
+                pbar.update(end - start - overlap)
+                break
+
+            # Build packed keys
+            if order == 2:
+                keys = chunk[:own_len] * MAX_TOKEN + chunk[1:own_len + 1]
+            else:
+                keys = (chunk[:own_len] * (MAX_TOKEN * MAX_TOKEN)
+                        + chunk[1:own_len + 1] * MAX_TOKEN
+                        + chunk[2:own_len + 2])
+
+            # Deduplicate within chunk
+            unique_keys, counts = np.unique(keys, return_counts=True)
+            counts = counts.astype(np.int64)
+
+            # Interleave (key, count) pairs and write
+            # Layout: [key0, count0, key1, count1, ...]
+            pairs = np.empty(len(unique_keys) * 2, dtype=np.int64)
+            pairs[0::2] = unique_keys
+            pairs[1::2] = counts
+
+            tmp_path = os.path.join(tmp_dir, f"{label}_{len(chunk_files)}.bin")
+            pairs.tofile(tmp_path)
+            chunk_files.append((tmp_path, len(unique_keys)))
+
+            total_raw += own_len
+            total_unique_across_chunks += len(unique_keys)
+
+            del chunk, keys, unique_keys, counts, pairs
+            pbar.update(own_len)
+
+    logger.info("  %d chunks, %d total raw %ss, %d unique entries across chunks",
+                len(chunk_files), total_raw, label, total_unique_across_chunks)
+    return chunk_files, total_raw, total_unique_across_chunks
+
+
+# ── Phase 2: K-way merge of deduped chunks ──────────────────────────────────
+
+def _iter_chunk_file(path, n_unique):
+    """Yield (key, count) pairs from a deduped chunk file, in sorted order."""
+    data = np.fromfile(path, dtype=np.int64)
+    keys = data[0::2]
+    counts = data[1::2]
+    for i in range(n_unique):
+        yield (int(keys[i]), int(counts[i]))
+
+
+def _merge_deduped_chunks(chunk_files, min_count, order, total_unique_entries):
+    """
+    K-way merge of sorted (key, count) chunk files.
+    Sum counts for the same key across chunks. Apply min_count filter.
+
+    Much faster than merging raw keys because we're iterating over
+    unique-per-chunk entries, not raw occurrences.
+
+    Returns: (filtered_ngrams_as_tuples, total_occurrences, kept_occurrences)
+    """
+    label = "bigram" if order == 2 else "trigram"
+
+    if not chunk_files:
+        return [], 0, 0
+
+    # Create iterators for each chunk file
+    iterators = []
+    for path, n_unique in chunk_files:
+        iterators.append(_iter_chunk_file(path, n_unique))
+
+    # K-way merge on the key (first element of each tuple)
+    merged = heapq.merge(*iterators, key=lambda x: x[0])
+
+    results = []
+    total_occ = 0
+    kept_occ = 0
+
+    current_key = None
+    current_count = 0
+
+    decode_bi = lambda k: (int(k // MAX_TOKEN), int(k % MAX_TOKEN))
+    decode_tri = lambda k: (int(k // (MAX_TOKEN * MAX_TOKEN)),
+                            int(k % (MAX_TOKEN * MAX_TOKEN) // MAX_TOKEN),
+                            int(k % MAX_TOKEN))
+    decode_fn = decode_bi if order == 2 else decode_tri
+
+    with tqdm(total=total_unique_entries, desc=f"Merging {label}s", unit="entry", unit_scale=True) as pbar:
+        for key, count in merged:
+            pbar.update(1)
+            if key == current_key:
+                current_count += count
+            else:
+                # Flush previous
+                if current_key is not None:
+                    total_occ += current_count
+                    if current_count >= min_count:
+                        results.append(decode_fn(current_key))
+                        kept_occ += current_count
+                current_key = key
+                current_count = count
+
+        # Flush last
+        if current_key is not None:
+            total_occ += current_count
+            if current_count >= min_count:
+                results.append(decode_fn(current_key))
+                kept_occ += current_count
+
+    results.sort()
+    return results, total_occ, kept_occ
+
+
+# ── Full pipeline for one N-gram order ───────────────────────────────────────
+
+def count_and_filter(data_path: Path, min_count: int, order: int,
+                     chunk_size: int = 10_000_000):
+    """
+    Count N-grams of given order, return filtered list.
+    Uses disk-based sort+merge. RAM usage ≈ one chunk (~80MB) + merge iterators.
+    """
     data = np.memmap(str(data_path), dtype=np.uint32, mode="r")
     n_tokens = len(data)
-    logger.info("  %d tokens (%.2f GB)", n_tokens, n_tokens * 4 / 1e9)
+    del data
 
-    # Pack N-gram token IDs into single int64 keys
-    # With vocab ~86K, MAX_TOKEN = 100000 is safe (86K^3 = 6.4e14 < 2^63)
-    MAX_TOKEN = np.int64(100_000)
+    label = "bigram" if order == 2 else "trigram"
+    logger.info("")
+    logger.info("=" * 50)
+    logger.info(" %ss (order=%d)", label.capitalize(), order)
+    logger.info("=" * 50)
 
-    # Use smaller chunks to keep peak RAM low
-    # Each chunk: 10M tokens → ~80 MB for the int64 copy + ~80 MB for keys
-    CHUNK = 10_000_000
+    with tempfile.TemporaryDirectory(prefix=f"ngram_{label}_") as tmp_dir:
+        # Phase 1: chunk → dedupe → write sorted pairs to disk
+        chunk_files, total_raw, total_unique = _write_deduped_chunks(
+            data_path, n_tokens, order, chunk_size, tmp_dir
+        )
 
-    # ── Pass 1: Count bigrams ──
-    logger.info("Pass 1/2: Counting bigrams ...")
-    bigram_counts = {}
-    with tqdm(total=n_tokens, desc="Bigrams", unit="tok", unit_scale=True) as pbar:
-        for start in range(0, n_tokens - 1, CHUNK):
-            end = min(start + CHUNK + 1, n_tokens)  # +1 overlap for pairs
-            chunk = data[start:end].astype(np.int64)
-            own_len = min(CHUNK, n_tokens - 1 - start)
+        # Phase 2: k-way merge + count + filter
+        ngrams, total_occ, kept_occ = _merge_deduped_chunks(
+            chunk_files, min_count, order, total_unique
+        )
+        # Temp files cleaned up here
 
-            keys = chunk[:own_len] * MAX_TOKEN + chunk[1:own_len + 1]
-            unique_keys, counts = np.unique(keys, return_counts=True)
+    logger.info("  Result: %d %ss (coverage: %.2f%%)",
+                len(ngrams), label,
+                100 * kept_occ / total_occ if total_occ else 0)
 
-            # Merge into global dict — unique_keys per chunk is much smaller than raw
-            for k, c in zip(unique_keys, counts):
-                k = int(k)
-                bigram_counts[k] = bigram_counts.get(k, 0) + int(c)
-
-            del chunk, keys, unique_keys, counts
-            pbar.update(own_len)
-
-    logger.info("  Unique bigrams: %d", len(bigram_counts))
-
-    # ── Pass 2: Count trigrams ──
-    logger.info("Pass 2/2: Counting trigrams ...")
-    trigram_counts = {}
-    with tqdm(total=n_tokens, desc="Trigrams", unit="tok", unit_scale=True) as pbar:
-        for start in range(0, n_tokens - 2, CHUNK):
-            end = min(start + CHUNK + 2, n_tokens)  # +2 overlap for triples
-            chunk = data[start:end].astype(np.int64)
-            own_len = min(CHUNK, n_tokens - 2 - start)
-
-            keys = (chunk[:own_len] * (MAX_TOKEN * MAX_TOKEN)
-                    + chunk[1:own_len + 1] * MAX_TOKEN
-                    + chunk[2:own_len + 2])
-            unique_keys, counts = np.unique(keys, return_counts=True)
-
-            for k, c in zip(unique_keys, counts):
-                k = int(k)
-                trigram_counts[k] = trigram_counts.get(k, 0) + int(c)
-
-            del chunk, keys, unique_keys, counts
-            pbar.update(own_len)
-
-    logger.info("  Unique trigrams: %d", len(trigram_counts))
-
-    # ── Apply cutoff ──
-    logger.info("Applying min_count=%d cutoff ...", min_count)
-    bigrams = []
-    bi_total = 0
-    bi_kept_freq = 0
-    for key, count in tqdm(bigram_counts.items(), desc="Filtering bigrams", unit="ngram"):
-        bi_total += count
-        if count >= min_count:
-            a = int(key // MAX_TOKEN)
-            b = int(key % MAX_TOKEN)
-            bigrams.append((a, b))
-            bi_kept_freq += count
-
-    del bigram_counts
-
-    trigrams = []
-    tri_total = 0
-    tri_kept_freq = 0
-    for key, count in tqdm(trigram_counts.items(), desc="Filtering trigrams", unit="ngram"):
-        tri_total += count
-        if count >= min_count:
-            a = int(key // (MAX_TOKEN * MAX_TOKEN))
-            rem = int(key % (MAX_TOKEN * MAX_TOKEN))
-            b = int(rem // MAX_TOKEN)
-            c = int(rem % MAX_TOKEN)
-            trigrams.append((a, b, c))
-            tri_kept_freq += count
-
-    del trigram_counts
-
-    bigrams.sort()
-    trigrams.sort()
-
-    logger.info("After min_count=%d cutoff:", min_count)
-    logger.info("  Bigrams:  %d", len(bigrams))
-    logger.info("  Trigrams: %d", len(trigrams))
-    logger.info("  Bigram coverage:  %.2f%% of all bigram occurrences",
-                100 * bi_kept_freq / bi_total if bi_total else 0)
-    logger.info("  Trigram coverage: %.2f%% of all trigram occurrences",
-                100 * tri_kept_freq / tri_total if tri_total else 0)
-
-    stats = {
-        "n_tokens": int(n_tokens),
-        "unique_bigrams_total": int(bi_total),  # this is occurrence count
-        "unique_trigrams_total": int(tri_total),
-        "bigram_occurrences_total": int(bi_total),
-        "trigram_occurrences_total": int(tri_total),
-        "bigrams_after_cutoff": len(bigrams),
-        "trigrams_after_cutoff": len(trigrams),
-        "bigram_coverage_pct": round(100 * bi_kept_freq / bi_total, 2) if bi_total else 0,
-        "trigram_coverage_pct": round(100 * tri_kept_freq / tri_total, 2) if tri_total else 0,
-    }
-
-    return bigrams, trigrams, stats
+    return ngrams, total_occ, kept_occ
 
 
 # ── Index assignment ─────────────────────────────────────────────────────────
@@ -188,7 +234,7 @@ def build_ngram_index(bigrams, trigrams):
     """
     bigram_to_idx = {}
     for i, ng in enumerate(tqdm(bigrams, desc="Indexing bigrams", unit="ngram")):
-        bigram_to_idx[ng] = i + 1  # 1-indexed, 0 = UNK
+        bigram_to_idx[ng] = i + 1
 
     trigram_to_idx = {}
     for i, ng in enumerate(tqdm(trigrams, desc="Indexing trigrams", unit="ngram")):
@@ -218,6 +264,8 @@ def main():
                         help="Output path for ngram_vocab.json")
     parser.add_argument("--min-count", type=int, default=50,
                         help="Minimum frequency to include an N-gram (default: 50)")
+    parser.add_argument("--chunk-size", type=int, default=10_000_000,
+                        help="Tokens per chunk (default: 10M, lower = less RAM)")
     args = parser.parse_args()
 
     data_dir = Path(args.data)
@@ -228,19 +276,37 @@ def main():
         logger.error("Run `python train_gpt.py prepare` first.")
         sys.exit(1)
 
-    # ── Step 1: Count N-grams ──
-    bigrams, trigrams, stats = count_ngrams(train_bin, args.min_count)
+    data = np.memmap(str(train_bin), dtype=np.uint32, mode="r")
+    n_tokens = len(data)
+    del data
+    logger.info("Data: %s — %d tokens (%.2f GB)", train_bin, n_tokens, n_tokens * 4 / 1e9)
+
+    t0 = time.time()
+
+    # ── Bigrams first (memory freed before trigrams start) ──
+    bigrams, bi_total, bi_kept = count_and_filter(
+        train_bin, args.min_count, order=2, chunk_size=args.chunk_size
+    )
+
+    # ── Trigrams ──
+    trigrams, tri_total, tri_kept = count_and_filter(
+        train_bin, args.min_count, order=3, chunk_size=args.chunk_size
+    )
+
+    elapsed = time.time() - t0
+    logger.info("")
+    logger.info("Total counting time: %.1fs", elapsed)
 
     if len(bigrams) == 0 and len(trigrams) == 0:
         logger.error("No N-grams survived the cutoff! Try lowering --min-count")
         sys.exit(1)
 
-    # ── Step 2: Assign indices ──
+    # ── Assign indices ──
     bigram_to_idx, trigram_to_idx, bi_table_size, tri_table_size = build_ngram_index(
         bigrams, trigrams
     )
 
-    # ── Step 3: Save ──
+    # ── Save ──
     logger.info("Serializing to JSON ...")
     bigram_dict = {f"{a},{b}": idx for (a, b), idx in
                    tqdm(bigram_to_idx.items(), desc="Serializing bigrams", unit="ngram")}
@@ -259,7 +325,15 @@ def main():
         "bigrams": bigram_dict,
         "trigrams": trigram_dict,
 
-        "stats": stats,
+        "stats": {
+            "n_tokens": int(n_tokens),
+            "bigram_occurrences_total": int(bi_total),
+            "trigram_occurrences_total": int(tri_total),
+            "bigrams_after_cutoff": len(bigrams),
+            "trigrams_after_cutoff": len(trigrams),
+            "bigram_coverage_pct": round(100 * bi_kept / bi_total, 2) if bi_total else 0,
+            "trigram_coverage_pct": round(100 * tri_kept / tri_total, 2) if tri_total else 0,
+        },
     }
 
     output_path = Path(args.output)
@@ -278,21 +352,22 @@ def main():
     logger.info("N-gram Vocabulary Summary")
     logger.info("=" * 60)
     logger.info("  Source:          %s", train_bin)
-    logger.info("  Tokens:          %d", stats["n_tokens"])
+    logger.info("  Tokens:          %d", n_tokens)
     logger.info("  Min count:       %d", args.min_count)
     logger.info("  Bigrams:         %d (coverage: %.1f%%)",
-                len(bigrams), stats["bigram_coverage_pct"])
+                len(bigrams),
+                100 * bi_kept / bi_total if bi_total else 0)
     logger.info("  Trigrams:        %d (coverage: %.1f%%)",
-                len(trigrams), stats["trigram_coverage_pct"])
+                len(trigrams),
+                100 * tri_kept / tri_total if tri_total else 0)
     logger.info("  Bigram table:    %d rows (%d known + 1 UNK)",
                 bi_table_size, len(bigrams))
     logger.info("  Trigram table:   %d rows (%d known + 1 UNK)",
                 tri_table_size, len(trigrams))
     logger.info("")
 
-    # Param estimates
-    vocab_size = 86075  # approximate
-    d = 64  # per-order dimension
+    vocab_size = 86075
+    d = 64
     uni_params = vocab_size * d
     bi_params = bi_table_size * d
     tri_params = tri_table_size * d
