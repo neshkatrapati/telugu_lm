@@ -222,10 +222,12 @@ def train_sentencepiece(input_path, output_dir, vocab_size=48000,
     return model_path
 
 
-def extract_parquet_to_text(parquet_path, output_path, text_column="text"):
+def extract_parquet_to_text(parquet_path, output_path, text_column="text",
+                            max_lines=0):
     """Extract text column from parquet file, one row per line.
 
     Streams row-group-by-row-group to keep RAM low.
+    If max_lines > 0, stops after writing that many lines.
     """
     import pyarrow.parquet as pq
 
@@ -233,13 +235,18 @@ def extract_parquet_to_text(parquet_path, output_path, text_column="text"):
     pf = pq.ParquetFile(parquet_path)
     n_row_groups = pf.metadata.num_row_groups
     total_rows = pf.metadata.num_rows
-    logger.info("  Total rows: %d (%d row groups)", total_rows, n_row_groups)
+    target = min(total_rows, max_lines) if max_lines > 0 else total_rows
+    logger.info("  Total rows: %d (%d row groups), extracting up to %d",
+                total_rows, n_row_groups, target)
 
     n_written = 0
     n_empty = 0
+    done = False
     with open(output_path, "w", encoding="utf-8") as f:
-        with tqdm(total=total_rows, desc="Extracting text", unit=" rows") as pbar:
+        with tqdm(total=target, desc="Extracting text", unit=" rows") as pbar:
             for rg_idx in range(n_row_groups):
+                if done:
+                    break
                 table = pf.read_row_group(rg_idx, columns=[text_column])
                 col = table.column(text_column)
                 for text in col.to_pylist():
@@ -250,9 +257,12 @@ def extract_parquet_to_text(parquet_path, output_path, text_column="text"):
                         if clean:
                             f.write(clean + "\n")
                             n_written += 1
+                            if max_lines > 0 and n_written >= max_lines:
+                                done = True
+                                break
                         else:
                             n_empty += 1
-                pbar.update(len(col))
+                pbar.update(min(len(col), target - pbar.n))
                 del table, col  # free row group immediately
 
     logger.info("  Written: %d lines (%d empty/null skipped)", n_written, n_empty)
@@ -321,7 +331,10 @@ def main():
         input_path = merge_text_files(args.input_dir, tmp_path)
     elif args.input and args.input.endswith(".parquet"):
         tmp_path = os.path.join(args.output, "corpus.txt")
-        input_path = extract_parquet_to_text(args.input, tmp_path, args.text_column)
+        # If subsampling, only extract that many lines from parquet
+        max_extract = args.input_sentence_size if args.input_sentence_size > 0 else 10_000_000
+        input_path = extract_parquet_to_text(args.input, tmp_path, args.text_column,
+                                             max_lines=max_extract)
     else:
         input_path = args.input
 
