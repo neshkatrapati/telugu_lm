@@ -1215,7 +1215,7 @@ Examples:
 
     # Prepare
     prep = subparsers.add_parser("prepare", help="Tokenize corpus into binary shards")
-    prep.add_argument("--data", type=str, required=True, help="Path to corpus directory (text files or segmented)")
+    prep.add_argument("--data", type=str, default=None, help="Path to corpus directory (text files or segmented)")
     prep.add_argument("--tokenizer", type=str, default="./tokenizer", help="Tokenizer directory")
     prep.add_argument("--output", type=str, default="./train_data", help="Output directory for binary shards")
     prep.add_argument("--val-split", type=float, default=0.02, help="Validation split ratio (default: 0.02)")
@@ -1257,9 +1257,14 @@ Examples:
     _add_train_args(tr)
     tr.add_argument("--resume", type=str, default=None, help="Checkpoint to resume from")
 
-    # All (prepare + train)
+    # All (prepare + train) — --data is optional if --parquet is given
     al = subparsers.add_parser("all", help="Prepare data and train in one go")
     _add_train_args(al)
+    # Override --data to not be required (parquet can substitute for input)
+    for action in al._actions:
+        if hasattr(action, 'dest') and action.dest == 'data':
+            action.required = False
+            break
     al.add_argument("--output", type=str, default="./train_data", help="Output for binary shards")
     al.add_argument("--tokenizer-type", type=str, default="sp", choices=["sp", "morfessor"],
                      help="Tokenizer backend (default: sp)")
@@ -1306,8 +1311,11 @@ Examples:
         train_config.wsd_decay_frac = args.wsd_decay_frac
 
     if args.command == "prepare":
+        if not args.data and not args.parquet:
+            parser.error("prepare requires either --data (text dir) or --parquet (parquet file)")
+        data_dir = Path(args.data) if args.data else Path(".")
         prepare_data(
-            Path(args.data), Path(args.tokenizer), Path(args.output),
+            data_dir, Path(args.tokenizer), Path(args.output),
             args.val_split, model_config.block_size,
             num_workers=args.workers,
             tokenizer_type=args.tokenizer_type,
@@ -1320,9 +1328,12 @@ Examples:
 
     elif args.command == "all":
         _apply_train_args(args, model_config, train_config)
+        if not args.data and not args.parquet:
+            parser.error("'all' requires either --data (text dir) or --parquet (parquet file)")
+        data_dir = Path(args.data) if args.data else Path(".")
         output_dir = Path(args.output)
         prepare_data(
-            Path(args.data), Path(args.tokenizer), output_dir,
+            data_dir, Path(args.tokenizer), output_dir,
             train_config.val_split, model_config.block_size,
             num_workers=args.workers,
             tokenizer_type=args.tokenizer_type,
