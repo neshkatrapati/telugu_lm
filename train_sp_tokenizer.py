@@ -14,19 +14,20 @@ Requirements:
   - pip install sentencepiece
 
 Usage:
+    # From a parquet file:
+    python train_sp_tokenizer.py \
+        --input corpus.parquet --text-column text \
+        --output ./sp_tokenizer --vocab-size 48000
+
+    # From a plain text file:
     python train_sp_tokenizer.py \
         --input corpus.txt \
-        --output ./sp_tokenizer \
-        --vocab-size 48000
+        --output ./sp_tokenizer --vocab-size 48000
 
-    # If your corpus is split across multiple files:
+    # From a directory of .txt files:
     python train_sp_tokenizer.py \
         --input-dir ./data/raw_text/ \
-        --output ./sp_tokenizer \
-        --vocab-size 48000
-
-    # If you only have train.bin (token IDs), you need the original text.
-    # train.bin cannot be used — SentencePiece needs raw text.
+        --output ./sp_tokenizer --vocab-size 48000
 """
 
 import os
@@ -209,6 +210,32 @@ def train_sentencepiece(input_path, output_dir, vocab_size=48000,
     return model_path
 
 
+def extract_parquet_to_text(parquet_path, output_path, text_column="text"):
+    """Extract text column from parquet file, one row per line."""
+    import pandas as pd
+
+    logger.info("Reading parquet: %s (column: '%s')", parquet_path, text_column)
+    df = pd.read_parquet(parquet_path, columns=[text_column])
+    logger.info("  Rows: %d", len(df))
+
+    n_written = 0
+    n_empty = 0
+    with open(output_path, "w", encoding="utf-8") as f:
+        for text in df[text_column]:
+            if pd.isna(text) or not str(text).strip():
+                n_empty += 1
+                continue
+            # Write each row as one line (replace internal newlines with spaces
+            # so SentencePiece sees it as one sentence)
+            clean = str(text).replace("\n", " ").replace("\r", " ").strip()
+            if clean:
+                f.write(clean + "\n")
+                n_written += 1
+
+    logger.info("  Written: %d lines (%d empty/null skipped)", n_written, n_empty)
+    return output_path
+
+
 def merge_text_files(input_dir, output_path, extensions=(".txt", ".seg.txt")):
     """Merge all text files in a directory into one file for SentencePiece."""
     files = []
@@ -248,6 +275,8 @@ def main():
 
     parser.add_argument("--output", type=str, required=True,
                         help="Output directory for SP model")
+    parser.add_argument("--text-column", type=str, default="text",
+                        help="Column name for parquet input (default: 'text')")
     parser.add_argument("--vocab-size", type=int, default=48000,
                         help="Target vocabulary size (default: 48000)")
     parser.add_argument("--model-type", type=str, default="unigram",
@@ -261,12 +290,15 @@ def main():
                         help="Subsample N sentences for training (0=all)")
     args = parser.parse_args()
 
+    os.makedirs(args.output, exist_ok=True)
+
     # Handle input
     if args.input_dir:
-        # Merge files into one temp file
-        tmp_path = os.path.join(args.output, "merged_corpus.txt")
-        os.makedirs(args.output, exist_ok=True)
+        tmp_path = os.path.join(args.output, "corpus.txt")
         input_path = merge_text_files(args.input_dir, tmp_path)
+    elif args.input and args.input.endswith(".parquet"):
+        tmp_path = os.path.join(args.output, "corpus.txt")
+        input_path = extract_parquet_to_text(args.input, tmp_path, args.text_column)
     else:
         input_path = args.input
 
