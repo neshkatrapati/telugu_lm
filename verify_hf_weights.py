@@ -44,7 +44,18 @@ def main():
 
     checkpoint = torch.load(str(args.checkpoint), map_location="cpu", weights_only=False)
     config_dict = checkpoint["config"]
-    config = GPTConfig(**config_dict)
+    config = GPTConfig(
+        block_size=config_dict["block_size"],
+        vocab_size=config_dict["vocab_size"],
+        n_layer=config_dict["n_layer"],
+        n_head=config_dict["n_head"],
+        n_kv_head=config_dict.get("n_kv_head", config_dict["n_head"]),
+        n_embd=config_dict["n_embd"],
+        dropout=config_dict.get("dropout", 0.0),
+        bias=config_dict["bias"],
+        rope_theta=config_dict.get("rope_theta", 10000.0),
+        use_weight_sharing=config_dict.get("use_weight_sharing", False),
+    )
     model_ours = build_model(config, device="cpu")
 
     state_dict = checkpoint["model"]
@@ -157,8 +168,15 @@ def main():
 
                 # QKV raw (before RoPE)
                 attn_ours = model_ours.transformer.h[0].attn
-                qkv_ours = attn_ours.c_attn(ln1_ours)
-                q_ours, k_ours, v_ours = qkv_ours.split(config.n_embd, dim=2)
+                has_separate_qkv = hasattr(attn_ours, 'q_proj')
+
+                if has_separate_qkv:
+                    q_ours = attn_ours.q_proj(ln1_ours)
+                    k_ours = attn_ours.k_proj(ln1_ours)
+                    v_ours = attn_ours.v_proj(ln1_ours)
+                else:
+                    qkv_ours = attn_ours.c_attn(ln1_ours)
+                    q_ours, k_ours, v_ours = qkv_ours.split(config.n_embd, dim=2)
 
                 attn_hf = model_hf.model.layers[0].self_attn
                 q_hf = attn_hf.q_proj(ln1_hf)
@@ -173,17 +191,18 @@ def main():
                 # but they should match after applying their respective RoPE
                 B, T, C = ln1_ours.shape
                 H = config.n_head
+                H_kv = config.n_kv_head
                 D = C // H
 
                 # Our RoPE: view_as_complex on consecutive pairs
                 q_ours_r = q_ours.view(B, T, H, D).transpose(1, 2)
-                k_ours_r = k_ours.view(B, T, H, D).transpose(1, 2)
+                k_ours_r = k_ours.view(B, T, H_kv, D).transpose(1, 2)
                 from train_gpt import apply_rotary_emb
                 q_ours_rope, k_ours_rope = apply_rotary_emb(q_ours_r, k_ours_r, freqs_cis)
 
                 # HF RoPE: rotate_half on half-split
                 q_hf_r = q_hf.view(B, T, H, D).transpose(1, 2)
-                k_hf_r = k_hf.view(B, T, H, D).transpose(1, 2)
+                k_hf_r = k_hf.view(B, T, H_kv, D).transpose(1, 2)
                 cos_sin = model_hf.model.layers[0].self_attn.rotary_emb(q_hf_r, torch.arange(T).unsqueeze(0))
                 cos, sin = cos_sin
                 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb

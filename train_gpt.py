@@ -60,27 +60,35 @@ logger = logging.getLogger(__name__)
 # ===========================================================================
 @dataclass
 class GPTConfig:
-    """LLaMA-style model configuration — ~300M parameters."""
+    """LLaMA-style model configuration — ~320M parameters."""
     block_size: int = 2048       # context length
     vocab_size: int = 0          # 0 = auto-detect from tokenizer at runtime
-    n_layer: int = 20            # transformer layers
-    n_head: int = 16             # attention heads
+    n_layer: int = 24            # unique transformer layers
+    n_head: int = 16             # query attention heads
+    n_kv_head: int = 4           # KV head groups for GQA (4 KV heads shared across 16 Q heads)
     n_embd: int = 1024           # embedding dimension
-    dropout: float = 0.1
+    dropout: float = 0.0         # 0.0 for pretraining (Liu et al. 2025)
     bias: bool = False           # no bias in linear layers
     rope_theta: float = 10000.0  # RoPE base frequency
+    use_weight_sharing: bool = True  # MobileLLM-LS block-wise sharing (2x effective depth)
+
+    def effective_depth(self):
+        """Number of block forward passes (2x unique layers if weight sharing)."""
+        return self.n_layer * 2 if self.use_weight_sharing else self.n_layer
 
     def param_count(self):
-        """Rough parameter count estimate."""
+        """Rough parameter count estimate (GQA-aware)."""
         # Embedding: vocab * embd (no positional embedding — using RoPE)
         emb = self.vocab_size * self.n_embd
-        # Attention per layer: QKV (3 * n_embd^2) + output proj (n_embd^2) = 4 * n_embd^2
-        attn_per_layer = 4 * self.n_embd ** 2
+        head_dim = self.n_embd // self.n_head
+        # Attention per layer: Q(n_head*hd*embd) + K(n_kv_head*hd*embd) + V(same) + O(embd^2)
+        attn_per_layer = (self.n_head + 2 * self.n_kv_head) * head_dim * self.n_embd + self.n_embd ** 2
         # SwiGLU MLP per layer: gate + up + down = 3 * n_embd * hidden_dim
         hidden_dim = ((int(2 * self.n_embd * 4 / 3) + 255) // 256) * 256
         mlp_per_layer = 3 * self.n_embd * hidden_dim
+        # Only unique layers have parameters (weight sharing doesn't add params)
         tfm = self.n_layer * (attn_per_layer + mlp_per_layer)
-        # RMSNorm params: (2 per layer + 1 final) * n_embd
+        # RMSNorm params: (2 per unique layer + 1 final) * n_embd
         norms = (2 * self.n_layer + 1) * self.n_embd
         # LM head shares weights with embedding
         return emb + tfm + norms
@@ -109,6 +117,9 @@ class TrainConfig:
     warmup_steps: int = 500
     max_steps: int = 45000               # ~3 epochs over 3.7B tokens
     lr_decay_steps: int = 45000          # cosine decay over full training
+    lr_schedule: str = "wsd"             # "wsd" (warmup-stable-decay) or "cosine"
+    wsd_stable_frac: float = 0.7         # WSD: fraction of total steps at peak LR
+    wsd_decay_frac: float = 0.2          # WSD: fraction of total steps for decay
 
     # Logging & saving
     log_interval: int = 10
@@ -140,25 +151,19 @@ def prepare_data(
     val_split: float,
     block_size: int,
     num_workers: int = 0,
+    tokenizer_type: str = "sp",
+    parquet_path: str = None,
 ):
     """
-    Tokenize segmented corpus into memory-mapped binary shards.
+    Tokenize corpus into memory-mapped binary shards.
 
-    Simple single-threaded approach with per-line progress bar and
-    streaming writes to disk. Uses encode_lines_to_array() with BPE
-    cache for speed.
+    Supports two tokenizer backends:
+      - "sp":       SentencePiece (default) — reads raw text or parquet
+      - "morfessor": Legacy Morfessor tokenizer — reads .seg.txt files
 
-    Reads .seg.txt files, encodes with our Morfessor tokenizer,
-    and writes train.bin / val.bin as uint32 numpy arrays.
+    Writes train.bin / val.bin as uint32 numpy arrays.
     """
     from tqdm import tqdm
-
-    # Import our tokenizer
-    sys.path.insert(0, str(Path(__file__).parent))
-    from train_tokenizer import MorfessorTokenizer
-
-    tokenizer = MorfessorTokenizer(tokenizer_dir)
-    logger.info("Loaded tokenizer: vocab_size=%d", tokenizer.vocab_size)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -174,16 +179,180 @@ def prepare_data(
         logger.info("  Delete these files to re-prepare.")
         return train_tokens, val_tokens
 
+    # Stream-write to temp binary (avoids holding all IDs in RAM)
+    temp_bin = output_dir / "all_tokens.tmp.bin"
+    total_tokens = 0
+    total_unk = 0
+    BATCH_SIZE = 1000  # lines per micro-batch write
+
+    if tokenizer_type == "sp":
+        total_tokens, total_unk = _prepare_sentencepiece(
+            data_dir, tokenizer_dir, temp_bin, parquet_path, BATCH_SIZE, tqdm
+        )
+    else:
+        total_tokens, total_unk = _prepare_morfessor(
+            data_dir, tokenizer_dir, temp_bin, BATCH_SIZE, tqdm
+        )
+
+    logger.info("Total tokens: %d", total_tokens)
+    logger.info("UNK tokens:   %d (%.2f%%)", total_unk, 100 * total_unk / total_tokens if total_tokens else 0)
+
+    # Phase 2: Split into train/val from the temp binary
+    temp_size = os.path.getsize(temp_bin)
+    n_total = temp_size // 4  # uint32 = 4 bytes
+    n_val = int(n_total * val_split)
+    n_train = n_total - n_val
+
+    logger.info("Splitting: %d train + %d val tokens", n_train, n_val)
+
+    all_data = np.memmap(str(temp_bin), dtype=np.uint32, mode="r", shape=(n_total,))
+    all_data[:n_train].tofile(str(train_bin))
+    all_data[n_train:].tofile(str(val_bin))
+    del all_data
+    temp_bin.unlink()
+
+    train_gb = os.path.getsize(train_bin) / 1e9
+    val_gb = os.path.getsize(val_bin) / 1e9
+
+    logger.info("Saved prepared data:")
+    logger.info("  train.bin: %d tokens (%.2f GB)", n_train, train_gb)
+    logger.info("  val.bin:   %d tokens (%.2f GB)", n_val, val_gb)
+    logger.info("  Location:  %s", output_dir.resolve())
+
+    # Save metadata — get vocab_size from the tokenizer that was used
+    vocab_size = _get_vocab_size(tokenizer_dir, tokenizer_type)
+    meta = {
+        "vocab_size": vocab_size,
+        "block_size": block_size,
+        "train_tokens": int(n_train),
+        "val_tokens": int(n_val),
+        "total_tokens": int(total_tokens),
+        "unk_rate": total_unk / total_tokens if total_tokens else 0,
+        "dtype": "uint32",
+        "tokenizer_type": tokenizer_type,
+    }
+    with open(output_dir / "meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+    return n_train, n_val
+
+
+def _get_vocab_size(tokenizer_dir: Path, tokenizer_type: str) -> int:
+    """Get vocab size from tokenizer without loading the full object."""
+    if tokenizer_type == "sp":
+        import sentencepiece as spm
+        sp = spm.SentencePieceProcessor(model_file=str(tokenizer_dir / "sp_telugu.model"))
+        return sp.get_piece_size()
+    else:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from train_tokenizer import MorfessorTokenizer
+        return MorfessorTokenizer(tokenizer_dir).vocab_size
+
+
+def _prepare_sentencepiece(data_dir, tokenizer_dir, temp_bin, parquet_path, batch_size, tqdm):
+    """Tokenize raw text using SentencePiece. Returns (total_tokens, total_unk)."""
+    import sentencepiece as spm
+
+    sp_model_path = tokenizer_dir / "sp_telugu.model"
+    if not sp_model_path.exists():
+        logger.error("SentencePiece model not found: %s", sp_model_path)
+        logger.error("Train one first: python train_sp_tokenizer.py --input corpus.parquet --output %s", tokenizer_dir)
+        sys.exit(1)
+
+    sp = spm.SentencePieceProcessor(model_file=str(sp_model_path))
+    vocab_size = sp.get_piece_size()
+    eos_id = sp.eos_id()
+    unk_id = sp.unk_id()
+    logger.info("Loaded SentencePiece tokenizer: vocab_size=%d", vocab_size)
+
+    total_tokens = 0
+    total_unk = 0
+    batch_ids = []
+    line_count = 0
+
+    def _flush(out_f, batch_ids, total_tokens, total_unk):
+        """Write batch to disk and count UNKs."""
+        if not batch_ids:
+            return total_tokens, total_unk
+        arr = np.array(batch_ids, dtype=np.uint32)
+        out_f.write(arr.tobytes())
+        unk_count = int(np.sum(arr == unk_id))
+        return total_tokens + len(arr), total_unk + unk_count
+
+    with open(temp_bin, "wb") as out_f:
+        if parquet_path:
+            # Stream from parquet
+            import pyarrow.parquet as pq
+            logger.info("Reading parquet: %s", parquet_path)
+            pf = pq.ParquetFile(parquet_path)
+            total_rows = pf.metadata.num_rows
+            n_row_groups = pf.metadata.num_row_groups
+
+            with tqdm(total=total_rows, desc="Tokenizing (parquet)", unit=" rows") as pbar:
+                for rg_idx in range(n_row_groups):
+                    table = pf.read_row_group(rg_idx, columns=["text"])
+                    col = table.column("text")
+                    for text in col.to_pylist():
+                        if text is None or not str(text).strip():
+                            continue
+                        clean = str(text).replace("\n", " ").replace("\r", " ").strip()
+                        if not clean:
+                            continue
+                        ids = sp.encode(clean, out_type=int)
+                        ids.append(eos_id)
+                        batch_ids.extend(ids)
+                        line_count += 1
+                        if line_count % batch_size == 0:
+                            total_tokens, total_unk = _flush(out_f, batch_ids, total_tokens, total_unk)
+                            batch_ids = []
+                    pbar.update(len(col))
+                    del table, col
+        else:
+            # Read from text files
+            txt_files = sorted(data_dir.rglob("*.txt"))
+            if not txt_files:
+                logger.error("No .txt files found in %s", data_dir)
+                sys.exit(1)
+            logger.info("Found %d text files to tokenize", len(txt_files))
+
+            for fpath in txt_files:
+                fsize_mb = os.path.getsize(fpath) / 1e6
+                logger.info("  Tokenizing %s (%.0f MB)...", fpath.name, fsize_mb)
+                with open(fpath, "r", encoding="utf-8") as f:
+                    for line in tqdm(f, desc=fpath.name, unit=" lines", mininterval=0.5):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        ids = sp.encode(line, out_type=int)
+                        ids.append(eos_id)
+                        batch_ids.extend(ids)
+                        line_count += 1
+                        if line_count % batch_size == 0:
+                            total_tokens, total_unk = _flush(out_f, batch_ids, total_tokens, total_unk)
+                            batch_ids = []
+
+        # Final flush
+        total_tokens, total_unk = _flush(out_f, batch_ids, total_tokens, total_unk)
+
+    return total_tokens, total_unk
+
+
+def _prepare_morfessor(data_dir, tokenizer_dir, temp_bin, batch_size, tqdm):
+    """Tokenize segmented text using Morfessor tokenizer. Returns (total_tokens, total_unk)."""
+    sys.path.insert(0, str(Path(__file__).parent))
+    from train_tokenizer import MorfessorTokenizer
+
+    tokenizer = MorfessorTokenizer(tokenizer_dir)
+    logger.info("Loaded Morfessor tokenizer: vocab_size=%d", tokenizer.vocab_size)
+
     # Find all segmented files
     seg_files = sorted(data_dir.rglob("*.seg.txt"))
     if not seg_files:
         seg_files = sorted(data_dir.rglob("*.txt"))
         seg_files = [f for f in seg_files if "morfessor" not in str(f)]
-
     if not seg_files:
         logger.error("No segmented text files found in %s", data_dir)
         sys.exit(1)
-
     logger.info("Found %d files to tokenize", len(seg_files))
 
     # Local refs for hot-path speed
@@ -196,13 +365,8 @@ def prepare_data(
     _bpe = tokenizer._encode_token_bpe
     _id2tok = tokenizer.id_to_token
 
-    # Stream-write to temp binary (avoids holding all IDs in RAM)
-    temp_bin = output_dir / "all_tokens.tmp.bin"
     total_tokens = 0
     total_unk = 0
-
-    # Micro-batch: encode N lines at a time, write as one array
-    BATCH_SIZE = 1000  # lines per micro-batch write
 
     with open(temp_bin, "wb") as out_f:
         for fpath in seg_files:
@@ -220,7 +384,6 @@ def prepare_data(
                     if not line:
                         continue
 
-                    # Inline encode — avoids method call overhead per line
                     for token in line.split():
                         tid = _get(token)
                         if tid is not None:
@@ -230,7 +393,6 @@ def prepare_data(
                                 batch_unk += 1
                             continue
 
-                        # Slow path: fallback
                         batch_total += 1
                         is_cont = token.endswith(_sep)
                         bare = token[:-_sep_len] if is_cont else token
@@ -260,13 +422,11 @@ def prepare_data(
                                     else:
                                         batch_ids.append(_get(ch, _unk))
 
-                    # Append EOS after each document
                     batch_ids.append(_eos)
                     batch_total += 1
                     line_in_batch += 1
 
-                    # Flush micro-batch to disk periodically
-                    if line_in_batch >= BATCH_SIZE:
+                    if line_in_batch >= batch_size:
                         arr = np.array(batch_ids, dtype=np.uint32)
                         out_f.write(arr.tobytes())
                         total_tokens += batch_total
@@ -276,52 +436,13 @@ def prepare_data(
                         batch_total = 0
                         line_in_batch = 0
 
-            # Flush remaining
             if batch_ids:
                 arr = np.array(batch_ids, dtype=np.uint32)
                 out_f.write(arr.tobytes())
                 total_tokens += batch_total
                 total_unk += batch_unk
 
-    logger.info("Total tokens: %d", total_tokens)
-    logger.info("UNK tokens:   %d (%.2f%%)", total_unk, 100 * total_unk / total_tokens if total_tokens else 0)
-
-    # Phase 2: Split into train/val from the temp binary
-    temp_size = os.path.getsize(temp_bin)
-    n_total = temp_size // 4  # uint32 = 4 bytes
-    n_val = int(n_total * val_split)
-    n_train = n_total - n_val
-
-    logger.info("Splitting: %d train + %d val tokens", n_train, n_val)
-
-    all_data = np.memmap(str(temp_bin), dtype=np.uint32, mode="r", shape=(n_total,))
-    all_data[:n_train].tofile(str(train_bin))
-    all_data[n_train:].tofile(str(val_bin))
-    del all_data
-    temp_bin.unlink()
-
-    train_gb = os.path.getsize(train_bin) / 1e9
-    val_gb = os.path.getsize(val_bin) / 1e9
-
-    logger.info("Saved prepared data:")
-    logger.info("  train.bin: %d tokens (%.2f GB)", n_train, train_gb)
-    logger.info("  val.bin:   %d tokens (%.2f GB)", n_val, val_gb)
-    logger.info("  Location:  %s", output_dir.resolve())
-
-    # Save metadata
-    meta = {
-        "vocab_size": tokenizer.vocab_size,
-        "block_size": block_size,
-        "train_tokens": int(n_train),
-        "val_tokens": int(n_val),
-        "total_tokens": int(total_tokens),
-        "unk_rate": total_unk / total_tokens if total_tokens else 0,
-        "dtype": "uint32",
-    }
-    with open(output_dir / "meta.json", "w") as f:
-        json.dump(meta, f, indent=2)
-
-    return n_train, n_val
+    return total_tokens, total_unk
 
 
 # ===========================================================================
@@ -367,27 +488,44 @@ def build_model(config: GPTConfig, device: str = "cuda"):
         xk_out = torch.view_as_real(xk_complex * freqs).flatten(-2)
         return xq_out.type_as(xq), xk_out.type_as(xk)
 
-    # ----- Attention with RoPE -----
+    # ----- Attention with RoPE + GQA -----
     class CausalSelfAttention(nn.Module):
         def __init__(self, config):
             super().__init__()
             assert config.n_embd % config.n_head == 0
-            self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-            self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-            self.resid_dropout = nn.Dropout(config.dropout)
+            assert config.n_head % config.n_kv_head == 0
+
             self.n_head = config.n_head
+            self.n_kv_head = config.n_kv_head
             self.n_embd = config.n_embd
             self.head_dim = config.n_embd // config.n_head
+            self.n_rep = config.n_head // config.n_kv_head  # Q heads per KV group
             self.dropout = config.dropout
+
+            # Separate projections: Q full-rank, K/V reduced for GQA
+            self.q_proj = nn.Linear(config.n_embd, config.n_head * self.head_dim, bias=config.bias)
+            self.k_proj = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim, bias=config.bias)
+            self.v_proj = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim, bias=config.bias)
+            self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+            self.resid_dropout = nn.Dropout(config.dropout)
 
         def forward(self, x, freqs_cis):
             B, T, C = x.size()
-            q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-            q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-            k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-            v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-            # Apply RoPE to Q and K (not V)
+
+            q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+            k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+            v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+
+            # Apply RoPE to Q and K (broadcasts correctly for different head counts)
             q, k = apply_rotary_emb(q, k, freqs_cis)
+
+            # Expand KV heads to match Q head count for SDPA
+            if self.n_rep > 1:
+                k = k.unsqueeze(2).expand(B, self.n_kv_head, self.n_rep, T, self.head_dim)
+                k = k.reshape(B, self.n_head, T, self.head_dim)
+                v = v.unsqueeze(2).expand(B, self.n_kv_head, self.n_rep, T, self.head_dim)
+                v = v.reshape(B, self.n_head, T, self.head_dim)
+
             # Flash attention (PyTorch >= 2.0)
             y = F.scaled_dot_product_attention(
                 q, k, v,
@@ -428,7 +566,7 @@ def build_model(config: GPTConfig, device: str = "cuda"):
             x = x + self.mlp(self.ln_2(x))
             return x
 
-    # ----- GPT (LLaMA-style) -----
+    # ----- GPT (LLaMA-style with GQA + weight sharing) -----
     class GPT(nn.Module):
         def __init__(self, config):
             super().__init__()
@@ -443,6 +581,18 @@ def build_model(config: GPTConfig, device: str = "cuda"):
             # Weight tying
             self.transformer.wte.weight = self.lm_head.weight
 
+            # Block-wise weight sharing: each unique block runs twice
+            # _block_schedule is a plain list of module references (not nn.ModuleList)
+            if config.use_weight_sharing:
+                self._block_schedule = []
+                for block in self.transformer.h:
+                    self._block_schedule.append(block)
+                    self._block_schedule.append(block)
+            else:
+                self._block_schedule = list(self.transformer.h)
+
+            self._effective_depth = len(self._block_schedule)
+
             # Precompute RoPE frequencies and store as buffer
             head_dim = config.n_embd // config.n_head
             freqs_cis = precompute_freqs_cis(head_dim, config.block_size, config.rope_theta)
@@ -450,10 +600,10 @@ def build_model(config: GPTConfig, device: str = "cuda"):
 
             # Init weights
             self.apply(self._init_weights)
-            # Scale residual projections (attention c_proj + SwiGLU w_down)
+            # Scale residual projections by effective depth (attention c_proj + SwiGLU w_down)
             for pn, p in self.named_parameters():
                 if pn.endswith("c_proj.weight") or pn.endswith("w_down.weight"):
-                    torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
+                    torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self._effective_depth))
 
         def _init_weights(self, module):
             if isinstance(module, nn.Linear):
@@ -476,7 +626,7 @@ def build_model(config: GPTConfig, device: str = "cuda"):
             # Recover complex freqs from stored real buffer, slice to seq length
             freqs_cis = torch.view_as_complex(self.freqs_cis[:T])
 
-            for block in self.transformer.h:
+            for block in self._block_schedule:
                 x = block(x, freqs_cis)
             x = self.transformer.ln_f(x)
 
@@ -596,9 +746,14 @@ def train(
     n_params = model.count_parameters()
     logger.info("  Model params: %d (%.1fM)", n_params, n_params / 1e6)
     logger.info("  Block size:   %d", model_config.block_size)
-    logger.info("  Layers:       %d", model_config.n_layer)
-    logger.info("  Heads:        %d", model_config.n_head)
+    logger.info("  Layers:       %d unique, %d effective", model_config.n_layer, model_config.effective_depth())
+    logger.info("  Q Heads:      %d", model_config.n_head)
+    logger.info("  KV Heads:     %d (GQA ratio: %d Q per KV)", model_config.n_kv_head,
+                model_config.n_head // model_config.n_kv_head)
     logger.info("  Embed dim:    %d", model_config.n_embd)
+    logger.info("  Weight share: %s", model_config.use_weight_sharing)
+    logger.info("  Dropout:      %.2f", model_config.dropout)
+    logger.info("  LR schedule:  %s", train_config.lr_schedule)
 
     # Effective batch
     tokens_per_step = (
@@ -685,22 +840,49 @@ def train(
 
     # LR schedule
     def get_lr(step):
-        if step < train_config.warmup_steps:
-            return train_config.learning_rate * step / train_config.warmup_steps
-        if step > train_config.lr_decay_steps:
-            return train_config.min_lr
-        decay_ratio = (step - train_config.warmup_steps) / (train_config.lr_decay_steps - train_config.warmup_steps)
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-        return train_config.min_lr + coeff * (train_config.learning_rate - train_config.min_lr)
+        if train_config.lr_schedule == "wsd":
+            # WSD: Warmup -> Stable -> Decay (MiniCPM-style, resumable)
+            total = train_config.max_steps
+            warmup_end = train_config.warmup_steps
+            decay_steps = int(total * train_config.wsd_decay_frac)
+            decay_start = total - decay_steps
+
+            if step < warmup_end:
+                return train_config.learning_rate * step / warmup_end
+            elif step < decay_start:
+                return train_config.learning_rate
+            else:
+                if decay_steps <= 0:
+                    return train_config.min_lr
+                decay_ratio = (step - decay_start) / decay_steps
+                return train_config.min_lr + (1.0 - decay_ratio) * (train_config.learning_rate - train_config.min_lr)
+        else:
+            # Original cosine schedule
+            if step < train_config.warmup_steps:
+                return train_config.learning_rate * step / train_config.warmup_steps
+            if step > train_config.lr_decay_steps:
+                return train_config.min_lr
+            decay_ratio = (step - train_config.warmup_steps) / (train_config.lr_decay_steps - train_config.warmup_steps)
+            coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+            return train_config.min_lr + coeff * (train_config.learning_rate - train_config.min_lr)
 
     # Save dir
     save_dir = Path(train_config.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # Load tokenizer for sample generation during eval
-    sys.path.insert(0, str(Path(__file__).parent))
-    from train_tokenizer import MorfessorTokenizer
-    tokenizer = MorfessorTokenizer(tokenizer_dir)
+    sp_model_path = tokenizer_dir / "sp_telugu.model"
+    if sp_model_path.exists():
+        import sentencepiece as spm
+        _sp = spm.SentencePieceProcessor(model_file=str(sp_model_path))
+        decode_fn = lambda ids: _sp.decode(ids)
+        logger.info("Loaded SentencePiece tokenizer for decoding")
+    else:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from train_tokenizer import MorfessorTokenizer
+        _morf_tok = MorfessorTokenizer(tokenizer_dir)
+        decode_fn = _morf_tok.decode
+        logger.info("Loaded Morfessor tokenizer for decoding")
 
     # Sample prompts for generation during eval (seeded from val data)
     sample_prompts_ids = []
@@ -818,8 +1000,8 @@ def train(
                     x = torch.tensor([prompt_ids], dtype=torch.long, device=device)
                     y = model.generate(x, max_new_tokens=SAMPLE_GEN_LEN, temperature=0.8, top_k=50)
                     gen_ids = y[0].tolist()
-                    prompt_text = tokenizer.decode(prompt_ids)
-                    full_text = tokenizer.decode(gen_ids)
+                    prompt_text = decode_fn(prompt_ids)
+                    full_text = decode_fn(gen_ids)
                     generated_text = full_text[len(prompt_text):]  # strip prompt from output
                     samples.append({
                         "prompt": prompt_text,
@@ -914,16 +1096,24 @@ def generate_text(
 ):
     """Generate text from a trained model."""
     import torch
-    import re
-
-    sys.path.insert(0, str(Path(__file__).parent))
-    from train_tokenizer import MorfessorTokenizer
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Load checkpoint
     checkpoint = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
-    config = GPTConfig(**checkpoint["config"])
+    cfg = checkpoint["config"]
+    config = GPTConfig(
+        block_size=cfg["block_size"],
+        vocab_size=cfg["vocab_size"],
+        n_layer=cfg["n_layer"],
+        n_head=cfg["n_head"],
+        n_kv_head=cfg.get("n_kv_head", cfg["n_head"]),
+        n_embd=cfg["n_embd"],
+        dropout=cfg.get("dropout", 0.0),
+        bias=cfg["bias"],
+        rope_theta=cfg.get("rope_theta", 10000.0),
+        use_weight_sharing=cfg.get("use_weight_sharing", False),
+    )
 
     # Build model
     model = build_model(config, device)
@@ -931,41 +1121,52 @@ def generate_text(
     model.eval()
     model.to(device)
 
-    # Load tokenizer
-    tokenizer = MorfessorTokenizer(tokenizer_dir)
+    # Load tokenizer (SentencePiece or Morfessor)
+    sp_model_path = tokenizer_dir / "sp_telugu.model"
+    if sp_model_path.exists():
+        import sentencepiece as spm
+        sp = spm.SentencePieceProcessor(model_file=str(sp_model_path))
+        ids = [sp.bos_id()] + sp.encode(prompt, out_type=int)
+        decode_fn = lambda tok_ids: sp.decode(tok_ids)
+    else:
+        import re
+        sys.path.insert(0, str(Path(__file__).parent))
+        from train_tokenizer import MorfessorTokenizer
+        tokenizer = MorfessorTokenizer(tokenizer_dir)
+        decode_fn = tokenizer.decode
 
-    # Segment prompt with Morfessor
-    morfessor_model_path = Path(tokenizer_dir).parent / "data" / "morfessor" / "morfessor_telugu.bin"
-    if not morfessor_model_path.exists():
-        morfessor_model_path = Path("./data/morfessor/morfessor_telugu.bin")
+        # Segment prompt with Morfessor
+        morfessor_model_path = Path(tokenizer_dir).parent / "data" / "morfessor" / "morfessor_telugu.bin"
+        if not morfessor_model_path.exists():
+            morfessor_model_path = Path("./data/morfessor/morfessor_telugu.bin")
 
-    TELUGU_WORD_RE = re.compile(r"[\u0C00-\u0C7F]+")
-    separator = tokenizer.separator
+        TELUGU_WORD_RE = re.compile(r"[\u0C00-\u0C7F]+")
+        separator = tokenizer.separator
 
-    segmented_prompt = prompt
-    if morfessor_model_path.exists():
-        try:
-            import morfessor
-            io = morfessor.MorfessorIO()
-            morf_model = io.read_binary_model_file(str(morfessor_model_path))
-            tokens = prompt.split()
-            seg_tokens = []
-            for token in tokens:
-                if TELUGU_WORD_RE.fullmatch(token):
-                    segments = morf_model.viterbi_segment(token)[0]
-                    for i, seg in enumerate(segments):
-                        if i < len(segments) - 1:
-                            seg_tokens.append(seg + separator)
-                        else:
-                            seg_tokens.append(seg)
-                else:
-                    seg_tokens.append(token)
-            segmented_prompt = " ".join(seg_tokens)
-        except Exception:
-            pass
+        segmented_prompt = prompt
+        if morfessor_model_path.exists():
+            try:
+                import morfessor
+                io = morfessor.MorfessorIO()
+                morf_model = io.read_binary_model_file(str(morfessor_model_path))
+                tokens = prompt.split()
+                seg_tokens = []
+                for token in tokens:
+                    if TELUGU_WORD_RE.fullmatch(token):
+                        segments = morf_model.viterbi_segment(token)[0]
+                        for i, seg in enumerate(segments):
+                            if i < len(segments) - 1:
+                                seg_tokens.append(seg + separator)
+                            else:
+                                seg_tokens.append(seg)
+                    else:
+                        seg_tokens.append(token)
+                segmented_prompt = " ".join(seg_tokens)
+            except Exception:
+                pass
 
-    # Encode
-    ids = tokenizer.encode(segmented_prompt, add_bos=True, add_eos=False)
+        ids = tokenizer.encode(segmented_prompt, add_bos=True, add_eos=False)
+
     x = torch.tensor([ids], dtype=torch.long, device=device)
 
     # Generate
@@ -974,7 +1175,7 @@ def generate_text(
 
     # Decode
     generated_ids = y[0].tolist()
-    text = tokenizer.decode(generated_ids)
+    text = decode_fn(generated_ids)
 
     logger.info("Prompt:    %s", prompt)
     logger.info("Generated: %s", text)
@@ -1013,43 +1214,57 @@ Examples:
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
     # Prepare
-    prep = subparsers.add_parser("prepare", help="Tokenize segmented corpus into binary shards")
-    prep.add_argument("--data", type=str, required=True, help="Path to segmented corpus directory")
+    prep = subparsers.add_parser("prepare", help="Tokenize corpus into binary shards")
+    prep.add_argument("--data", type=str, required=True, help="Path to corpus directory (text files or segmented)")
     prep.add_argument("--tokenizer", type=str, default="./tokenizer", help="Tokenizer directory")
     prep.add_argument("--output", type=str, default="./train_data", help="Output directory for binary shards")
     prep.add_argument("--val-split", type=float, default=0.02, help="Validation split ratio (default: 0.02)")
-    prep.add_argument("--workers", type=int, default=0, help="Number of parallel workers (default: auto = cpu_count - 1)")
+    prep.add_argument("--tokenizer-type", type=str, default="sp", choices=["sp", "morfessor"],
+                       help="Tokenizer backend (default: sp = SentencePiece)")
+    prep.add_argument("--parquet", type=str, default=None, help="Parquet file path (alternative to --data for raw text)")
+    prep.add_argument("--workers", type=int, default=0, help="Number of parallel workers (default: auto)")
+
+    # Shared architecture + training args (added to both train and all)
+    def _add_train_args(p):
+        """Add training arguments shared between 'train' and 'all' subcommands."""
+        p.add_argument("--data", type=str, required=True, help="Path to prepared data (train.bin/val.bin)")
+        p.add_argument("--tokenizer", type=str, default="./tokenizer", help="Tokenizer directory")
+        p.add_argument("--max-steps", type=int, default=45000, help="Max training steps (default: 45000)")
+        p.add_argument("--batch-size", type=int, default=32, help="Micro batch size (default: 32)")
+        p.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps (default: 4)")
+        p.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate (default: 3e-4)")
+        p.add_argument("--save-dir", type=str, default="./checkpoints", help="Checkpoint directory")
+        p.add_argument("--save-interval", type=int, default=500, help="Steps between checkpoints (default: 500)")
+        p.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
+        p.add_argument("--grad-checkpoint", action="store_true", help="Enable gradient checkpointing (saves VRAM)")
+        p.add_argument("--wandb", type=str, default="", help="W&B project name (enables logging)")
+        p.add_argument("--wandb-name", type=str, default="", help="W&B run name (optional)")
+        # Architecture
+        p.add_argument("--n-layer", type=int, default=24, help="Number of unique transformer layers (default: 24)")
+        p.add_argument("--n-kv-head", type=int, default=4, help="KV head groups for GQA (default: 4)")
+        p.add_argument("--no-weight-sharing", action="store_true", help="Disable block-wise weight sharing")
+        p.add_argument("--dropout", type=float, default=0.0, help="Dropout rate (default: 0.0)")
+        # LR schedule
+        p.add_argument("--lr-schedule", type=str, default="wsd", choices=["wsd", "cosine"],
+                       help="LR schedule (default: wsd)")
+        p.add_argument("--wsd-stable-frac", type=float, default=0.7,
+                       help="WSD: fraction of steps at stable LR (default: 0.7)")
+        p.add_argument("--wsd-decay-frac", type=float, default=0.2,
+                       help="WSD: fraction of steps for decay (default: 0.2)")
 
     # Train
     tr = subparsers.add_parser("train", help="Train LLaMA-style model")
-    tr.add_argument("--data", type=str, required=True, help="Path to prepared data (train.bin/val.bin)")
-    tr.add_argument("--tokenizer", type=str, default="./tokenizer", help="Tokenizer directory")
+    _add_train_args(tr)
     tr.add_argument("--resume", type=str, default=None, help="Checkpoint to resume from")
-    tr.add_argument("--max-steps", type=int, default=45000, help="Max training steps (default: 45000, ~3 epochs)")
-    tr.add_argument("--batch-size", type=int, default=32, help="Micro batch size (default: 32)")
-    tr.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps (default: 4)")
-    tr.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate (default: 3e-4)")
-    tr.add_argument("--save-dir", type=str, default="./checkpoints", help="Checkpoint directory")
-    tr.add_argument("--save-interval", type=int, default=500, help="Steps between checkpoints (default: 500)")
-    tr.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
-    tr.add_argument("--grad-checkpoint", action="store_true", help="Enable gradient checkpointing (saves VRAM)")
-    tr.add_argument("--wandb", type=str, default="", help="W&B project name (enables logging). E.g. --wandb telugu-gpt")
-    tr.add_argument("--wandb-name", type=str, default="", help="W&B run name (optional, auto-generated if empty)")
 
     # All (prepare + train)
     al = subparsers.add_parser("all", help="Prepare data and train in one go")
-    al.add_argument("--data", type=str, required=True, help="Path to segmented corpus directory")
-    al.add_argument("--tokenizer", type=str, default="./tokenizer", help="Tokenizer directory")
-    al.add_argument("--output", type=str, default="./train_data", help="Output directory for binary shards")
-    al.add_argument("--max-steps", type=int, default=45000, help="Max training steps (~3 epochs)")
-    al.add_argument("--batch-size", type=int, default=32, help="Micro batch size")
-    al.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps")
-    al.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate")
-    al.add_argument("--save-dir", type=str, default="./checkpoints", help="Checkpoint directory")
-    al.add_argument("--save-interval", type=int, default=500, help="Steps between checkpoints (default: 500)")
-    al.add_argument("--wandb", type=str, default="", help="W&B project name (enables logging)")
-    al.add_argument("--wandb-name", type=str, default="", help="W&B run name (optional)")
-    al.add_argument("--workers", type=int, default=0, help="Number of parallel workers for data prep (default: auto)")
+    _add_train_args(al)
+    al.add_argument("--output", type=str, default="./train_data", help="Output for binary shards")
+    al.add_argument("--tokenizer-type", type=str, default="sp", choices=["sp", "morfessor"],
+                     help="Tokenizer backend (default: sp)")
+    al.add_argument("--parquet", type=str, default=None, help="Parquet file path")
+    al.add_argument("--workers", type=int, default=0, help="Parallel workers for data prep")
 
     # Generate
     gen = subparsers.add_parser("generate", help="Generate text from trained model")
@@ -1069,14 +1284,12 @@ Examples:
     model_config = GPTConfig()
     train_config = TrainConfig()
 
-    if args.command == "prepare":
-        prepare_data(
-            Path(args.data), Path(args.tokenizer), Path(args.output),
-            args.val_split, model_config.block_size,
-            num_workers=args.workers,
-        )
-
-    elif args.command == "train":
+    def _apply_train_args(args, model_config, train_config):
+        """Apply shared training CLI args to config objects."""
+        model_config.n_layer = args.n_layer
+        model_config.n_kv_head = args.n_kv_head
+        model_config.use_weight_sharing = not args.no_weight_sharing
+        model_config.dropout = args.dropout
         train_config.micro_batch_size = args.batch_size
         train_config.gradient_accumulation_steps = args.grad_accum
         train_config.learning_rate = args.lr
@@ -1088,23 +1301,32 @@ Examples:
         train_config.gradient_checkpointing = args.grad_checkpoint
         train_config.wandb_project = args.wandb
         train_config.wandb_run_name = args.wandb_name
+        train_config.lr_schedule = args.lr_schedule
+        train_config.wsd_stable_frac = args.wsd_stable_frac
+        train_config.wsd_decay_frac = args.wsd_decay_frac
+
+    if args.command == "prepare":
+        prepare_data(
+            Path(args.data), Path(args.tokenizer), Path(args.output),
+            args.val_split, model_config.block_size,
+            num_workers=args.workers,
+            tokenizer_type=args.tokenizer_type,
+            parquet_path=args.parquet,
+        )
+
+    elif args.command == "train":
+        _apply_train_args(args, model_config, train_config)
         train(Path(args.data), Path(args.tokenizer), model_config, train_config, args.resume)
 
     elif args.command == "all":
-        train_config.micro_batch_size = args.batch_size
-        train_config.gradient_accumulation_steps = args.grad_accum
-        train_config.learning_rate = args.lr
-        train_config.max_steps = args.max_steps
-        train_config.lr_decay_steps = args.max_steps
-        train_config.save_dir = args.save_dir
-        train_config.save_interval = args.save_interval
-        train_config.wandb_project = args.wandb
-        train_config.wandb_run_name = args.wandb_name
+        _apply_train_args(args, model_config, train_config)
         output_dir = Path(args.output)
         prepare_data(
             Path(args.data), Path(args.tokenizer), output_dir,
             train_config.val_split, model_config.block_size,
             num_workers=args.workers,
+            tokenizer_type=args.tokenizer_type,
+            parquet_path=args.parquet,
         )
         train(output_dir, Path(args.tokenizer), model_config, train_config)
 

@@ -12,7 +12,9 @@ format, loadable with:
 
 What it does:
   1. Reads our checkpoint (.pt) and maps weights to HF LlamaForCausalLM format
-     - Splits fused QKV (c_attn) into separate q_proj, k_proj, v_proj
+     - New format: reads separate q_proj, k_proj, v_proj (GQA-aware)
+     - Old format: splits fused QKV (c_attn) into separate projections
+     - Handles weight sharing: unrolls N unique layers into 2N HF layers
      - Renames all keys to HF convention
   2. Reads our tokenizer.json and builds an HF-compatible tokenizer
      - Preserves @@ continuation marker semantics
@@ -62,10 +64,15 @@ def create_config(checkpoint: dict, output_dir: Path, is_sft: bool = False):
 
     n_embd = cfg["n_embd"]        # 1024
     n_head = cfg["n_head"]        # 16
-    n_layer = cfg["n_layer"]      # 20
+    n_kv_head = cfg.get("n_kv_head", cfg["n_head"])  # GQA groups
+    n_layer = cfg["n_layer"]      # unique layers
+    use_weight_sharing = cfg.get("use_weight_sharing", False)
     block_size = cfg["block_size"]  # 2048
     vocab_size = cfg["vocab_size"]
     rope_theta = cfg.get("rope_theta", 10000.0)
+
+    # For HF: unroll weight sharing to actual layer count
+    hf_n_layer = n_layer * 2 if use_weight_sharing else n_layer
 
     # SwiGLU intermediate_size: same formula as in train_gpt.py
     hidden_dim = int(2 * n_embd * 4 / 3)
@@ -88,9 +95,9 @@ def create_config(checkpoint: dict, output_dir: Path, is_sft: bool = False):
         # Dimensions
         "hidden_size": n_embd,
         "intermediate_size": hidden_dim,
-        "num_hidden_layers": n_layer,
+        "num_hidden_layers": hf_n_layer,
         "num_attention_heads": n_head,
-        "num_key_value_heads": n_head,  # no GQA — same as num_attention_heads
+        "num_key_value_heads": n_kv_head,
         "head_dim": n_embd // n_head,
 
         # Positional encoding
@@ -131,7 +138,12 @@ def create_config(checkpoint: dict, output_dir: Path, is_sft: bool = False):
 
     logger.info("Created config.json:")
     logger.info("  hidden_size=%d, intermediate_size=%d", n_embd, hidden_dim)
-    logger.info("  num_layers=%d, num_heads=%d, vocab_size=%d", n_layer, n_head, vocab_size)
+    logger.info("  num_layers=%d (unique=%d), num_heads=%d, num_kv_heads=%d, vocab_size=%d",
+                hf_n_layer, n_layer, n_head, n_kv_head, vocab_size)
+    if use_weight_sharing:
+        logger.info("  weight_sharing=True (%d unique → %d HF layers)", n_layer, hf_n_layer)
+    if n_kv_head != n_head:
+        logger.info("  GQA: %d query heads, %d KV heads (ratio=%d)", n_head, n_kv_head, n_head // n_kv_head)
     logger.info("  max_position_embeddings=%d, rope_theta=%.1f", block_size, rope_theta)
     if is_sft:
         logger.info("  eos_token_id=%s (SFT — includes <|end|>)", eos_token_id)
@@ -191,24 +203,43 @@ def convert_weights(checkpoint: dict, config: dict, output_dir: Path,
                     original_vocab_size: int = 0):
     """Convert our state_dict to HF LlamaForCausalLM format.
 
+    Handles both old (fused c_attn) and new (separate q_proj/k_proj/v_proj) formats.
+    When weight sharing is enabled, unrolls N unique layers into 2N HF layers.
+
     Key operations:
-      - Split fused c_attn.weight (3*n_embd, n_embd) → q_proj, k_proj, v_proj
-      - Permute Q/K rows and o_proj cols for RoPE convention difference
+      - Old format: split fused c_attn.weight (3*n_embd, n_embd) → q_proj, k_proj, v_proj
+      - New format: read separate q_proj, k_proj, v_proj directly (supports GQA)
+      - Permute Q/K rows for RoPE convention difference
         (our interleaved complex pairs → HF's rotate_half half-split)
       - Rename all keys to HF naming convention
       - Skip freqs_cis buffer (HF recomputes RoPE)
       - Skip lm_head.weight (tied to embed_tokens)
       - Pad embedding if vocab was expanded (BPE merge intermediates)
+      - If weight sharing: duplicate each unique layer into 2 HF layers
       - Save as model.safetensors
     """
     import torch
     from safetensors.torch import save_file
 
     state_dict = checkpoint["model"]
+    cfg = checkpoint["config"]
     n_embd = config["hidden_size"]
-    n_layer = config["num_hidden_layers"]
+    n_hf_layers = config["num_hidden_layers"]  # already unrolled if weight sharing
     n_heads = config["num_attention_heads"]
+    n_kv_heads = config.get("num_key_value_heads", n_heads)
     hf_vocab_size = config["vocab_size"]
+
+    use_weight_sharing = cfg.get("use_weight_sharing", False)
+    n_unique_layers = cfg["n_layer"]  # actual unique layers in checkpoint
+
+    # Detect format: new (separate q_proj/k_proj/v_proj) vs old (fused c_attn)
+    has_separate_qkv = f"transformer.h.0.attn.q_proj.weight" in state_dict
+    if has_separate_qkv:
+        logger.info("Detected new format: separate q_proj/k_proj/v_proj (GQA-aware)")
+    else:
+        logger.info("Detected old format: fused c_attn (full MHA)")
+
+    head_dim = n_embd // n_heads
 
     hf_state_dict = {}
 
@@ -222,37 +253,60 @@ def convert_weights(checkpoint: dict, config: dict, output_dir: Path,
         embed_weight = torch.cat([embed_weight, padding], dim=0)
     hf_state_dict["model.embed_tokens.weight"] = embed_weight
 
+    # Build layer mapping: HF layer index → unique layer index in our checkpoint
+    # With weight sharing: layers [0,1] → unique 0, [2,3] → unique 1, etc.
+    # Without: layers [0] → unique 0, [1] → unique 1, etc.
+    if use_weight_sharing:
+        hf_to_ours = []
+        for i in range(n_unique_layers):
+            hf_to_ours.append(i)  # first pass
+            hf_to_ours.append(i)  # second pass (weight sharing)
+        logger.info("Weight sharing: %d unique layers → %d HF layers",
+                     n_unique_layers, len(hf_to_ours))
+    else:
+        hf_to_ours = list(range(n_unique_layers))
+
+    assert len(hf_to_ours) == n_hf_layers, (
+        f"Layer mapping mismatch: {len(hf_to_ours)} != {n_hf_layers}"
+    )
+
     # Transformer layers
-    for i in range(n_layer):
-        prefix_ours = f"transformer.h.{i}"
-        prefix_hf = f"model.layers.{i}"
+    for hf_i, ours_i in enumerate(hf_to_ours):
+        prefix_ours = f"transformer.h.{ours_i}"
+        prefix_hf = f"model.layers.{hf_i}"
 
         # Input LayerNorm (RMSNorm)
         hf_state_dict[f"{prefix_hf}.input_layernorm.weight"] = (
             state_dict[f"{prefix_ours}.ln_1.weight"]
         )
 
-        # Attention: split fused QKV
-        c_attn_weight = state_dict[f"{prefix_ours}.attn.c_attn.weight"]
-        # c_attn_weight shape: (3 * n_embd, n_embd) = (3072, 1024)
-        assert c_attn_weight.shape[0] == 3 * n_embd, (
-            f"Expected c_attn shape ({3*n_embd}, {n_embd}), got {c_attn_weight.shape}"
-        )
-        q_proj, k_proj, v_proj = c_attn_weight.split(n_embd, dim=0)
+        if has_separate_qkv:
+            # New format: separate projections (GQA-aware)
+            q_proj = state_dict[f"{prefix_ours}.attn.q_proj.weight"]
+            k_proj = state_dict[f"{prefix_ours}.attn.k_proj.weight"]
+            v_proj = state_dict[f"{prefix_ours}.attn.v_proj.weight"]
 
-        # Permute Q and K for RoPE convention:
-        # Our model: interleaved complex pairs [(d0,d1), (d2,d3), ...]
-        # HF LLaMA:  half-split rotate_half [(d0,d_{D/2}), (d1,d_{D/2+1}), ...]
-        q_proj = _interleaved_to_half_rotation(q_proj, n_heads, dim=0)
-        k_proj = _interleaved_to_half_rotation(k_proj, n_heads, dim=0)
+            # Permute Q and K for RoPE convention:
+            # Our model: interleaved complex pairs [(d0,d1), (d2,d3), ...]
+            # HF LLaMA:  half-split rotate_half [(d0,d_{D/2}), (d1,d_{D/2+1}), ...]
+            q_proj = _interleaved_to_half_rotation(q_proj, n_heads, dim=0)
+            k_proj = _interleaved_to_half_rotation(k_proj, n_kv_heads, dim=0)
+        else:
+            # Old format: fused c_attn (full MHA, n_kv_heads == n_heads)
+            c_attn_weight = state_dict[f"{prefix_ours}.attn.c_attn.weight"]
+            assert c_attn_weight.shape[0] == 3 * n_embd, (
+                f"Expected c_attn shape ({3*n_embd}, {n_embd}), got {c_attn_weight.shape}"
+            )
+            q_proj, k_proj, v_proj = c_attn_weight.split(n_embd, dim=0)
+
+            q_proj = _interleaved_to_half_rotation(q_proj, n_heads, dim=0)
+            k_proj = _interleaved_to_half_rotation(k_proj, n_heads, dim=0)
 
         hf_state_dict[f"{prefix_hf}.self_attn.q_proj.weight"] = q_proj
         hf_state_dict[f"{prefix_hf}.self_attn.k_proj.weight"] = k_proj
         hf_state_dict[f"{prefix_hf}.self_attn.v_proj.weight"] = v_proj
 
         # Output projection — no permutation needed.
-        # o_proj reads attention output which has same shape as V (not RoPE'd),
-        # so the dimension ordering is unchanged.
         hf_state_dict[f"{prefix_hf}.self_attn.o_proj.weight"] = (
             state_dict[f"{prefix_ours}.attn.c_proj.weight"]
         )
@@ -276,12 +330,9 @@ def convert_weights(checkpoint: dict, config: dict, output_dir: Path,
     # Final LayerNorm
     hf_state_dict["model.norm.weight"] = state_dict["transformer.ln_f.weight"]
 
-    # lm_head — tied to embed_tokens, so we include it explicitly
-    # HF LlamaForCausalLM with tie_word_embeddings=True will handle the tying,
-    # but safetensors needs the key if it's in the model's state dict.
-    # Actually, with tie_word_embeddings=True, HF does NOT expect lm_head.weight
+    # lm_head — tied to embed_tokens, so we skip it.
+    # With tie_word_embeddings=True, HF does NOT expect lm_head.weight
     # in the checkpoint — it's aliased from embed_tokens at load time.
-    # So we skip it.
 
     # Log what we converted
     n_params = sum(p.numel() for p in hf_state_dict.values())
@@ -290,17 +341,30 @@ def convert_weights(checkpoint: dict, config: dict, output_dir: Path,
 
     # Log what we skipped
     converted_keys = set()
-    for i in range(n_layer):
+    for i in range(n_unique_layers):
         prefix = f"transformer.h.{i}"
-        converted_keys.update([
-            f"{prefix}.ln_1.weight",
-            f"{prefix}.attn.c_attn.weight",
-            f"{prefix}.attn.c_proj.weight",
-            f"{prefix}.ln_2.weight",
-            f"{prefix}.mlp.w_gate.weight",
-            f"{prefix}.mlp.w_up.weight",
-            f"{prefix}.mlp.w_down.weight",
-        ])
+        if has_separate_qkv:
+            converted_keys.update([
+                f"{prefix}.ln_1.weight",
+                f"{prefix}.attn.q_proj.weight",
+                f"{prefix}.attn.k_proj.weight",
+                f"{prefix}.attn.v_proj.weight",
+                f"{prefix}.attn.c_proj.weight",
+                f"{prefix}.ln_2.weight",
+                f"{prefix}.mlp.w_gate.weight",
+                f"{prefix}.mlp.w_up.weight",
+                f"{prefix}.mlp.w_down.weight",
+            ])
+        else:
+            converted_keys.update([
+                f"{prefix}.ln_1.weight",
+                f"{prefix}.attn.c_attn.weight",
+                f"{prefix}.attn.c_proj.weight",
+                f"{prefix}.ln_2.weight",
+                f"{prefix}.mlp.w_gate.weight",
+                f"{prefix}.mlp.w_up.weight",
+                f"{prefix}.mlp.w_down.weight",
+            ])
     converted_keys.update(["transformer.wte.weight", "transformer.ln_f.weight"])
 
     skipped = [k for k in state_dict.keys() if k not in converted_keys]

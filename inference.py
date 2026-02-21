@@ -113,7 +113,19 @@ def load_model(checkpoint_path: Path, device: str):
     from train_gpt import GPTConfig, build_model
 
     checkpoint = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
-    config = GPTConfig(**checkpoint["config"])
+    cfg = checkpoint["config"]
+    config = GPTConfig(
+        block_size=cfg["block_size"],
+        vocab_size=cfg["vocab_size"],
+        n_layer=cfg["n_layer"],
+        n_head=cfg["n_head"],
+        n_kv_head=cfg.get("n_kv_head", cfg["n_head"]),
+        n_embd=cfg["n_embd"],
+        dropout=cfg.get("dropout", 0.0),
+        bias=cfg["bias"],
+        rope_theta=cfg.get("rope_theta", 10000.0),
+        use_weight_sharing=cfg.get("use_weight_sharing", False),
+    )
 
     model = build_model(config, device)
     model.load_state_dict(checkpoint["model"])
@@ -167,29 +179,41 @@ def run_inference(
     top_k: int = 50,
     separator: str = "@@",
     verbose: bool = False,
+    use_sp: bool = False,
 ):
     """Full inference pipeline: text -> segment -> tokenize -> generate -> decode -> text.
 
-    With v2 tokenizer, decode is trivial — just tokenizer.decode() handles
+    With SentencePiece tokenizer, segmentation is handled internally.
+    With v2 Morfessor tokenizer, decode is trivial — just tokenizer.decode() handles
     everything via @@ marker replacement. No Desegmenter needed.
     """
 
-    # Step 1: Morfessor segmentation
-    segmented = segment_text(prompt, morf_model, separator)
-    if verbose:
-        print(f"  [Segmented]  {segmented}")
+    if use_sp:
+        # SentencePiece handles segmentation internally
+        token_ids = [tokenizer.bos_id()] + tokenizer.encode(prompt)
+        if verbose:
+            print(f"  [SP encode]  {token_ids[:20]}{'...' if len(token_ids) > 20 else ''} ({len(token_ids)} tokens)")
+    else:
+        # Step 1: Morfessor segmentation
+        segmented = segment_text(prompt, morf_model, separator)
+        if verbose:
+            print(f"  [Segmented]  {segmented}")
 
-    # Step 2: Tokenize
-    token_ids = tokenizer.encode(segmented, add_bos=True, add_eos=False)
-    if verbose:
-        print(f"  [Token IDs]  {token_ids[:20]}{'...' if len(token_ids) > 20 else ''} ({len(token_ids)} tokens)")
+        # Step 2: Tokenize
+        token_ids = tokenizer.encode(segmented, add_bos=True, add_eos=False)
+        if verbose:
+            print(f"  [Token IDs]  {token_ids[:20]}{'...' if len(token_ids) > 20 else ''} ({len(token_ids)} tokens)")
 
     # Step 3: Generate
     output_ids = generate(model, token_ids, max_tokens, temperature, top_k, device)
 
-    # Step 4: Decode — trivial with v2 tokenizer
-    full_text = tokenizer.decode(output_ids)
-    generated_text = tokenizer.decode(output_ids[len(token_ids):])
+    # Step 4: Decode
+    if use_sp:
+        full_text = tokenizer.decode(output_ids)
+        generated_text = tokenizer.decode(output_ids[len(token_ids):])
+    else:
+        full_text = tokenizer.decode(output_ids)
+        generated_text = tokenizer.decode(output_ids[len(token_ids):])
 
     if verbose:
         print(f"  [Raw decode] {generated_text[:200]}")
@@ -227,11 +251,24 @@ Examples:
 
     # Load everything
     logger.info("Loading components...")
-    morf_model = load_morfessor_model(Path(args.morfessor_model))
 
-    sys.path.insert(0, str(Path(__file__).parent))
-    from train_tokenizer import MorfessorTokenizer
-    tokenizer = MorfessorTokenizer(Path(args.tokenizer))
+    # Detect tokenizer type: SentencePiece (.model) vs Morfessor (tokenizer.json)
+    tokenizer_path = Path(args.tokenizer)
+    sp_model_path = tokenizer_path / "sp_telugu.model" if tokenizer_path.is_dir() else tokenizer_path
+    use_sp = sp_model_path.exists() and sp_model_path.suffix == ".model"
+
+    if use_sp:
+        import sentencepiece as spm
+        tokenizer = spm.SentencePieceProcessor()
+        tokenizer.load(str(sp_model_path))
+        morf_model = None
+        logger.info("Loaded SentencePiece tokenizer from %s (vocab=%d)", sp_model_path, tokenizer.get_piece_size())
+    else:
+        morf_model = load_morfessor_model(Path(args.morfessor_model))
+        sys.path.insert(0, str(Path(__file__).parent))
+        from train_tokenizer import MorfessorTokenizer
+        tokenizer = MorfessorTokenizer(tokenizer_path)
+        logger.info("Loaded Morfessor tokenizer from %s", tokenizer_path)
 
     model, config = load_model(Path(args.checkpoint), device)
 
@@ -242,7 +279,7 @@ Examples:
         full_text, generated = run_inference(
             args.prompt, model, tokenizer, morf_model, device,
             args.max_tokens, args.temperature, args.top_k,
-            args.separator, args.verbose,
+            args.separator, args.verbose, use_sp,
         )
         print(f"\nPrompt:    {args.prompt}")
         print(f"Generated: {generated}")
@@ -268,7 +305,7 @@ Examples:
             full_text, generated = run_inference(
                 prompt, model, tokenizer, morf_model, device,
                 args.max_tokens, args.temperature, args.top_k,
-                args.separator, args.verbose,
+                args.separator, args.verbose, use_sp,
             )
             print(f"\n{full_text}")
 

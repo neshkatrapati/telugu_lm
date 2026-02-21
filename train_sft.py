@@ -257,7 +257,19 @@ def load_pretrained_and_resize(checkpoint_path: Path, new_vocab_size: int, devic
 
     # Load checkpoint
     checkpoint = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
-    old_config = GPTConfig(**checkpoint["config"])
+    cfg = checkpoint["config"]
+    old_config = GPTConfig(
+        block_size=cfg["block_size"],
+        vocab_size=cfg["vocab_size"],
+        n_layer=cfg["n_layer"],
+        n_head=cfg["n_head"],
+        n_kv_head=cfg.get("n_kv_head", cfg["n_head"]),
+        n_embd=cfg["n_embd"],
+        dropout=cfg.get("dropout", 0.0),
+        bias=cfg["bias"],
+        rope_theta=cfg.get("rope_theta", 10000.0),
+        use_weight_sharing=cfg.get("use_weight_sharing", False),
+    )
     old_vocab_size = old_config.vocab_size
 
     logger.info("Loaded pretrained checkpoint from %s", checkpoint_path)
@@ -272,10 +284,12 @@ def load_pretrained_and_resize(checkpoint_path: Path, new_vocab_size: int, devic
         vocab_size=new_vocab_size,
         n_layer=old_config.n_layer,
         n_head=old_config.n_head,
+        n_kv_head=old_config.n_kv_head,
         n_embd=old_config.n_embd,
         dropout=old_config.dropout,
         bias=old_config.bias,
         rope_theta=old_config.rope_theta,
+        use_weight_sharing=old_config.use_weight_sharing,
     )
 
     model = build_model(new_config, device)
@@ -384,7 +398,19 @@ def train_sft(
         logger.info("Resuming SFT from %s", resume_from)
         resume_ckpt = torch.load(resume_from, map_location=device, weights_only=False)
         from train_gpt import GPTConfig, build_model
-        model_config = GPTConfig(**resume_ckpt["config"])
+        rcfg = resume_ckpt["config"]
+        model_config = GPTConfig(
+            block_size=rcfg["block_size"],
+            vocab_size=rcfg["vocab_size"],
+            n_layer=rcfg["n_layer"],
+            n_head=rcfg["n_head"],
+            n_kv_head=rcfg.get("n_kv_head", rcfg["n_head"]),
+            n_embd=rcfg["n_embd"],
+            dropout=rcfg.get("dropout", 0.0),
+            bias=rcfg["bias"],
+            rope_theta=rcfg.get("rope_theta", 10000.0),
+            use_weight_sharing=rcfg.get("use_weight_sharing", False),
+        )
         model = build_model(model_config, device)
         model.load_state_dict(resume_ckpt["model"])
         model.to(device)
@@ -459,10 +485,18 @@ def train_sft(
 
     # ---- Load tokenizer + Morfessor for sample generation ----
     sys.path.insert(0, str(Path(__file__).parent))
-    from train_tokenizer import MorfessorTokenizer
-
-    tokenizer = MorfessorTokenizer(tokenizer_dir)
-    morf_model = load_morfessor_model(morfessor_path) if morfessor_path.exists() else None
+    sp_model_path = tokenizer_dir / "sp_telugu.model"
+    if sp_model_path.exists():
+        import sentencepiece as spm
+        _sp = spm.SentencePieceProcessor(model_file=str(sp_model_path))
+        tokenizer = type("SPWrapper", (), {"decode": lambda self, ids: _sp.decode(ids)})()
+        morf_model = None
+        logger.info("Loaded SentencePiece tokenizer for decoding")
+    else:
+        from train_tokenizer import MorfessorTokenizer
+        tokenizer = MorfessorTokenizer(tokenizer_dir)
+        morf_model = load_morfessor_model(morfessor_path) if morfessor_path.exists() else None
+        logger.info("Loaded Morfessor tokenizer for decoding")
 
     # Build reverse lookup for special tokens
     id_to_special = {v: k for k, v in special_tokens.items()}

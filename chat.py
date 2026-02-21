@@ -121,7 +121,19 @@ def load_sft_model(checkpoint_path: Path, device: str):
     from train_gpt import GPTConfig, build_model
 
     checkpoint = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
-    config = GPTConfig(**checkpoint["config"])
+    cfg = checkpoint["config"]
+    config = GPTConfig(
+        block_size=cfg["block_size"],
+        vocab_size=cfg["vocab_size"],
+        n_layer=cfg["n_layer"],
+        n_head=cfg["n_head"],
+        n_kv_head=cfg.get("n_kv_head", cfg["n_head"]),
+        n_embd=cfg["n_embd"],
+        dropout=cfg.get("dropout", 0.0),
+        bias=cfg["bias"],
+        rope_theta=cfg.get("rope_theta", 10000.0),
+        use_weight_sharing=cfg.get("use_weight_sharing", False),
+    )
 
     model = build_model(config, device)
     model.load_state_dict(checkpoint["model"])
@@ -165,10 +177,12 @@ def _cached_forward(model, idx, kv_cache, start_pos):
     On prefill (start_pos=0): processes full sequence, populates cache.
     On decode (start_pos>0):  processes 1 token, appends to cache.
 
+    Supports GQA (n_kv_head < n_head) and block-wise weight sharing.
+
     Args:
         model: GPT model (unwrapped — not torch.compiled)
         idx: (B, T) token IDs — full sequence on prefill, (B, 1) on decode
-        kv_cache: list of (K, V) tensors per layer, or None for first call
+        kv_cache: list of (K, V) tensors per effective layer, or None for first call
         start_pos: position offset for RoPE
 
     Returns:
@@ -178,7 +192,9 @@ def _cached_forward(model, idx, kv_cache, start_pos):
     B, T = idx.size()
     config = model.config
     n_head = config.n_head
+    n_kv_head = getattr(config, "n_kv_head", n_head)
     head_dim = config.n_embd // n_head
+    n_rep = n_head // n_kv_head
 
     # Embedding
     x = model.transformer.wte(idx)
@@ -188,34 +204,54 @@ def _cached_forward(model, idx, kv_cache, start_pos):
     freqs_real = model.freqs_cis[start_pos : start_pos + T]  # stored as real
     freqs_cis = torch.view_as_complex(freqs_real)
 
+    # Use block schedule (handles weight sharing) or fall back to plain list
+    block_schedule = getattr(model, "_block_schedule", list(model.transformer.h))
+    n_effective = len(block_schedule)
+
     if kv_cache is None:
-        kv_cache = [None] * len(model.transformer.h)
+        kv_cache = [None] * n_effective
 
     new_cache = []
-    for i, block in enumerate(model.transformer.h):
-        # --- Attention with KV-cache ---
+    for i, block in enumerate(block_schedule):
+        # --- Attention with KV-cache (GQA-aware) ---
         residual = x
         x_norm = block.ln_1(x)
 
         attn = block.attn
-        q, k, v = attn.c_attn(x_norm).split(config.n_embd, dim=2)
-        q = q.view(B, T, n_head, head_dim).transpose(1, 2)
-        k = k.view(B, T, n_head, head_dim).transpose(1, 2)
-        v = v.view(B, T, n_head, head_dim).transpose(1, 2)
+
+        # GQA: separate Q, K, V projections
+        if hasattr(attn, "q_proj"):
+            q = attn.q_proj(x_norm).view(B, T, n_head, head_dim).transpose(1, 2)
+            k = attn.k_proj(x_norm).view(B, T, n_kv_head, head_dim).transpose(1, 2)
+            v = attn.v_proj(x_norm).view(B, T, n_kv_head, head_dim).transpose(1, 2)
+        else:
+            # Legacy: fused c_attn
+            q, k, v = attn.c_attn(x_norm).split(config.n_embd, dim=2)
+            q = q.view(B, T, n_head, head_dim).transpose(1, 2)
+            k = k.view(B, T, n_head, head_dim).transpose(1, 2)
+            v = v.view(B, T, n_head, head_dim).transpose(1, 2)
 
         # RoPE on new Q, K
         q, k = _apply_rotary_emb(q, k, freqs_cis)
 
-        # Append to cache
+        # Append to cache (KV cache stores n_kv_head heads, not n_head)
         if kv_cache[i] is not None:
             prev_k, prev_v = kv_cache[i]
             k = torch.cat([prev_k, k], dim=2)
             v = torch.cat([prev_v, v], dim=2)
         new_cache.append((k, v))
 
+        # Expand KV heads to match Q heads for SDPA
+        if n_rep > 1:
+            S = k.size(2)  # total sequence length in cache
+            k_exp = k.unsqueeze(2).expand(B, n_kv_head, n_rep, S, head_dim).reshape(B, n_head, S, head_dim)
+            v_exp = v.unsqueeze(2).expand(B, n_kv_head, n_rep, S, head_dim).reshape(B, n_head, S, head_dim)
+        else:
+            k_exp, v_exp = k, v
+
         # Attention — Q is only the new positions, K/V include history
         y = F.scaled_dot_product_attention(
-            q, k, v,
+            q, k_exp, v_exp,
             attn_mask=None,
             dropout_p=0,
             is_causal=(kv_cache[i] is None),  # only causal on prefill
