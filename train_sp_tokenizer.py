@@ -34,9 +34,10 @@ import os
 import sys
 import glob
 import argparse
-import tempfile
 import logging
 from pathlib import Path
+
+from tqdm import tqdm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,11 +83,14 @@ def train_sentencepiece(input_path, output_dir, vocab_size=48000,
     logger.info("  Seed vocab size:    %d", seed_sentencepiece_size)
 
     # Count input lines for logging
-    logger.info("  Counting input lines ...")
+    file_bytes = os.path.getsize(input_path)
     n_lines = 0
-    with open(input_path, "r", encoding="utf-8") as f:
-        for _ in f:
-            n_lines += 1
+    with open(input_path, "rb") as f:
+        with tqdm(total=file_bytes, desc="Counting lines", unit="B",
+                  unit_scale=True, unit_divisor=1024) as pbar:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                n_lines += chunk.count(b"\n")
+                pbar.update(len(chunk))
     logger.info("  Input lines:        %d", n_lines)
 
     # Define special tokens matching our existing convention
@@ -130,6 +134,14 @@ def train_sentencepiece(input_path, output_dir, vocab_size=48000,
         # Training data sampling (if corpus is very large)
         shuffle_input_sentence=True,
     )
+
+    # SentencePiece loads ALL sentences into RAM by default.
+    # For large corpora (>1GB), this will OOM. Default to 10M sentences
+    # which is more than enough for learning a good vocab.
+    if input_sentence_size <= 0 and n_lines > 10_000_000:
+        input_sentence_size = 10_000_000
+        logger.info("  ⚠ Corpus has %dM lines — subsampling to %dM to avoid OOM",
+                    n_lines // 1_000_000, input_sentence_size // 1_000_000)
 
     if input_sentence_size > 0:
         train_args["input_sentence_size"] = input_sentence_size
@@ -187,7 +199,7 @@ def train_sentencepiece(input_path, output_dir, vocab_size=48000,
     n_telugu = 0
     n_byte_fallback = 0
     n_other = 0
-    for i in range(actual_vocab):
+    for i in tqdm(range(actual_vocab), desc="Analyzing vocab", unit=" pieces"):
         piece = sp.id_to_piece(i)
         if any(0x0C00 <= ord(c) <= 0x0C7F for c in piece):
             n_telugu += 1
@@ -211,26 +223,37 @@ def train_sentencepiece(input_path, output_dir, vocab_size=48000,
 
 
 def extract_parquet_to_text(parquet_path, output_path, text_column="text"):
-    """Extract text column from parquet file, one row per line."""
-    import pandas as pd
+    """Extract text column from parquet file, one row per line.
+
+    Streams row-group-by-row-group to keep RAM low.
+    """
+    import pyarrow.parquet as pq
 
     logger.info("Reading parquet: %s (column: '%s')", parquet_path, text_column)
-    df = pd.read_parquet(parquet_path, columns=[text_column])
-    logger.info("  Rows: %d", len(df))
+    pf = pq.ParquetFile(parquet_path)
+    n_row_groups = pf.metadata.num_row_groups
+    total_rows = pf.metadata.num_rows
+    logger.info("  Total rows: %d (%d row groups)", total_rows, n_row_groups)
 
     n_written = 0
     n_empty = 0
     with open(output_path, "w", encoding="utf-8") as f:
-        for text in df[text_column]:
-            if pd.isna(text) or not str(text).strip():
-                n_empty += 1
-                continue
-            # Write each row as one line (replace internal newlines with spaces
-            # so SentencePiece sees it as one sentence)
-            clean = str(text).replace("\n", " ").replace("\r", " ").strip()
-            if clean:
-                f.write(clean + "\n")
-                n_written += 1
+        with tqdm(total=total_rows, desc="Extracting text", unit=" rows") as pbar:
+            for rg_idx in range(n_row_groups):
+                table = pf.read_row_group(rg_idx, columns=[text_column])
+                col = table.column(text_column)
+                for text in col.to_pylist():
+                    if text is None or not str(text).strip():
+                        n_empty += 1
+                    else:
+                        clean = str(text).replace("\n", " ").replace("\r", " ").strip()
+                        if clean:
+                            f.write(clean + "\n")
+                            n_written += 1
+                        else:
+                            n_empty += 1
+                pbar.update(len(col))
+                del table, col  # free row group immediately
 
     logger.info("  Written: %d lines (%d empty/null skipped)", n_written, n_empty)
     return output_path
@@ -250,7 +273,7 @@ def merge_text_files(input_dir, output_path, extensions=(".txt", ".seg.txt")):
     logger.info("Merging %d files from %s → %s", len(files), input_dir, output_path)
     total_lines = 0
     with open(output_path, "w", encoding="utf-8") as out:
-        for fpath in files:
+        for fpath in tqdm(files, desc="Merging files", unit=" files"):
             with open(fpath, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
