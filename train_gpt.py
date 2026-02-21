@@ -475,12 +475,17 @@ def build_model(config: GPTConfig, device: str = "cuda"):
         return freqs_cis
 
     def apply_rotary_emb(xq, xk, freqs_cis):
-        """Apply rotary embeddings to Q and K tensors."""
-        # xq, xk: (B, n_head, T, head_dim)
-        # freqs_cis: (T, head_dim//2) complex
-        B, H, T, D = xq.shape
-        xq_ = xq.float().reshape(B, H, T, D // 2, 2)
-        xk_ = xk.float().reshape(B, H, T, D // 2, 2)
+        """Apply rotary embeddings to Q and K tensors.
+
+        Handles GQA where xq and xk may have different head counts:
+          xq: (B, n_head, T, head_dim)
+          xk: (B, n_kv_head, T, head_dim)
+          freqs_cis: (T, head_dim//2) complex
+        """
+        B, Hq, T, D = xq.shape
+        _, Hk, _, _ = xk.shape
+        xq_ = xq.float().reshape(B, Hq, T, D // 2, 2)
+        xk_ = xk.float().reshape(B, Hk, T, D // 2, 2)
         xq_complex = torch.view_as_complex(xq_)
         xk_complex = torch.view_as_complex(xk_)
         freqs = freqs_cis.unsqueeze(0).unsqueeze(0)   # (1, 1, T, D//2)
