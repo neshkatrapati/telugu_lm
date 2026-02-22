@@ -999,11 +999,13 @@ def train(
             logger.info("step %5d | val_loss %.4f", step, val_loss)
 
             # Sample generation for quality tracking (still in eval mode)
+            # Use the uncompiled model to avoid dynamo recompilation per sequence length
+            gen_model = model._orig_mod if hasattr(model, "_orig_mod") else model
             samples = []
             with torch.no_grad():
                 for prompt_ids in sample_prompts_ids:
                     x = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-                    y = model.generate(x, max_new_tokens=SAMPLE_GEN_LEN, temperature=0.8, top_k=50)
+                    y = gen_model.generate(x, max_new_tokens=SAMPLE_GEN_LEN, temperature=0.8, top_k=50)
                     gen_ids = y[0].tolist()
                     prompt_text = decode_fn(prompt_ids)
                     full_text = decode_fn(gen_ids)
@@ -1013,6 +1015,7 @@ def train(
                         "generated": generated_text,
                     })
                     logger.info("  [sample] %s → %s", prompt_text[:60], generated_text[:80])
+            del gen_model
 
             model.train()
 
