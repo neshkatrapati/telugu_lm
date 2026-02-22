@@ -761,6 +761,24 @@ def train(
         logger.error("Run the 'prepare' step first.")
         sys.exit(1)
 
+    # If resuming, peek at checkpoint config to override model architecture
+    # so build_model creates a compatible model. Keep checkpoint in memory
+    # to avoid loading it twice.
+    _pending_checkpoint = None
+    if resume_from and os.path.exists(resume_from):
+        logger.info("Loading checkpoint %s (to CPU)...", resume_from)
+        _pending_checkpoint = torch.load(resume_from, map_location="cpu", weights_only=False)
+        ckpt_cfg = _pending_checkpoint.get("config", {})
+        if ckpt_cfg:
+            overrides = []
+            for key in ("n_layer", "n_head", "n_kv_head", "n_embd", "use_weight_sharing",
+                        "dropout", "block_size", "rope_theta", "bias"):
+                if key in ckpt_cfg and getattr(model_config, key) != ckpt_cfg[key]:
+                    overrides.append(f"{key}: {getattr(model_config, key)} → {ckpt_cfg[key]}")
+                    setattr(model_config, key, ckpt_cfg[key])
+            if overrides:
+                logger.info("Overriding model config from checkpoint: %s", ", ".join(overrides))
+
     # Build model
     model = build_model(model_config, device)
     n_params = model.count_parameters()
@@ -817,9 +835,9 @@ def train(
     best_val_loss = float("inf")
     tokens_processed = 0
     _resume_optimizer_state = None
-    if resume_from and os.path.exists(resume_from):
-        logger.info("Resuming from %s", resume_from)
-        checkpoint = torch.load(resume_from, map_location="cpu", weights_only=False)
+    if _pending_checkpoint is not None:
+        checkpoint = _pending_checkpoint
+        _pending_checkpoint = None
         model.load_state_dict(checkpoint["model"])
         start_step = checkpoint["step"]
         best_val_loss = checkpoint.get("best_val_loss", float("inf"))
@@ -829,14 +847,16 @@ def train(
                      start_step, tokens_processed / tokens_per_epoch, best_val_loss)
         del checkpoint  # free CPU memory immediately
 
+    # Gradient checkpointing (enable BEFORE compile so the checkpoint calls
+    # are part of the graph that torch.compile sees)
+    if train_config.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        logger.info("Gradient checkpointing enabled — activation memory will be O(sqrt(layers))")
+
     # Compile (after loading weights so keys match)
     if train_config.compile_model and hasattr(torch, "compile"):
         logger.info("Compiling model with torch.compile...")
         model = torch.compile(model)
-
-    # Gradient checkpointing
-    if train_config.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
 
     # Optimizer
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
@@ -970,6 +990,11 @@ def train(
                 logits, loss = model(x, y)
                 loss = loss / train_config.gradient_accumulation_steps
 
+            if step <= start_step + 1 and micro_step == 0:
+                alloc = torch.cuda.memory_allocated() / 1e9
+                resv = torch.cuda.memory_reserved() / 1e9
+                logger.info("  [MEM] step=%d micro=%d BEFORE backward: alloc=%.1fG reserved=%.1fG",
+                            step, micro_step, alloc, resv)
             scaler.scale(loss).backward()
             loss_accum += loss.item()
 
@@ -1039,6 +1064,9 @@ def train(
                 torch.cuda.empty_cache()
 
             model.train()
+            alloc = torch.cuda.memory_allocated() / 1e9
+            resv = torch.cuda.memory_reserved() / 1e9
+            logger.info("  [MEM] after eval+save, back to train: alloc=%.1fG reserved=%.1fG", alloc, resv)
 
             if use_wandb:
                 wandb.log({
