@@ -704,6 +704,8 @@ def _save_checkpoint(model, optimizer, model_config, path, **kwargs):
     }
     ckpt.update(kwargs)
     torch.save(ckpt, str(path))
+    del ckpt, state
+    torch.cuda.empty_cache()
 
 
 # ===========================================================================
