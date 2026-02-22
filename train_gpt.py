@@ -620,6 +620,13 @@ def build_model(config: GPTConfig, device: str = "cuda"):
             elif isinstance(module, RMSNorm):
                 pass  # weight already initialized to ones in constructor
 
+        def gradient_checkpointing_enable(self):
+            """Enable gradient checkpointing to trade compute for memory."""
+            self._gradient_checkpointing = True
+
+        def gradient_checkpointing_disable(self):
+            self._gradient_checkpointing = False
+
         def forward(self, idx, targets=None):
             device = idx.device
             B, T = idx.size()
@@ -631,8 +638,14 @@ def build_model(config: GPTConfig, device: str = "cuda"):
             # Recover complex freqs from stored real buffer, slice to seq length
             freqs_cis = torch.view_as_complex(self.freqs_cis[:T])
 
+            use_ckpt = getattr(self, "_gradient_checkpointing", False) and self.training
             for block in self._block_schedule:
-                x = block(x, freqs_cis)
+                if use_ckpt:
+                    x = torch.utils.checkpoint.checkpoint(
+                        block, x, freqs_cis, use_reentrant=False,
+                    )
+                else:
+                    x = block(x, freqs_cis)
             x = self.transformer.ln_f(x)
 
             if targets is not None:
@@ -803,15 +816,18 @@ def train(
     start_step = 0
     best_val_loss = float("inf")
     tokens_processed = 0
+    _resume_optimizer_state = None
     if resume_from and os.path.exists(resume_from):
         logger.info("Resuming from %s", resume_from)
-        checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
+        checkpoint = torch.load(resume_from, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"])
         start_step = checkpoint["step"]
         best_val_loss = checkpoint.get("best_val_loss", float("inf"))
         tokens_processed = checkpoint.get("tokens_processed", start_step * tokens_per_step)
+        _resume_optimizer_state = checkpoint.get("optimizer")
         logger.info("Resumed at step %d (epoch %.2f), best_val_loss=%.4f",
                      start_step, tokens_processed / tokens_per_epoch, best_val_loss)
+        del checkpoint  # free CPU memory immediately
 
     # Compile (after loading weights so keys match)
     if train_config.compile_model and hasattr(torch, "compile"):
@@ -837,13 +853,12 @@ def train(
         fused=True if device == "cuda" else False,
     )
 
-    # Load optimizer state if resuming (after optimizer is created with compiled model params)
-    if resume_from and os.path.exists(resume_from):
-        checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
-        if checkpoint.get("optimizer") is not None:
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            logger.info("Restored optimizer state")
-        del checkpoint  # free memory
+    # Load optimizer state if resuming (from state saved earlier, no second disk load)
+    if _resume_optimizer_state is not None:
+        optimizer.load_state_dict(_resume_optimizer_state)
+        logger.info("Restored optimizer state")
+        del _resume_optimizer_state
+        torch.cuda.empty_cache()
 
     # LR schedule
     def get_lr(step):
