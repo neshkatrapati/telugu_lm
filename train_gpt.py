@@ -999,23 +999,27 @@ def train(
             logger.info("step %5d | val_loss %.4f", step, val_loss)
 
             # Sample generation for quality tracking (still in eval mode)
-            # Use the uncompiled model to avoid dynamo recompilation per sequence length
-            gen_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+            # Only run if torch.compile is NOT active — dynamo caches from
+            # variable-length generate() cause OOM on the next backward().
             samples = []
-            with torch.no_grad():
-                for prompt_ids in sample_prompts_ids:
-                    x = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-                    y = gen_model.generate(x, max_new_tokens=SAMPLE_GEN_LEN, temperature=0.8, top_k=50)
-                    gen_ids = y[0].tolist()
-                    prompt_text = decode_fn(prompt_ids)
-                    full_text = decode_fn(gen_ids)
-                    generated_text = full_text[len(prompt_text):]  # strip prompt from output
-                    samples.append({
-                        "prompt": prompt_text,
-                        "generated": generated_text,
-                    })
-                    logger.info("  [sample] %s → %s", prompt_text[:60], generated_text[:80])
-            del gen_model
+            is_compiled = hasattr(model, "_orig_mod")
+            if not is_compiled:
+                gen_model = model
+                with torch.no_grad():
+                    for prompt_ids in sample_prompts_ids:
+                        x = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+                        y = gen_model.generate(x, max_new_tokens=SAMPLE_GEN_LEN, temperature=0.8, top_k=50)
+                        gen_ids = y[0].tolist()
+                        del x, y
+                        prompt_text = decode_fn(prompt_ids)
+                        full_text = decode_fn(gen_ids)
+                        generated_text = full_text[len(prompt_text):]
+                        samples.append({
+                            "prompt": prompt_text,
+                            "generated": generated_text,
+                        })
+                        logger.info("  [sample] %s → %s", prompt_text[:60], generated_text[:80])
+                torch.cuda.empty_cache()
 
             model.train()
 
