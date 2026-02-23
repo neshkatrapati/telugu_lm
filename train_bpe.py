@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-BPE Training for Non-Telugu Text
-==================================
+BPE Training for Non-Telugu Text (v2)
+=======================================
 Extracts non-Telugu tokens from the Morfessor-segmented corpus and trains
-a Byte Pair Encoding (BPE) model on them. The resulting subword vocabulary
-uses the same @@ continuation convention as the Morfessor morphemes.
+a Byte Pair Encoding (BPE) model on them.
+
+v2: Segmented corpus uses ▁ as a word-boundary separator token.
+All morphemes/subwords are bare (no @@ suffix). BPE produces bare subwords.
 
 Usage:
     python train_bpe.py --seg-corpus ./data/morfessor/segmented_corpus/sangraha/ --num-merges 8000
@@ -49,26 +51,28 @@ def _has_telugu(s: str) -> bool:
 
 
 def _scan_chunk(args: tuple) -> tuple[Counter, int, int]:
-    """Worker: scan a chunk of lines, return (non_telugu_counter, total_toks, non_telugu_toks)."""
+    """Worker: scan a chunk of lines, return (non_telugu_counter, total_toks, non_telugu_toks).
+
+    v2: Tokens are bare (no @@ suffix). The ▁ separator token is skipped.
+    """
     lines, separator, sep_len = args
     freq: Counter = Counter()
     total = 0
     non_tel = 0
     for line in lines:
         for token in line.split():
+            # Skip the word-boundary separator token
+            if token == separator:
+                continue
             total += 1
-            # Strip @@ suffix
-            if token.endswith(separator):
-                base = token[:-sep_len]
-            else:
-                base = token
-            if not _has_telugu(base):
-                freq[base] += 1
+            # v2: tokens are already bare, no stripping needed
+            if not _has_telugu(token):
+                freq[token] += 1
                 non_tel += 1
     return freq, total, non_tel
 
 
-def extract_non_telugu(seg_corpus_path: Path, separator: str = "@@", num_workers: int = 0) -> Counter:
+def extract_non_telugu(seg_corpus_path: Path, separator: str = "\u2581", num_workers: int = 0) -> Counter:
     """Scan .seg.txt files and collect non-Telugu token frequencies.
 
     Parallelized: reads file in large chunks, distributes across workers.
@@ -140,13 +144,13 @@ def extract_non_telugu(seg_corpus_path: Path, separator: str = "@@", num_workers
             with open(fpath, "r", encoding="utf-8") as f:
                 for line in tqdm(f, desc=fpath.name, unit=" lines"):
                     for token in line.split():
+                        # Skip the word-boundary separator token
+                        if token == separator:
+                            continue
                         total_tokens += 1
-                        if token.endswith(separator):
-                            base = token[:-sep_len]
-                        else:
-                            base = token
-                        if not _has_telugu(base):
-                            word_freq[base] += 1
+                        # v2: tokens are already bare, no stripping needed
+                        if not _has_telugu(token):
+                            word_freq[token] += 1
                             non_telugu_tokens += 1
 
     logger.info("Total tokens scanned: %d", total_tokens)
@@ -303,16 +307,17 @@ def train_bpe(word_freqs: Counter, num_merges: int) -> tuple[list[tuple[str, str
 # ---------------------------------------------------------------------------
 # Step 3: BPE encode
 # ---------------------------------------------------------------------------
-def bpe_encode(word: str, merges: list[tuple[str, str]], separator: str = "@@") -> list[str]:
+def bpe_encode(word: str, merges: list[tuple[str, str]]) -> list[str]:
     """Encode a word into BPE subwords using the learned merge table.
 
-    Returns subwords with @@ on non-final pieces:
-        "international" -> ["inter@@", "nation@@", "al"]
+    v2: Returns bare subwords (no @@ suffix). Word boundaries are handled
+    by the ▁ separator token at a higher level.
+
+        "international" -> ["inter", "nation", "al"]
 
     Args:
         word: the raw word to encode
         merges: ordered list of (a, b) merge pairs from training
-        separator: continuation marker (default: @@)
     """
     if not word:
         return []
@@ -334,15 +339,8 @@ def bpe_encode(word: str, merges: list[tuple[str, str]], separator: str = "@@") 
                 i += 1
         chars = new_chars
 
-    # Add @@ to all subwords except the last (word-final)
-    result = []
-    for i, subword in enumerate(chars):
-        if i < len(chars) - 1:
-            result.append(subword + separator)
-        else:
-            result.append(subword)
-
-    return result
+    # v2: return bare subwords — no @@ suffix
+    return chars
 
 
 # ---------------------------------------------------------------------------
@@ -415,8 +413,8 @@ Examples:
         help="Output directory for BPE files (default: ./data/morfessor/bpe)",
     )
     parser.add_argument(
-        "--separator", type=str, default="@@",
-        help="Continuation marker (default: @@)",
+        "--separator", type=str, default="\u2581",
+        help="Word boundary separator token (default: ▁ U+2581)",
     )
     parser.add_argument(
         "--min-freq", type=int, default=5,
@@ -460,7 +458,7 @@ Examples:
     logger.info("=" * 60)
     test_words = ["international", "government", "2024", "https", "the", "COVID-19"]
     for word in test_words:
-        encoded = bpe_encode(word, merges, args.separator)
+        encoded = bpe_encode(word, merges)
         logger.info("  %-20s -> %s", word, " ".join(encoded))
 
     # Show top subwords

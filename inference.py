@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Telugu LLaMA — Interactive Inference (v2)
+Telugu LLaMA — Interactive Inference (v3)
 ==========================================
 Full pipeline: raw text -> Morfessor segmentation -> tokenize -> model -> decode -> text
 
-The v2 tokenizer preserves @@ continuation markers, so decode is trivial:
-just replace "@@ " with "" to merge morphemes back into words.
-No Desegmenter needed.
+v3: Uses ▁ (U+2581) word-boundary separator. All morphemes are bare (no @@ suffix).
+Decode: concatenate all tokens, ▁ → space, strip.
 
 Usage:
     python inference.py --checkpoint ./checkpoints/best.pt
@@ -42,64 +41,43 @@ def load_morfessor_model(model_path: Path):
     return model
 
 
-def segment_text(text: str, morf_model, separator: str = "@@") -> str:
-    """Segment raw text using Morfessor with @@ continuation markers.
+def segment_text(text: str, morf_model, separator: str = "\u2581") -> str:
+    """Segment raw text using Morfessor with ▁ word-boundary separators.
 
-    - Pure Telugu words -> Morfessor morpheme segments with @@ boundaries
-    - Pure non-Telugu words -> kept as-is
-    - Mixed-script tokens (e.g. "2024లో") -> split at script boundary with @@
-      e.g. "2024లో" -> "2024@@ లో"
+    v3: Uses ▁ (U+2581) as a dedicated word-boundary separator token.
+    All morphemes are bare (no @@ suffix).
+
+    Output: "▁ విద్యార్థు ల కు ▁ went" for input "విద్యార్థులకు went"
 
     Args:
         text: Raw input text.
         morf_model: Loaded Morfessor model.
-        separator: Continuation marker (default: @@).
+        separator: Word boundary separator (default: ▁).
 
     Returns:
-        Segmented text with @@ continuation markers.
+        Segmented text with ▁ word boundaries and bare morphemes.
     """
     tokens = text.split()
     seg_tokens = []
 
     for token in tokens:
+        seg_tokens.append(separator)  # ▁ before each word
+
         if TELUGU_WORD_RE.fullmatch(token):
-            # Pure Telugu word — segment with Morfessor
+            # Pure Telugu word — segment with Morfessor (bare morphemes)
             segments = morf_model.viterbi_segment(token)[0]
-            for i, seg in enumerate(segments):
-                if i < len(segments) - 1:
-                    seg_tokens.append(seg + separator)
-                else:
-                    seg_tokens.append(seg)
+            seg_tokens.extend(segments)
 
         elif TELUGU_WORD_RE.search(token):
             # Mixed-script token — split at Telugu/non-Telugu boundaries
-            # e.g. "2024లో" -> ["2024", "లో"]
-            # e.g. "IPLలో" -> ["IPL", "లో"]
             parts = re.split(r"([\u0C00-\u0C7F]+)", token)
             parts = [p for p in parts if p]
-
-            for part_idx, part in enumerate(parts):
-                is_last_part = (part_idx == len(parts) - 1)
-
+            for part in parts:
                 if TELUGU_WORD_RE.fullmatch(part):
-                    # Telugu part — segment with Morfessor
                     segments = morf_model.viterbi_segment(part)[0]
-                    for i, seg in enumerate(segments):
-                        if i < len(segments) - 1:
-                            seg_tokens.append(seg + separator)
-                        else:
-                            # Last segment of Telugu part
-                            if not is_last_part:
-                                # Not the last part of the mixed token — add @@
-                                seg_tokens.append(seg + separator)
-                            else:
-                                seg_tokens.append(seg)
+                    seg_tokens.extend(segments)
                 else:
-                    # Non-Telugu part
-                    if not is_last_part:
-                        seg_tokens.append(part + separator)
-                    else:
-                        seg_tokens.append(part)
+                    seg_tokens.append(part)
         else:
             # Pure non-Telugu word — keep as-is
             seg_tokens.append(token)
@@ -177,15 +155,15 @@ def run_inference(
     max_tokens: int = 200,
     temperature: float = 0.8,
     top_k: int = 50,
-    separator: str = "@@",
+    separator: str = "\u2581",
     verbose: bool = False,
     use_sp: bool = False,
 ):
     """Full inference pipeline: text -> segment -> tokenize -> generate -> decode -> text.
 
     With SentencePiece tokenizer, segmentation is handled internally.
-    With v2 Morfessor tokenizer, decode is trivial — just tokenizer.decode() handles
-    everything via @@ marker replacement. No Desegmenter needed.
+    With v3 Morfessor tokenizer, decode is trivial — just tokenizer.decode() handles
+    everything via ▁ → space conversion. No Desegmenter needed.
     """
 
     if use_sp:
@@ -242,7 +220,7 @@ Examples:
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature (default: 0.8)")
     parser.add_argument("--top-k", type=int, default=50, help="Top-k sampling (default: 50)")
     parser.add_argument("--verbose", action="store_true", help="Show intermediate steps (segmentation, token IDs)")
-    parser.add_argument("--separator", type=str, default="@@", help="Morfessor separator (default: @@)")
+    parser.add_argument("--separator", type=str, default="\u2581", help="Word boundary separator (default: ▁)")
 
     args = parser.parse_args()
 

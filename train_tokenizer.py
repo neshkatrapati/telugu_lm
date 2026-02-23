@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """
-Telugu Morfessor + BPE Tokenizer Builder (v2)
-==============================================
+Telugu Morfessor + BPE Tokenizer Builder (v3 — ▁ separator)
+=============================================================
 Builds a unified tokenizer that handles:
-  - Telugu morphemes from Morfessor (with @@ continuation markers preserved)
+  - Telugu morphemes from Morfessor (bare forms, no @@ duplication)
   - Non-Telugu text (English, numbers, URLs) via BPE subword encoding
   - Character-level fallback for anything not covered
+  - ▁ (U+2581) as a dedicated word-boundary separator token
 
-Key change from v1: @@ is part of the token, not stripped.
-  - "విద్యార్థు@@" (ID=X) and "విద్యార్థు" (ID=Y) are SEPARATE vocab entries.
-  - This lets the model learn word boundaries and decode reconstructs perfectly.
+v3 changes from v2:
+  - Eliminated @@ suffix duplication — each morpheme stored ONCE
+  - ▁ is a single token (ID=4) inserted between words in the token stream
+  - Decode: concatenate all tokens, ▁ → space, strip
+  - Vocab size: ~33K Telugu + ~8-9K BPE + ~1K chars + 5 special ≈ ~43K
 
 Pipeline:
-  1. Scan segmented corpus — collect only TELUGU tokens (with @@ preserved)
-     Non-Telugu tokens (English, numbers, URLs) are skipped here.
+  1. Scan segmented corpus — collect TELUGU tokens (bare, no @@)
+     The ▁ separator tokens and non-Telugu tokens are skipped here.
   2. Load BPE vocab (from train_bpe.py) — handles all non-Telugu text
-  3. Add character-level fallback (both ch and ch@@ variants)
+  3. Add character-level fallback (single form per char, no @@ variants)
   4. Build token-to-id / id-to-token mappings
-  5. Save as JSON tokenizer (v2.0)
-
-Expected vocab size: ~33K Telugu morphemes + ~8K BPE subwords + ~500 chars ≈ ~42K
+  5. Save as JSON tokenizer (v3.0)
 
 Usage:
     python train_tokenizer.py \\
@@ -59,6 +60,7 @@ SPECIAL_TOKENS = OrderedDict([
     ("<unk>", 1),
     ("<bos>", 2),
     ("<eos>", 3),
+    ("\u2581", 4),  # ▁ word-boundary separator
 ])
 
 NUM_SPECIAL = len(SPECIAL_TOKENS)
@@ -85,6 +87,7 @@ def _has_telugu(s: str) -> bool:
 def _count_chunk(args: tuple) -> tuple[Counter, int, int]:
     """Worker: count Telugu-containing token frequencies in a chunk of lines.
 
+    v3: Tokens are bare (no @@ suffix). The ▁ separator is skipped.
     Only tokens containing at least one Telugu character are counted.
     Non-Telugu tokens (English, numbers, URLs) are skipped — they are
     handled entirely by BPE subwords.
@@ -99,14 +102,13 @@ def _count_chunk(args: tuple) -> tuple[Counter, int, int]:
         for token in line.split():
             if not token:
                 continue
+            # Skip the word-boundary separator token
+            if token == separator:
+                continue
             total += 1
-            # Strip @@ suffix to check for Telugu characters
-            if token.endswith(separator):
-                base = token[:-sep_len]
-            else:
-                base = token
-            if _has_telugu(base):
-                freq[token] += 1  # Keep @@ as part of the key
+            # v3: tokens are bare — count base form directly
+            if _has_telugu(token):
+                freq[token] += 1
                 telugu_count += 1
     return freq, total, telugu_count
 
@@ -114,18 +116,17 @@ def _count_chunk(args: tuple) -> tuple[Counter, int, int]:
 def build_vocab_from_corpus(corpus_path: Path, separator: str, num_workers: int = 0) -> list[tuple[str, int]]:
     """Scan segmented corpus files and count TELUGU-CONTAINING tokens only.
 
-    CRITICAL v2 changes:
-      1. Tokens are NOT stripped of @@. "విద్యార్థు@@" and "విద్యార్థు"
-         are counted as separate entries, so the model can learn word boundaries.
-      2. Only tokens containing at least one Telugu character are counted.
+    v3 changes:
+      1. Tokens are bare (no @@ suffix). Each morpheme stored once.
+      2. The ▁ separator token is skipped during counting.
+      3. Only tokens containing at least one Telugu character are counted.
          Non-Telugu text (English, numbers, URLs) is handled entirely by BPE.
-         This prevents vocab explosion from millions of unique non-Telugu surface forms.
 
     Parallelized: streams lines into chunks, dispatches to workers.
 
     Args:
         corpus_path: Path to a .seg.txt file or a directory containing them.
-        separator: The morpheme boundary marker (e.g. '@@').
+        separator: The word-boundary separator token (e.g. '▁').
         num_workers: Number of parallel workers (0 = auto).
 
     Returns:
@@ -199,27 +200,22 @@ def build_vocab_from_corpus(corpus_path: Path, separator: str, num_workers: int 
                     for token in line.split():
                         if not token:
                             continue
+                        # Skip the word-boundary separator token
+                        if token == separator:
+                            continue
                         total_tokens += 1
-                        # Strip @@ suffix to check for Telugu characters
-                        if token.endswith(separator):
-                            base = token[:-sep_len]
-                        else:
-                            base = token
-                        if _has_telugu(base):
-                            token_freq[token] += 1  # Keep @@ as part of the key
+                        # v3: tokens are bare — count base form directly
+                        if _has_telugu(token):
+                            token_freq[token] += 1
                             telugu_tokens += 1
-
-    # Count how many are continuation vs word-final
-    continuation = sum(1 for t in token_freq if t.endswith(separator))
-    word_final = len(token_freq) - continuation
 
     logger.info("Total tokens scanned: %d", total_tokens)
     logger.info("Telugu tokens: %d (%.1f%%)", telugu_tokens,
                 100 * telugu_tokens / total_tokens if total_tokens else 0)
     logger.info("Non-Telugu tokens skipped: %d (%.1f%%)", total_tokens - telugu_tokens,
                 100 * (total_tokens - telugu_tokens) / total_tokens if total_tokens else 0)
-    logger.info("Unique Telugu morpheme types: %d (%d continuation, %d word-final)",
-                len(token_freq), continuation, word_final)
+    logger.info("Unique Telugu morpheme types: %d (single form, no @@ duplication)",
+                len(token_freq))
 
     morphemes = sorted(token_freq.items(), key=lambda x: x[1], reverse=True)
     return morphemes
@@ -269,16 +265,15 @@ def build_tokenizer(
 ):
     """Build a unified tokenizer from Morfessor morphemes + BPE subwords.
 
-    Vocabulary structure:
-        [special tokens] + [Telugu morphemes with @@] + [BPE subwords] + [char fallbacks]
+    v3 Vocabulary structure:
+        [special tokens incl ▁] + [Telugu morphemes (bare)] + [BPE subwords (bare)] + [char fallbacks (bare)]
 
-    The corpus scan only collects Telugu-containing tokens (~33K morphemes).
-    Non-Telugu text is handled entirely by BPE subwords (~8K).
-    This gives a predictable vocab size of ~42K instead of millions.
+    Each morpheme/subword/character is stored ONCE — no @@ duplication.
+    The ▁ word-boundary separator is a special token (ID=4).
 
     Args:
         output_dir: Where to save tokenizer files.
-        separator: Continuation marker (default: @@).
+        separator: Word-boundary separator token (default: ▁).
         segmented_corpus: Path to .seg.txt files — scanned for Telugu morphemes only.
         morfessor_dir: Fallback — directory containing morpheme_vocab.tsv.
         vocab_size: Cap vocab at this size (0 = use all).
@@ -335,7 +330,7 @@ def build_tokenizer(
     id_to_token = {v: k for k, v in SPECIAL_TOKENS.items()}
     next_id = NUM_SPECIAL
 
-    # Add morfessor morphemes (these include both "x@@" and "x" variants)
+    # Add morfessor morphemes (bare forms only — no @@ duplication)
     morfessor_count = 0
     for morph, freq in morphemes:
         if morph not in token_to_id:
@@ -347,37 +342,28 @@ def build_tokenizer(
     logger.info("Added %d Morfessor morpheme tokens (IDs %d-%d)",
                 morfessor_count, NUM_SPECIAL, next_id - 1)
 
-    # --- Add BPE subwords (non-Telugu) ---
+    # --- Add BPE subwords (non-Telugu) — bare forms only, no @@ duplication ---
     bpe_merges = []
     bpe_count = 0
     if bpe_vocab_path and bpe_merges_path:
         bpe_vocab = load_bpe_vocab(bpe_vocab_path)
         bpe_merges = load_bpe_merges(bpe_merges_path)
 
-        # Add BPE subwords that aren't already in the vocab
-        # BPE produces bare subwords — we need both "sub" and "sub@@" variants
+        # Add BPE subwords that aren't already in the vocab (bare form only)
         for subword, freq in sorted(bpe_vocab.items(), key=lambda x: -x[1]):
-            # Add the bare subword (word-final form)
             if subword not in token_to_id:
                 token_to_id[subword] = next_id
                 id_to_token[next_id] = subword
                 next_id += 1
                 bpe_count += 1
-            # Add the continuation form (subword@@)
-            cont_form = subword + separator
-            if cont_form not in token_to_id:
-                token_to_id[cont_form] = next_id
-                id_to_token[next_id] = cont_form
-                next_id += 1
-                bpe_count += 1
 
-        logger.info("Added %d BPE subword tokens", bpe_count)
+        logger.info("Added %d BPE subword tokens (bare, no @@ duplication)", bpe_count)
     else:
         logger.info("No BPE vocab provided — non-Telugu text will use character fallback")
 
-    # --- Add character-level fallback ---
+    # --- Add character-level fallback (bare forms only, no @@ duplication) ---
     # For any token not covered by morphemes or BPE, we fall back to characters.
-    # We add both "ch" (word-final) and "ch@@" (continuation) variants.
+    # v3: single form per character — no continuation/word-final split.
     char_ranges = []
     # Printable ASCII (32-126)
     char_ranges.extend(chr(c) for c in range(32, 127))
@@ -388,27 +374,19 @@ def build_tokenizer(
 
     char_count = 0
     for ch in char_ranges:
-        # Word-final form
         if ch not in token_to_id:
             token_to_id[ch] = next_id
             id_to_token[next_id] = ch
             next_id += 1
             char_count += 1
-        # Continuation form (ch@@)
-        cont_ch = ch + separator
-        if cont_ch not in token_to_id:
-            token_to_id[cont_ch] = next_id
-            id_to_token[next_id] = cont_ch
-            next_id += 1
-            char_count += 1
 
     final_vocab_size = len(token_to_id)
 
-    logger.info("Added %d character fallback tokens", char_count)
+    logger.info("Added %d character fallback tokens (bare, no @@ duplication)", char_count)
     logger.info("")
-    logger.info("Tokenizer built (v2.0):")
+    logger.info("Tokenizer built (v3.0 — ▁ separator):")
     logger.info("  Vocab size:       %d", final_vocab_size)
-    logger.info("  Special tokens:   %d", NUM_SPECIAL)
+    logger.info("  Special tokens:   %d (incl ▁ separator)", NUM_SPECIAL)
     logger.info("  Morfessor tokens: %d", morfessor_count)
     logger.info("  BPE tokens:       %d", bpe_count)
     logger.info("  Char fallbacks:   %d", char_count)
@@ -418,7 +396,7 @@ def build_tokenizer(
 
     # 1. Save as JSON (human-readable)
     tokenizer_json = {
-        "version": "2.0",
+        "version": "3.0",
         "type": "morfessor_bpe_telugu",
         "vocab_size": final_vocab_size,
         "separator": separator,
@@ -470,15 +448,15 @@ def _get_merge_ranks(merges: list[tuple[str, str]]) -> dict[tuple[str, str], int
     return _bpe_merge_ranks
 
 
-def bpe_encode_word(word: str, merges: list[tuple[str, str]], separator: str = "@@") -> list[str]:
+def bpe_encode_word(word: str, merges: list[tuple[str, str]]) -> list[str]:
     """Encode a word into BPE subwords using the learned merge table.
 
     Uses priority-based pair merging: at each step, finds the highest-priority
     (lowest rank) pair present in the current symbols and merges it. This is
     O(word_length² × log) instead of O(num_merges × word_length).
 
-    Returns subwords with @@ on non-final pieces:
-        "international" -> ["inter@@", "nation@@", "al"]
+    v3: Returns bare subwords (no @@ suffix). Word boundaries handled by ▁.
+        "international" -> ["inter", "nation", "al"]
     """
     if not word:
         return []
@@ -514,15 +492,8 @@ def bpe_encode_word(word: str, merges: list[tuple[str, str]], separator: str = "
                 i += 1
         symbols = new_symbols
 
-    # Add @@ to all subwords except the last (word-final)
-    result = []
-    for i, subword in enumerate(symbols):
-        if i < len(symbols) - 1:
-            result.append(subword + separator)
-        else:
-            result.append(subword)
-
-    return result
+    # v3: return bare subwords — no @@ suffix
+    return symbols
 
 
 # ---------------------------------------------------------------------------
@@ -532,15 +503,14 @@ class MorfessorTokenizer:
     """
     Unified tokenizer for Morfessor-segmented Telugu + BPE non-Telugu text.
 
-    v2: @@ is part of the token string. "విద్యార్థు@@" and "విద్యార్థు" have
-    different token IDs. This means decode is trivial: just join and replace
-    "@@ " with "".
+    v3: Uses ▁ (U+2581) as a dedicated word-boundary separator token.
+    All morphemes/subwords are stored as single bare forms (no @@ duplication).
 
     Expects input text that has already been segmented (by morfessor_segment.py
-    or inference.py's segment_text), with @@ continuation markers.
+    or inference.py's segment_text), with ▁ tokens between words.
 
     Example:
-        segmented = "విద్యార్థు@@ ల@@ కు went to school"
+        segmented = "▁ విద్యార్థు ల కు ▁ went ▁ to ▁ school"
         ids = tokenizer.encode(segmented)
         text = tokenizer.decode(ids)
         # text == "విద్యార్థులకు went to school"
@@ -559,8 +529,6 @@ class MorfessorTokenizer:
         self.vocab_size = data["vocab_size"]
         self.separator = data["separator"]
         self.token_to_id = data["token_to_id"]
-        self.id_to_token = {int(k): v for k, v in
-                           {v: k for k, v in data["token_to_id"].items()}.items()}
         # Rebuild id_to_token properly: iterate token_to_id
         self.id_to_token = {}
         for token, tid in self.token_to_id.items():
@@ -572,6 +540,7 @@ class MorfessorTokenizer:
         self.unk_id = self.special_tokens["<unk>"]
         self.bos_id = self.special_tokens["<bos>"]
         self.eos_id = self.special_tokens["<eos>"]
+        self.sep_id = self.special_tokens.get("\u2581", self.token_to_id.get("\u2581"))
 
         # Load BPE merges if present
         self.bpe_merges = []
@@ -590,8 +559,8 @@ class MorfessorTokenizer:
     def _encode_token_bpe(self, word: str) -> list[int]:
         """Encode a single non-Telugu word using BPE merges, with char fallback.
 
-        Results are cached — the same word always produces the same IDs,
-        so we avoid re-running 8K merge rules for repeated tokens.
+        v3: BPE produces bare subwords. No @@ handling needed.
+        Results are cached — the same word always produces the same IDs.
         """
         # Check cache first
         cached = self._bpe_cache.get(word)
@@ -599,7 +568,7 @@ class MorfessorTokenizer:
             return cached
 
         if self.bpe_merges:
-            subwords = bpe_encode_word(word, self.bpe_merges, self.separator)
+            subwords = bpe_encode_word(word, self.bpe_merges)
             ids = []
             for sw in subwords:
                 tid = self.token_to_id.get(sw)
@@ -607,15 +576,8 @@ class MorfessorTokenizer:
                     ids.append(tid)
                 else:
                     # BPE subword not in vocab — char fallback
-                    # Strip @@ to check if it's a continuation piece
-                    is_cont = sw.endswith(self.separator)
-                    bare = sw[:-len(self.separator)] if is_cont else sw
-                    for ci, ch in enumerate(bare):
-                        is_last_char = (ci == len(bare) - 1) and not is_cont
-                        if not is_last_char:
-                            cid = self.token_to_id.get(ch + self.separator, self.unk_id)
-                        else:
-                            cid = self.token_to_id.get(ch, self.unk_id)
+                    for ch in sw:
+                        cid = self.token_to_id.get(ch, self.unk_id)
                         ids.append(cid)
             self._bpe_cache[word] = ids
             return ids
@@ -626,33 +588,27 @@ class MorfessorTokenizer:
             return ids
 
     def _encode_token_chars(self, word: str) -> list[int]:
-        """Encode a word character-by-character with @@ continuation."""
+        """Encode a word character-by-character.
+
+        v3: No @@ continuation — each character maps to its bare form.
+        """
         ids = []
-        for i, ch in enumerate(word):
-            if i < len(word) - 1:
-                # Continuation character
-                cid = self.token_to_id.get(ch + self.separator)
-                if cid is None:
-                    cid = self.token_to_id.get(ch, self.unk_id)
-                ids.append(cid)
-            else:
-                # Word-final character
-                cid = self.token_to_id.get(ch, self.unk_id)
-                ids.append(cid)
+        for ch in word:
+            cid = self.token_to_id.get(ch, self.unk_id)
+            ids.append(cid)
         return ids
 
     def encode(self, text: str, add_bos: bool = False, add_eos: bool = True) -> list[int]:
         """Encode segmented text to token IDs.
 
-        The text should already be segmented by morfessor_segment.py with @@
-        continuation markers. Each whitespace-separated token is looked up
-        directly in the vocabulary (with @@ preserved).
+        v3: Input text has ▁ as word-boundary separators and bare morphemes.
+        Example: "▁ విద్యార్థు ల కు ▁ went ▁ to ▁ school"
 
-        For non-Telugu tokens not in the vocab, BPE encoding is attempted,
-        then character fallback.
+        Each whitespace-separated token is looked up directly in the vocab.
+        The ▁ token maps to sep_id. For unknown tokens, BPE or char fallback.
 
         Args:
-            text: Segmented text, e.g. "విద్యార్థు@@ ల@@ కు went to school"
+            text: Segmented text with ▁ word boundaries.
             add_bos: Prepend <bos> token.
             add_eos: Append <eos> token.
 
@@ -668,49 +624,19 @@ class MorfessorTokenizer:
                 continue
 
             # Direct lookup — this is the primary path
-            # Token includes @@ if it's a continuation piece
+            # Covers ▁ separator, morphemes, BPE subwords, characters
             tid = self.token_to_id.get(token)
             if tid is not None:
                 ids.append(tid)
                 continue
 
             # Token not in vocab — need fallback
-            # Strip @@ to get the bare form for BPE/char encoding
-            is_continuation = token.endswith(self.separator)
-            bare = token[:-len(self.separator)] if is_continuation else token
-
-            if not self._is_telugu(bare):
-                # Non-Telugu: try BPE encoding on the bare form
-                sub_ids = self._encode_token_bpe(bare)
-                if is_continuation and sub_ids:
-                    # The last sub-token should be continuation, not word-final
-                    # Replace the last ID with its @@ variant if possible
-                    last_token_str = self.id_to_token.get(sub_ids[-1], "")
-                    if not last_token_str.endswith(self.separator):
-                        cont_tid = self.token_to_id.get(last_token_str + self.separator)
-                        if cont_tid is not None:
-                            sub_ids[-1] = cont_tid
-                ids.extend(sub_ids)
+            if not self._is_telugu(token):
+                # Non-Telugu: try BPE encoding
+                ids.extend(self._encode_token_bpe(token))
             else:
                 # Telugu token not in vocab — character fallback
-                if is_continuation:
-                    # Encode chars, last char gets @@ (since whole token is continuation)
-                    for i, ch in enumerate(bare):
-                        if i < len(bare) - 1:
-                            cid = self.token_to_id.get(ch + self.separator, self.unk_id)
-                        else:
-                            # Last char of a continuation token — still gets @@
-                            cid = self.token_to_id.get(ch + self.separator,
-                                                       self.token_to_id.get(ch, self.unk_id))
-                        ids.append(cid)
-                else:
-                    # Word-final: last char is bare
-                    for i, ch in enumerate(bare):
-                        if i < len(bare) - 1:
-                            cid = self.token_to_id.get(ch + self.separator, self.unk_id)
-                        else:
-                            cid = self.token_to_id.get(ch, self.unk_id)
-                        ids.append(cid)
+                ids.extend(self._encode_token_chars(token))
 
         if add_eos:
             ids.append(self.eos_id)
@@ -720,11 +646,12 @@ class MorfessorTokenizer:
     def encode_lines_to_array(self, lines: list[str], add_eos: bool = True) -> tuple:
         """Batch-encode multiple lines into a flat uint32 array + stats.
 
+        v3: Tokens are bare (no @@ handling). ▁ separator maps to sep_id.
         Optimized for data preparation — avoids per-line Python overhead.
         Uses local variable references for hot-path speedup.
 
         Args:
-            lines: List of segmented text lines.
+            lines: List of segmented text lines (with ▁ word boundaries).
             add_eos: Append <eos> after each line.
 
         Returns:
@@ -734,11 +661,8 @@ class MorfessorTokenizer:
         _get = self.token_to_id.get
         _unk = self.unk_id
         _eos = self.eos_id
-        _sep = self.separator
-        _sep_len = len(_sep)
         _is_tel = self._is_telugu
         _bpe = self._encode_token_bpe
-        _id2tok = self.id_to_token
 
         all_ids = []
         total = 0
@@ -750,7 +674,8 @@ class MorfessorTokenizer:
                 continue
 
             for token in line.split():
-                # Fast path: direct vocab lookup (handles ~85%+ of tokens)
+                # Fast path: direct vocab lookup (handles ~90%+ of tokens)
+                # Covers ▁, morphemes, BPE subwords, and characters
                 tid = _get(token)
                 if tid is not None:
                     all_ids.append(tid)
@@ -761,35 +686,19 @@ class MorfessorTokenizer:
 
                 # Slow path: token not in vocab
                 total += 1
-                is_cont = token.endswith(_sep)
-                bare = token[:-_sep_len] if is_cont else token
 
-                if not _is_tel(bare):
+                if not _is_tel(token):
                     # Non-Telugu → BPE (cached)
-                    sub_ids = _bpe(bare)
-                    if is_cont and sub_ids:
-                        last_str = _id2tok.get(sub_ids[-1], "")
-                        if not last_str.endswith(_sep):
-                            ct = _get(last_str + _sep)
-                            if ct is not None:
-                                sub_ids[-1] = ct
+                    sub_ids = _bpe(token)
                     all_ids.extend(sub_ids)
                     unk_count += sum(1 for i in sub_ids if i == _unk)
                 else:
                     # Telugu unknown → char fallback
-                    n = len(bare)
-                    if is_cont:
-                        for i, ch in enumerate(bare):
-                            if i < n - 1:
-                                all_ids.append(_get(ch + _sep, _unk))
-                            else:
-                                all_ids.append(_get(ch + _sep, _get(ch, _unk)))
-                    else:
-                        for i, ch in enumerate(bare):
-                            if i < n - 1:
-                                all_ids.append(_get(ch + _sep, _unk))
-                            else:
-                                all_ids.append(_get(ch, _unk))
+                    for ch in token:
+                        cid = _get(ch, _unk)
+                        all_ids.append(cid)
+                        if cid == _unk:
+                            unk_count += 1
 
             if add_eos:
                 all_ids.append(_eos)
@@ -800,8 +709,8 @@ class MorfessorTokenizer:
     def decode(self, ids: list[int]) -> str:
         """Decode token IDs back to text.
 
-        Reconstruction is trivial in v2: tokens with @@ are continuation
-        pieces that join to the next token. Replace "@@ " with "" to merge.
+        v3: Concatenate all tokens directly. ▁ token produces a space.
+        Strip leading/trailing whitespace.
 
         Args:
             ids: List of integer token IDs.
@@ -809,18 +718,17 @@ class MorfessorTokenizer:
         Returns:
             Reconstructed text string.
         """
-        tokens = []
+        parts = []
         for tid in ids:
-            token = self.id_to_token.get(tid, "<unk>")
+            token = self.id_to_token.get(tid, "")
             if token in ("<pad>", "<bos>", "<eos>"):
                 continue
-            tokens.append(token)
+            if token == "\u2581":
+                parts.append(" ")
+            else:
+                parts.append(token)
 
-        # Join with spaces, then merge continuation pieces
-        # "విద్యార్థు@@ ల@@ కు" -> "విద్యార్థులకు"
-        text = " ".join(tokens)
-        text = text.replace(self.separator + " ", "")
-        return text
+        return "".join(parts).strip()
 
     def __len__(self):
         return self.vocab_size
@@ -858,17 +766,14 @@ def test_tokenizer(tokenizer_dir: Path, test_texts: list[str], separator: str):
                 pass
 
     for text in test_texts:
-        # Segment with Morfessor if available
+        # Segment with Morfessor if available — v3: ▁ separator format
         if model:
             seg_tokens = []
             for word in text.split():
+                seg_tokens.append(separator)  # ▁ before each word
                 if TELUGU_WORD_RE.fullmatch(word):
                     segments = model.viterbi_segment(word)[0]
-                    for i, seg in enumerate(segments):
-                        if i < len(segments) - 1:
-                            seg_tokens.append(seg + separator)
-                        else:
-                            seg_tokens.append(seg)
+                    seg_tokens.extend(segments)  # bare morphemes
                 else:
                     seg_tokens.append(word)
             segmented = " ".join(seg_tokens)
@@ -942,8 +847,8 @@ Examples:
         help="Cap vocabulary size (0 = use all morphemes, default: 0).",
     )
     parser.add_argument(
-        "--separator", type=str, default="@@",
-        help="Continuation marker (default: @@).",
+        "--separator", type=str, default="\u2581",
+        help="Word boundary separator token (default: ▁ U+2581).",
     )
     parser.add_argument(
         "--bpe-vocab", type=str, default=None,
@@ -1003,7 +908,7 @@ Examples:
     test_tokenizer(output_dir, test_texts, args.separator)
 
     logger.info("")
-    logger.info("Tokenizer v2.0 ready at %s", output_dir.resolve())
+    logger.info("Tokenizer v3.0 (▁ separator) ready at %s", output_dir.resolve())
     logger.info("  vocab.txt             — one token per line")
     logger.info("  tokenizer.json        — full tokenizer config + BPE merges")
     logger.info("  token_frequencies.tsv — token ID + frequency")

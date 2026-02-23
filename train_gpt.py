@@ -66,7 +66,7 @@ class GPTConfig:
     n_layer: int = 24            # unique transformer layers
     n_head: int = 16             # query attention heads
     n_kv_head: int = 4           # KV head groups for GQA (4 KV heads shared across 16 Q heads)
-    n_embd: int = 1024           # embedding dimension
+    n_embd: int = 768            # embedding dimension (v2: 768, v1: 1024)
     dropout: float = 0.0         # 0.0 for pretraining (Liu et al. 2025)
     bias: bool = False           # no bias in linear layers
     rope_theta: float = 10000.0  # RoPE base frequency
@@ -359,11 +359,8 @@ def _prepare_morfessor(data_dir, tokenizer_dir, temp_bin, batch_size, tqdm):
     _get = tokenizer.token_to_id.get
     _unk = tokenizer.unk_id
     _eos = tokenizer.eos_id
-    _sep = tokenizer.separator
-    _sep_len = len(_sep)
     _is_tel = tokenizer._is_telugu
     _bpe = tokenizer._encode_token_bpe
-    _id2tok = tokenizer.id_to_token
 
     total_tokens = 0
     total_unk = 0
@@ -385,6 +382,7 @@ def _prepare_morfessor(data_dir, tokenizer_dir, temp_bin, batch_size, tqdm):
                         continue
 
                     for token in line.split():
+                        # v3: direct lookup — covers ▁, morphemes, BPE, chars
                         tid = _get(token)
                         if tid is not None:
                             batch_ids.append(tid)
@@ -393,34 +391,20 @@ def _prepare_morfessor(data_dir, tokenizer_dir, temp_bin, batch_size, tqdm):
                                 batch_unk += 1
                             continue
 
+                        # Slow path: token not in vocab
                         batch_total += 1
-                        is_cont = token.endswith(_sep)
-                        bare = token[:-_sep_len] if is_cont else token
-
-                        if not _is_tel(bare):
-                            sub_ids = _bpe(bare)
-                            if is_cont and sub_ids:
-                                last_str = _id2tok.get(sub_ids[-1], "")
-                                if not last_str.endswith(_sep):
-                                    ct = _get(last_str + _sep)
-                                    if ct is not None:
-                                        sub_ids[-1] = ct
+                        if not _is_tel(token):
+                            # Non-Telugu → BPE (cached)
+                            sub_ids = _bpe(token)
                             batch_ids.extend(sub_ids)
                             batch_unk += sum(1 for i in sub_ids if i == _unk)
                         else:
-                            n = len(bare)
-                            if is_cont:
-                                for i, ch in enumerate(bare):
-                                    if i < n - 1:
-                                        batch_ids.append(_get(ch + _sep, _unk))
-                                    else:
-                                        batch_ids.append(_get(ch + _sep, _get(ch, _unk)))
-                            else:
-                                for i, ch in enumerate(bare):
-                                    if i < n - 1:
-                                        batch_ids.append(_get(ch + _sep, _unk))
-                                    else:
-                                        batch_ids.append(_get(ch, _unk))
+                            # Telugu unknown → char fallback
+                            for ch in token:
+                                cid = _get(ch, _unk)
+                                batch_ids.append(cid)
+                                if cid == _unk:
+                                    batch_unk += 1
 
                     batch_ids.append(_eos)
                     batch_total += 1
@@ -1298,6 +1282,7 @@ Examples:
         p.add_argument("--wandb-name", type=str, default="", help="W&B run name (optional)")
         # Architecture
         p.add_argument("--n-layer", type=int, default=24, help="Number of unique transformer layers (default: 24)")
+        p.add_argument("--n-embd", type=int, default=768, help="Embedding dimension (default: 768)")
         p.add_argument("--n-kv-head", type=int, default=4, help="KV head groups for GQA (default: 4)")
         p.add_argument("--no-weight-sharing", action="store_true", help="Disable block-wise weight sharing")
         p.add_argument("--dropout", type=float, default=0.0, help="Dropout rate (default: 0.0)")
@@ -1349,6 +1334,7 @@ Examples:
     def _apply_train_args(args, model_config, train_config):
         """Apply shared training CLI args to config objects."""
         model_config.n_layer = args.n_layer
+        model_config.n_embd = args.n_embd
         model_config.n_kv_head = args.n_kv_head
         model_config.use_weight_sharing = not args.no_weight_sharing
         model_config.dropout = args.dropout

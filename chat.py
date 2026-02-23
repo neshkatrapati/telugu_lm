@@ -73,39 +73,29 @@ def load_morfessor_model(model_path: Path):
     return model
 
 
-def segment_text(text: str, morf_model, separator: str = "@@") -> str:
-    """Segment raw text using Morfessor with @@ continuation markers."""
+def segment_text(text: str, morf_model, separator: str = "\u2581") -> str:
+    """Segment raw text using Morfessor with ▁ word-boundary separators.
+
+    v3: ▁ before each word, bare morphemes (no @@ suffix).
+    """
     tokens = text.split()
     seg_tokens = []
 
     for token in tokens:
+        seg_tokens.append(separator)  # ▁ before each word
+
         if TELUGU_WORD_RE.fullmatch(token):
             segments = morf_model.viterbi_segment(token)[0]
-            for i, seg in enumerate(segments):
-                if i < len(segments) - 1:
-                    seg_tokens.append(seg + separator)
-                else:
-                    seg_tokens.append(seg)
+            seg_tokens.extend(segments)
         elif TELUGU_WORD_RE.search(token):
             parts = re.split(r"([\u0C00-\u0C7F]+)", token)
             parts = [p for p in parts if p]
-            for part_idx, part in enumerate(parts):
-                is_last_part = (part_idx == len(parts) - 1)
+            for part in parts:
                 if TELUGU_WORD_RE.fullmatch(part):
                     segments = morf_model.viterbi_segment(part)[0]
-                    for i, seg in enumerate(segments):
-                        if i < len(segments) - 1:
-                            seg_tokens.append(seg + separator)
-                        else:
-                            if not is_last_part:
-                                seg_tokens.append(seg + separator)
-                            else:
-                                seg_tokens.append(seg)
+                    seg_tokens.extend(segments)
                 else:
-                    if not is_last_part:
-                        seg_tokens.append(part + separator)
-                    else:
-                        seg_tokens.append(part)
+                    seg_tokens.append(part)
         else:
             seg_tokens.append(token)
 
@@ -491,17 +481,14 @@ class ChatSession:
 
     def init_streaming_state(self):
         """Reset streaming decode state before a new generation."""
-        self._prev_was_continuation = False
+        pass  # v3: no state needed — ▁ token handles word boundaries
 
     def decode_token_streaming(self, tid: int) -> str | None:
         """Decode a single token for streaming display.
 
-        The tokenizer uses @@ continuation markers:
-          - "విద్యార్థు@@" means the NEXT token joins without a space
-          - "కు" (no @@) is a word-final token
-
-        So the rule is: add a leading space UNLESS the previous token
-        ended with @@ (i.e. was a continuation marker).
+        v3: The tokenizer uses ▁ (U+2581) as a word-boundary separator token.
+        When we see ▁, output a space. All other tokens are concatenated directly.
+        No state tracking needed.
 
         Must call init_streaming_state() before each generation.
         """
@@ -512,22 +499,10 @@ class ChatSession:
         if not tok_str:
             return None
 
-        # Determine if we need a leading space
-        needs_space = not self._prev_was_continuation
-
-        if tok_str.endswith("@@"):
-            # This is a continuation piece — strip marker, next token joins
-            self._prev_was_continuation = True
-            text = tok_str[:-2]
+        if tok_str == "\u2581":
+            return " "
         else:
-            # Word-final token
-            self._prev_was_continuation = False
-            text = tok_str
-
-        if needs_space:
-            return " " + text
-        else:
-            return text
+            return tok_str
 
     def add_turn(self, user_text: str, assistant_text: str):
         """Record a completed turn in conversation history."""

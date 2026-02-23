@@ -66,49 +66,32 @@ def load_morfessor_model(model_path):
     return model
 
 
-def segment_text_morfessor(text, morf_model, separator="@@"):
-    """Segment raw text using Morfessor with @@ continuation markers.
+def segment_text_morfessor(text, morf_model, separator="\u2581"):
+    """Segment raw text using Morfessor with ▁ word-boundary separators.
 
-    Telugu words are split into morphemes with @@ joining markers.
-    Non-Telugu tokens (English, numbers, punctuation) pass through unchanged.
+    v3: ▁ before each word, bare morphemes (no @@ suffix).
 
-    Example: "అందమైనది" → "అందమైన@@ ది"
+    Example: "అందమైనది" → "▁ అందమైన ది"
     """
     tokens = text.split()
     seg_tokens = []
 
     for token in tokens:
+        seg_tokens.append(separator)  # ▁ before each word
+
         if TELUGU_WORD_RE.fullmatch(token):
-            # Pure Telugu word — segment with Morfessor
             segments = morf_model.viterbi_segment(token)[0]
-            for i, seg in enumerate(segments):
-                if i < len(segments) - 1:
-                    seg_tokens.append(seg + separator)
-                else:
-                    seg_tokens.append(seg)
+            seg_tokens.extend(segments)
         elif TELUGU_WORD_RE.search(token):
-            # Mixed token (Telugu + non-Telugu) — split and segment Telugu parts
             parts = re.split(r"([\u0C00-\u0C7F]+)", token)
             parts = [p for p in parts if p]
-            for part_idx, part in enumerate(parts):
-                is_last_part = (part_idx == len(parts) - 1)
+            for part in parts:
                 if TELUGU_WORD_RE.fullmatch(part):
                     segments = morf_model.viterbi_segment(part)[0]
-                    for i, seg in enumerate(segments):
-                        if i < len(segments) - 1:
-                            seg_tokens.append(seg + separator)
-                        else:
-                            if not is_last_part:
-                                seg_tokens.append(seg + separator)
-                            else:
-                                seg_tokens.append(seg)
+                    seg_tokens.extend(segments)
                 else:
-                    if not is_last_part:
-                        seg_tokens.append(part + separator)
-                    else:
-                        seg_tokens.append(part)
+                    seg_tokens.append(part)
         else:
-            # Non-Telugu token — pass through
             seg_tokens.append(token)
 
     return " ".join(seg_tokens)

@@ -17,7 +17,7 @@ What it does:
      - Handles weight sharing: unrolls N unique layers into 2N HF layers
      - Renames all keys to HF convention
   2. Reads our tokenizer.json and builds an HF-compatible tokenizer
-     - Preserves @@ continuation marker semantics
+     - Preserves ▁ word-boundary separator semantics
      - Creates tokenizer.json, tokenizer_config.json, special_tokens_map.json
   3. Creates config.json (LlamaConfig) and generation_config.json
   4. Optionally copies morfessor_telugu.bin for raw-text inference
@@ -400,20 +400,19 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
                       is_sft: bool = False, sft_special_tokens: dict = None):
     """Convert our custom tokenizer to HuggingFace format.
 
-    Our tokenizer is a Morfessor+BPE hybrid with @@ continuation markers.
+    v3: Our tokenizer uses ▁ (U+2581) as a word-boundary separator token.
+    All morphemes are bare (no @@ duplication). The ▁ token is in the vocab.
+
     We create an HF-compatible tokenizer using WordLevel model (exact lookup):
       - Uses the same vocab (token → id mapping, direct lookup)
       - Pre-tokenizer: WhitespaceSplit (input is already segmented)
-      - Decoder: replaces "@@  " with "" to rejoin morphemes
+      - Decoder: None (default space-joining). Custom Python class removes
+        spaces and replaces ▁ with space.
       - Post-processor: prepends <bos>
 
     For SFT models, also:
       - Adds <|system|>, <|user|>, <|assistant|>, <|end|> to vocab
       - Adds chat_template to tokenizer_config.json
-
-    We use WordLevel instead of BPE because our tokenizer does direct vocab
-    lookup on whole morpheme tokens (e.g. "విద్యార్థు@@" → ID). HF's BPE
-    model would re-split these into characters and merge up, giving wrong IDs.
 
     Returns the final HF vocab size.
 
@@ -429,7 +428,7 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
         our_tok = json.load(f)
 
     token_to_id = our_tok["token_to_id"]
-    separator = our_tok["separator"]  # "@@"
+    separator = our_tok["separator"]  # "▁"
     bpe_merges = our_tok.get("bpe_merges", [])
     vocab_size = our_tok["vocab_size"]
 
@@ -440,14 +439,14 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
     # We use WordLevel model (exact token → id lookup), NOT BPE.
     #
     # Why: Our tokenizer does direct vocab lookup on whitespace-split tokens.
-    # The input is already Morfessor-segmented, so "విద్యార్థు@@" is a single
-    # vocab entry looked up directly. HF's BPE model would re-split it into
-    # characters and try to merge up — producing completely wrong IDs.
+    # The input is already Morfessor-segmented, so each morpheme is a single
+    # vocab entry looked up directly. HF's BPE model would re-split these
+    # into characters and try to merge up — producing completely wrong IDs.
     #
-    # Decode logic (matches our tokenizer.decode()):
-    #   1. Join all tokens with spaces:  "రెడ్డి@@ గారు ప్రభుత్వం"
-    #   2. Replace "@@ " with "":        "రెడ్డిగారు ప్రభుత్వం"
-    #   3. Strip any trailing "@@":       (edge case for last token)
+    # v3 Decode logic (matches our tokenizer.decode()):
+    #   1. WordLevel joins all tokens with spaces: "▁ విద్యార్థు ల కు ▁ went"
+    #   2. Custom Python class: remove all spaces, replace ▁ with space
+    #   3. Strip leading/trailing spaces → "విద్యార్థులకు went"
 
     from tokenizers import Tokenizer, models, pre_tokenizers
     from tokenizers.processors import TemplateProcessing
@@ -479,19 +478,17 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
 
     # Decoder: set to None (default).
     # With decoder=None, WordLevel decode joins tokens with spaces:
-    #   "రెడ్డి@@" "గారు" → "రెడ్డి@@ గారు"
-    # The @@ stripping is handled by our custom TeluguTokenizer Python class
-    # (see create_tokenizer_class below), which overrides decode() to do:
-    #   text.replace("@@ ", "").rstrip("@@")
-    # This gives: "రెడ్డిగారు" — correct!
+    #   "▁" "విద్యార్థు" "ల" "కు" → "▁ విద్యార్థు ల కు"
+    # The custom TeluguTokenizer Python class (see create_tokenizer_class below)
+    # overrides decode() to: remove all spaces, replace ▁ with space, strip.
     #
     # We can't use a Sequence decoder because setting ANY custom decoder
     # in the tokenizers library replaces the default space-joining with
     # direct concatenation (no spaces between tokens).
     tok.decoder = None
 
-    # Add special tokens
-    base_specials = ["<pad>", "<unk>", "<bos>", "<eos>"]
+    # Add special tokens (▁ is in the vocab but is also treated as special)
+    base_specials = ["<pad>", "<unk>", "<bos>", "<eos>", "\u2581"]
     if is_sft and sft_special_tokens:
         base_specials.extend(sft_special_tokens.keys())
     tok.add_special_tokens(base_specials)
@@ -504,7 +501,7 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
 
     # --- tokenizer_config.json ---
     # Use auto_map to point to our custom TeluguTokenizer class which
-    # overrides decode() to strip @@ continuation markers.
+    # overrides decode() to handle ▁ word-boundary separator.
     tokenizer_config = {
         "tokenizer_class": "PreTrainedTokenizerFast",
         "auto_map": {
@@ -520,14 +517,15 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
         "clean_up_tokenization_spaces": False,
         "model_max_length": 2048,
         "extra_info": {
-            "type": "morfessor_bpe_telugu",
+            "type": "morfessor_bpe_telugu_v3",
             "separator": separator,
             "note": (
                 "This tokenizer expects Morfessor-segmented text as input. "
                 "For raw Telugu text, run Morfessor segmentation first using "
                 "the included morfessor_telugu.bin model. "
-                "Tokens ending with '@@' are continuation pieces that join "
-                "to the next token. The decoder handles @@ removal automatically."
+                "The ▁ (U+2581) token is a word-boundary separator. "
+                "All morphemes are stored as single bare forms (no @@ duplication). "
+                "The decoder handles ▁ → space conversion automatically."
             ),
         },
     }
@@ -645,31 +643,36 @@ def convert_tokenizer_sp(tokenizer_dir: Path, output_dir: Path, vocab_size: int)
 
 
 # ===========================================================================
-# Part 3b: Custom tokenizer class (handles @@ stripping in decode)
+# Part 3b: Custom tokenizer class (handles ▁ separator in decode)
 # ===========================================================================
 def create_tokenizer_class(output_dir: Path, is_sft: bool = False):
-    """Create a custom tokenizer class that strips @@ markers during decode.
+    """Create a custom tokenizer class that handles ▁ word-boundary decode.
 
-    The tokenizers library's WordLevel decoder with decoder=None joins tokens
-    with spaces (correct), but keeps @@ markers in the output. Our custom
-    class overrides decode() to strip @@ after the default decode.
+    v3: The tokenizers library's WordLevel decoder with decoder=None joins
+    tokens with spaces. Our custom class:
+      1. Removes all spaces (tokens were separated by WordLevel)
+      2. Replaces ▁ (U+2581) with space (word boundaries)
+      3. Strips leading/trailing whitespace
 
     For SFT models, also strips chat special tokens from decoded output.
     """
     code = '''\
-"""Custom Telugu tokenizer that handles @@ continuation marker stripping."""
+"""Custom Telugu tokenizer that handles ▁ word-boundary separator."""
 from transformers import PreTrainedTokenizerFast
 
 
 class TeluguTokenizer(PreTrainedTokenizerFast):
-    """Telugu tokenizer with Morfessor @@ continuation marker support.
+    """Telugu tokenizer with ▁ word-boundary separator support.
 
-    Tokens ending with @@ are continuation pieces that join to the next token.
-    This class overrides decode() to strip @@ markers and join morphemes:
-        "రెడ్డి@@ గారు" → "రెడ్డిగారు"
+    v3: All morphemes are stored as bare forms (no @@ duplication).
+    The ▁ (U+2581) token marks word boundaries.
 
-    Also strips chat special tokens (<|system|>, <|user|>, <|assistant|>, <|end|>)
-    from decoded output for clean text.
+    WordLevel decode joins tokens with spaces:
+        "▁ విద్యార్థు ల కు ▁ went"
+    This class removes spaces and converts ▁ to space:
+        "విద్యార్థులకు went"
+
+    Also strips chat special tokens for clean text.
     """
 
     # Chat special tokens to strip from output
@@ -677,15 +680,15 @@ class TeluguTokenizer(PreTrainedTokenizerFast):
 
     def decode(self, token_ids, skip_special_tokens=False, **kwargs):
         text = super().decode(token_ids, skip_special_tokens=skip_special_tokens, **kwargs)
-        # Strip @@ continuation markers:
-        # "@@ " between tokens means "join to next token" (no space)
-        text = text.replace("@@ ", "")
-        # Handle remaining @@ (before punctuation, end of string, etc.)
-        text = text.replace("@@", "")
+        # WordLevel joins with spaces: "▁ విద్యార్థు ల కు ▁ went"
+        # Remove all spaces (concatenate tokens directly)
+        text = text.replace(" ", "")
+        # Replace ▁ with space (word boundaries)
+        text = text.replace("\\u2581", " ")
         # Strip chat special tokens
         for special in self._CHAT_SPECIALS:
             text = text.replace(special, "")
-        # Clean up extra whitespace from removed tokens
+        # Clean up extra whitespace
         import re
         text = re.sub(r"  +", " ", text).strip()
         return text
@@ -693,7 +696,7 @@ class TeluguTokenizer(PreTrainedTokenizerFast):
     path = output_dir / "tokenizer_class.py"
     with open(path, "w", encoding="utf-8") as f:
         f.write(code)
-    logger.info("Saved tokenizer_class.py (custom TeluguTokenizer)")
+    logger.info("Saved tokenizer_class.py (custom TeluguTokenizer — v3 ▁ separator)")
 
 
 def create_tokenizer_class_sp(output_dir: Path):
@@ -816,17 +819,19 @@ def create_model_card(config: dict, output_dir: Path, is_sp: bool = False,
     else:
         trust_note = (
             "\n> **Note**: `trust_remote_code=True` is required for the custom tokenizer "
-            "that handles `@@` morpheme joining. Without it, `@@` markers will appear in the output.\n"
+            "that handles `▁` word-boundary decoding. Without it, `▁` markers will appear in the output.\n"
         )
         tok_section = (
-            "This model uses a **Morfessor + BPE hybrid tokenizer** designed for Telugu.\n\n"
-            "- **Telugu text**: Segmented into morphemes using Morfessor with `@@` continuation markers\n"
+            "This model uses a **Morfessor + BPE hybrid tokenizer** (v3) designed for Telugu.\n\n"
+            "- **Telugu text**: Segmented into bare morphemes using Morfessor\n"
+            "- **Word boundaries**: Marked by `▁` (U+2581) separator token\n"
             "- **Non-Telugu text** (English, numbers, URLs): Handled by BPE subword encoding\n"
-            "- **Fallback**: Character-level encoding for out-of-vocabulary tokens\n\n"
-            "**Important**: The tokenizer expects **pre-segmented** input (with `@@` markers). "
+            "- **Fallback**: Character-level encoding for out-of-vocabulary tokens\n"
+            "- **No duplication**: Each morpheme stored once (no `@@` variants)\n\n"
+            "**Important**: The tokenizer expects **pre-segmented** input (with `▁` separators). "
             "For raw Telugu text, you need to run Morfessor segmentation first."
         )
-        preproc = "Morfessor morpheme segmentation + BPE for non-Telugu"
+        preproc = "Morfessor morpheme segmentation + ▁ separator + BPE for non-Telugu"
 
     card = f"""---
 language:
@@ -1099,15 +1104,15 @@ response = tokenizer.decode(outputs[0], skip_special_tokens=False)
 print(response)
 ```
 
-> **Note**: `trust_remote_code=True` is required for the custom tokenizer that handles `@@` morpheme joining.
+> **Note**: `trust_remote_code=True` is required for the custom tokenizer that handles `▁` word-boundary decoding.
 
 ### Manual prompt construction
 
 If you prefer to build the prompt manually:
 
 ```python
-# For Morfessor-segmented text:
-prompt = "<bos><|system|> మీరు ఒక సహాయ@@ కరమైన తెలుగు AI అసిస్టెంట్. <|end|><|user|> తెలం@@ గాణ రాజ@@ ధాని ఏది? <|end|><|assistant|>"
+# For Morfessor-segmented text (v3 ▁ separator format):
+prompt = "<bos><|system|> ▁ మీరు ▁ ఒక ▁ సహాయ కరమైన ▁ తెలుగు ▁ AI ▁ అసిస్టెంట్. <|end|><|user|> ▁ తెలం గాణ ▁ రాజ ధాని ▁ ఏది? <|end|><|assistant|>"
 
 inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
 outputs = model.generate(**inputs, max_new_tokens=256, do_sample=True, temperature=0.7)
@@ -1134,13 +1139,15 @@ The CLI supports: streaming output, KV-cache for fast generation, multi-turn con
 
 ## Tokenizer
 
-This model uses a **Morfessor + BPE hybrid tokenizer** designed for Telugu:
+This model uses a **Morfessor + BPE hybrid tokenizer** (v3) designed for Telugu:
 
-- **Telugu text**: Segmented into morphemes using [Morfessor](https://github.com/aalto-speech/morfessor) with `@@` continuation markers
+- **Telugu text**: Segmented into bare morphemes using [Morfessor](https://github.com/aalto-speech/morfessor)
+- **Word boundaries**: Marked by `▁` (U+2581) separator token
 - **Non-Telugu text** (English, numbers): Handled by BPE subword encoding
 - **Fallback**: Character-level encoding for out-of-vocabulary tokens
+- **No duplication**: Each morpheme stored once (no `@@` variants)
 
-**Important**: The tokenizer expects **pre-segmented** input (with `@@` markers). For raw Telugu text, you need to run Morfessor segmentation first using the included `morfessor_telugu.bin`.
+**Important**: The tokenizer expects **pre-segmented** input (with `▁` separators). For raw Telugu text, you need to run Morfessor segmentation first using the included `morfessor_telugu.bin`.
 
 ### Full pipeline (raw Telugu text)
 
@@ -1153,13 +1160,13 @@ morf_model = io.read_binary_model_file("morfessor_telugu.bin")
 
 TELUGU_RE = re.compile(r"[\\u0C00-\\u0C7F]+")
 
-def segment_telugu(text, separator="@@"):
+def segment_telugu(text, separator="\\u2581"):
     tokens = []
     for word in text.split():
+        tokens.append(separator)  # ▁ before each word
         if TELUGU_RE.fullmatch(word):
             segments = morf_model.viterbi_segment(word)[0]
-            for i, seg in enumerate(segments):
-                tokens.append(seg + separator if i < len(segments) - 1 else seg)
+            tokens.extend(segments)  # bare morphemes
         else:
             tokens.append(word)
     return " ".join(tokens)
@@ -1377,7 +1384,7 @@ def verify_conversion(output_dir: Path, checkpoint: dict, tokenizer_dir: Path, i
     logger.info('  model.push_to_hub("dvitvaai/pothana-base-300M")')
     logger.info('  tokenizer.push_to_hub("dvitvaai/pothana-base-300M")')
     logger.info("")
-    logger.info("Note: trust_remote_code=True is needed for the custom @@ decoder.")
+    logger.info("Note: trust_remote_code=True is needed for the custom ▁ separator decoder.")
 
     return True
 

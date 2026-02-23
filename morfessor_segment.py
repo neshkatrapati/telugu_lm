@@ -28,6 +28,9 @@ Usage:
 
     # Custom corpus weight (higher = less segmentation, lower = more)
     python morfessor_segment.py --input ./data --corpus-weight 1.0
+
+    # v2: Output uses ▁ as word-boundary separator, bare morphemes (no @@):
+    #   "విద్యార్థులకు went" → "▁ విద్యార్థు ల కు ▁ went"
 """
 
 import os
@@ -469,10 +472,13 @@ def compute_vocab_stats(model_path: Path, freq_path: Path, output_dir: Path):
 # Step 4: Segment full corpus (with caching + multiprocessing)
 # ---------------------------------------------------------------------------
 
-def _build_segmentation_cache(model, freq_path: Path, separator: str) -> dict[str, str]:
+def _build_segmentation_cache(model, freq_path: Path, separator: str) -> dict[str, list[str]]:
     """
     Pre-segment all known words into a lookup dict.
     This avoids calling viterbi_segment millions of times during corpus pass.
+
+    v2: Returns bare morphemes (no @@ suffix). The separator (▁) is inserted
+    at the word level by the caller, not attached to individual morphemes.
     """
     from tqdm import tqdm
 
@@ -494,16 +500,8 @@ def _build_segmentation_cache(model, freq_path: Path, separator: str) -> dict[st
             _, word = parts
 
             segments = model.viterbi_segment(word)[0]
-            if len(segments) > 1:
-                segmented_parts = []
-                for i, seg in enumerate(segments):
-                    if i < len(segments) - 1:
-                        segmented_parts.append(seg + separator)
-                    else:
-                        segmented_parts.append(seg)
-                cache[word] = " ".join(segmented_parts)
-            else:
-                cache[word] = word
+            # Store bare morphemes — no separator suffix
+            cache[word] = list(segments)
 
     logger.info("Cached segmentations for %d word types", len(cache))
     return cache
@@ -513,46 +511,48 @@ MAX_TOKEN_LEN = 80  # Skip viterbi for tokens longer than this (URLs, garbage, e
 
 
 def _segment_telugu_word(cache: dict, model, word: str, separator: str) -> list[str]:
-    """Segment a pure-Telugu word into morphemes using cache.
+    """Segment a pure-Telugu word into bare morphemes using cache.
 
-    Returns a list of sub-tokens, e.g. ["విద్యార్థు@@", "ల@@", "కు"].
-    The LAST sub-token does NOT have @@ (it is word-final).
+    v2: Returns bare morphemes without any separator suffix.
+    e.g. ["విద్యార్థు", "ల", "కు"]
+    The ▁ word-boundary separator is inserted at a higher level.
     """
     cached = cache.get(word)
     if cached is not None:
-        return cached.split()
+        return list(cached)  # cache stores list[str] of bare morphemes
 
     if len(word) > MAX_TOKEN_LEN:
+        cache[word] = [word]
         return [word]
 
-    segments = model.viterbi_segment(word)[0]
-    if len(segments) > 1:
-        sub_tokens = []
-        for i, seg in enumerate(segments):
-            if i < len(segments) - 1:
-                sub_tokens.append(seg + separator)
-            else:
-                sub_tokens.append(seg)
-        cache[word] = " ".join(sub_tokens)
-        return sub_tokens
-    else:
-        cache[word] = word
-        return [word]
+    segments = list(model.viterbi_segment(word)[0])
+    cache[word] = segments
+    return segments
 
 
 def _segment_text_cached(cache: dict, model, text: str, separator: str) -> str:
     """
     Segment text into sub-word tokens using Morfessor for Telugu words.
 
-    - Pure Telugu words → Morfessor morphemes with @@ continuation markers
-    - Non-Telugu tokens → kept as-is
-    - Mixed-script tokens (e.g. 2024లో, IPLలో) → split at script boundary,
-      non-final parts get @@ to preserve the fact they were one token.
+    v2: Uses ▁ (separator) as a dedicated word-boundary token inserted BETWEEN
+    words. All morphemes are stored as bare forms (no @@ suffix).
+
+    Output format:
+        "విద్యార్థులకు went" → "▁ విద్యార్థు ల కు ▁ went"
+        Decode: concatenate all, ▁ → space, strip → "విద్యార్థులకు went"
+
+    - Pure Telugu words → ▁ + bare Morfessor morphemes
+    - Non-Telugu tokens → ▁ + kept as-is
+    - Mixed-script tokens (e.g. 2024లో) → ▁ + fragments concatenated as
+      separate tokens (all bare, no suffixes)
     """
     tokens = text.split()
     result = []
 
     for token in tokens:
+        # Insert word boundary separator before each word
+        result.append(separator)
+
         # No Telugu characters — keep as-is
         if not TELUGU_WORD_RE.search(token):
             result.append(token)
@@ -568,23 +568,11 @@ def _segment_text_cached(cache: dict, model, text: str, separator: str) -> str:
         parts = re.split(r"([\u0C00-\u0C7F]+)", token)
         parts = [p for p in parts if p]  # remove empties
 
-        for part_idx, part in enumerate(parts):
-            is_last_part = (part_idx == len(parts) - 1)
-
+        for part in parts:
             if TELUGU_WORD_RE.fullmatch(part):
-                sub_tokens = _segment_telugu_word(cache, model, part, separator)
-                if not is_last_part:
-                    # Not the last fragment — ensure final sub-token has @@
-                    # so decode knows this Telugu fragment was glued to the next part
-                    if sub_tokens and not sub_tokens[-1].endswith(separator):
-                        sub_tokens[-1] = sub_tokens[-1] + separator
-                result.extend(sub_tokens)
+                result.extend(_segment_telugu_word(cache, model, part, separator))
             else:
-                # Non-Telugu fragment
-                if not is_last_part:
-                    result.append(part + separator)
-                else:
-                    result.append(part)
+                result.append(part)
 
     return " ".join(result)
 
@@ -848,8 +836,8 @@ Examples:
     parser.add_argument(
         "--separator",
         type=str,
-        default="@@",
-        help="Morpheme boundary marker for segmented output (default: @@)",
+        default="\u2581",
+        help="Word boundary separator token for segmented output (default: ▁ U+2581)",
     )
     parser.add_argument(
         "--train-only",

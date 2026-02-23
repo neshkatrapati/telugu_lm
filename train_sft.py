@@ -195,39 +195,29 @@ def load_morfessor_model(model_path: Path):
     return model
 
 
-def segment_text(text: str, morf_model, separator: str = "@@") -> str:
-    """Segment raw text using Morfessor with @@ continuation markers."""
+def segment_text(text: str, morf_model, separator: str = "\u2581") -> str:
+    """Segment raw text using Morfessor with ▁ word-boundary separators.
+
+    v3: ▁ before each word, bare morphemes (no @@ suffix).
+    """
     tokens = text.split()
     seg_tokens = []
 
     for token in tokens:
+        seg_tokens.append(separator)  # ▁ before each word
+
         if TELUGU_WORD_RE.fullmatch(token):
             segments = morf_model.viterbi_segment(token)[0]
-            for i, seg in enumerate(segments):
-                if i < len(segments) - 1:
-                    seg_tokens.append(seg + separator)
-                else:
-                    seg_tokens.append(seg)
+            seg_tokens.extend(segments)
         elif TELUGU_WORD_RE.search(token):
             parts = re.split(r"([\u0C00-\u0C7F]+)", token)
             parts = [p for p in parts if p]
-            for part_idx, part in enumerate(parts):
-                is_last_part = (part_idx == len(parts) - 1)
+            for part in parts:
                 if TELUGU_WORD_RE.fullmatch(part):
                     segments = morf_model.viterbi_segment(part)[0]
-                    for i, seg in enumerate(segments):
-                        if i < len(segments) - 1:
-                            seg_tokens.append(seg + separator)
-                        else:
-                            if not is_last_part:
-                                seg_tokens.append(seg + separator)
-                            else:
-                                seg_tokens.append(seg)
+                    seg_tokens.extend(segments)
                 else:
-                    if not is_last_part:
-                        seg_tokens.append(part + separator)
-                    else:
-                        seg_tokens.append(part)
+                    seg_tokens.append(part)
         else:
             seg_tokens.append(token)
 

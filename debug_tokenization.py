@@ -54,13 +54,10 @@ def main():
         tokens = text.split()
         seg_tokens = []
         for token in tokens:
+            seg_tokens.append("\u2581")  # ▁ before each word
             if TELUGU_RE.fullmatch(token):
                 segments = morf_model.viterbi_segment(token)[0]
-                for i, seg in enumerate(segments):
-                    if i < len(segments) - 1:
-                        seg_tokens.append(seg + "@@")
-                    else:
-                        seg_tokens.append(seg)
+                seg_tokens.extend(segments)  # bare morphemes
             else:
                 seg_tokens.append(token)
         return " ".join(seg_tokens)
