@@ -568,6 +568,67 @@ def convert_tokenizer(tokenizer_dir: Path, output_dir: Path, original_vocab_size
 
 
 # ===========================================================================
+# Part 3a-SP: Convert SentencePiece tokenizer (native HF support)
+# ===========================================================================
+def convert_tokenizer_sp(tokenizer_dir: Path, output_dir: Path, vocab_size: int):
+    """Convert SentencePiece tokenizer to HuggingFace format.
+
+    SentencePiece is natively supported by HF via LlamaTokenizerFast.
+    We just need to:
+      1. Copy the .model file as tokenizer.model
+      2. Create tokenizer_config.json pointing to LlamaTokenizer
+      3. Create special_tokens_map.json
+
+    Returns the vocab size (unchanged for SP).
+    """
+    import shutil
+
+    sp_model_path = tokenizer_dir / "sp_telugu.model"
+    if not sp_model_path.exists():
+        raise FileNotFoundError(f"SentencePiece model not found: {sp_model_path}")
+
+    # 1. Copy .model file as "tokenizer.model" (HF convention)
+    dest_model = output_dir / "tokenizer.model"
+    shutil.copy2(str(sp_model_path), str(dest_model))
+    logger.info("Copied %s → %s", sp_model_path.name, dest_model.name)
+
+    # 2. tokenizer_config.json — use LlamaTokenizer (native SP support)
+    #    Our SP model uses custom token names: <bos>/<eos> not <s>/</s>
+    tokenizer_config = {
+        "tokenizer_class": "LlamaTokenizer",
+        "model_max_length": 2048,
+        "bos_token": "<bos>",
+        "eos_token": "<eos>",
+        "unk_token": "<unk>",
+        "pad_token": "<pad>",
+        "sp_model_kwargs": {},
+        "add_bos_token": True,
+        "add_eos_token": False,
+        "clean_up_tokenization_spaces": False,
+        "legacy": True,
+    }
+    config_path = output_dir / "tokenizer_config.json"
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(tokenizer_config, f, ensure_ascii=False, indent=2)
+    logger.info("Saved tokenizer_config.json (LlamaTokenizer)")
+
+    # 3. special_tokens_map.json
+    special_tokens_map = {
+        "bos_token": "<bos>",
+        "eos_token": "<eos>",
+        "unk_token": "<unk>",
+        "pad_token": "<pad>",
+    }
+    stm_path = output_dir / "special_tokens_map.json"
+    with open(stm_path, "w") as f:
+        json.dump(special_tokens_map, f, indent=2)
+    logger.info("Saved special_tokens_map.json")
+
+    logger.info("SentencePiece tokenizer ready (vocab_size=%d, native HF support)", vocab_size)
+    return vocab_size
+
+
+# ===========================================================================
 # Part 3b: Custom tokenizer class (handles @@ stripping in decode)
 # ===========================================================================
 def create_tokenizer_class(output_dir: Path, is_sft: bool = False):
@@ -653,19 +714,21 @@ def create_generation_config(output_dir: Path, is_sft: bool = False,
 # ===========================================================================
 # Part 5: Model card (README.md)
 # ===========================================================================
-def create_model_card(config: dict, output_dir: Path):
+def create_model_card(config: dict, output_dir: Path, is_sp: bool = False):
     """Create a HuggingFace model card (README.md)."""
 
     vocab_size = config["vocab_size"]
     n_layers = config["num_hidden_layers"]
     n_heads = config["num_attention_heads"]
+    n_kv_heads = config.get("num_key_value_heads", n_heads)
     hidden = config["hidden_size"]
     intermediate = config["intermediate_size"]
     ctx_len = config["max_position_embeddings"]
 
     # Rough param count (same formula as GPTConfig.param_count)
     emb = vocab_size * hidden
-    attn_per_layer = 4 * hidden ** 2
+    head_dim = hidden // n_heads
+    attn_per_layer = (n_heads + 2 * n_kv_heads) * head_dim * hidden + hidden ** 2
     mlp_per_layer = 3 * hidden * intermediate
     tfm = n_layers * (attn_per_layer + mlp_per_layer)
     norms = (2 * n_layers + 1) * hidden
@@ -673,6 +736,8 @@ def create_model_card(config: dict, output_dir: Path):
     param_str = f"{n_params / 1e6:.0f}M"
 
     model_name = "pothana-base-300M"
+    tok_tag = "sentencepiece" if is_sp else "morfessor"
+    tok_desc = "SentencePiece Unigram (48K)" if is_sp else "Morfessor + BPE (Telugu morpheme-aware)"
 
     card = f"""---
 language:
@@ -682,7 +747,9 @@ tags:
   - telugu
   - llama
   - causal-lm
-  - morfessor
+  - {tok_tag}
+  - gqa
+  - weight-sharing
   - from-scratch
 library_name: transformers
 pipeline_tag: text-generation
@@ -701,15 +768,15 @@ Developed by **[Dvitva AI](https://dvitva.ai)**.
 | | |
 |---|---|
 | **Model** | {model_name} |
-| **Architecture** | LLaMA (RoPE + SwiGLU + RMSNorm) |
+| **Architecture** | LLaMA (RoPE + SwiGLU + RMSNorm + GQA) |
 | **Parameters** | {param_str} |
 | **Hidden size** | {hidden} |
 | **Layers** | {n_layers} |
-| **Attention heads** | {n_heads} |
+| **Attention heads** | {n_heads} Q / {n_kv_heads} KV (Grouped Query Attention) |
 | **Intermediate size** | {intermediate} |
 | **Context length** | {ctx_len} |
 | **Vocab size** | {vocab_size:,} |
-| **Tokenizer** | Morfessor + BPE (Telugu morpheme-aware) |
+| **Tokenizer** | {tok_desc} |
 | **Training** | Single GPU, bf16 mixed precision |
 | **Developed by** | [Dvitva AI](https://dvitva.ai) |
 
@@ -720,13 +787,13 @@ Developed by **[Dvitva AI](https://dvitva.ai)**.
 ```python
 from transformers import pipeline
 
-pipe = pipeline("text-generation", model="dvitvaai/{model_name}", trust_remote_code=True)
+pipe = pipeline("text-generation", model="dvitvaai/{model_name}"{"" if is_sp else ", trust_remote_code=True"})
 result = pipe("తెలుగు భాష", max_new_tokens=50, do_sample=True, temperature=0.8)
 print(result[0]["generated_text"])
 ```
-
+{"" if is_sp else '''
 > **Note**: `trust_remote_code=True` is required for the custom tokenizer that handles `@@` morpheme joining. Without it, `@@` markers will appear in the output.
-
+'''}
 ### Manual loading
 
 ```python
@@ -734,11 +801,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
 model = AutoModelForCausalLM.from_pretrained("dvitvaai/{model_name}")
-tokenizer = AutoTokenizer.from_pretrained("dvitvaai/{model_name}", trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained("dvitvaai/{model_name}"{"" if is_sp else ", trust_remote_code=True"})
 
-# Input must be Morfessor-segmented (with @@ continuation markers)
-segmented_text = "తెలుగు భాష చాలా అందమైన@@ ది"
-inputs = tokenizer(segmented_text, return_tensors="pt")
+text = "తెలుగు భాష చాలా అందమైనది"
+inputs = tokenizer(text, return_tensors="pt")
 
 with torch.no_grad():
     outputs = model.generate(
@@ -754,59 +820,36 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 
 ## Tokenizer
 
-This model uses a **Morfessor + BPE hybrid tokenizer** designed for Telugu:
+{"This model uses a **SentencePiece Unigram** tokenizer with a 48K vocabulary, trained directly on Telugu text." if is_sp else "This model uses a **Morfessor + BPE hybrid tokenizer** designed for Telugu."}
 
-- **Telugu text**: Segmented into morphemes using [Morfessor](https://github.com/aalto-speech/morfessor) with `@@` continuation markers
-- **Non-Telugu text** (English, numbers, URLs): Handled by BPE subword encoding
-- **Fallback**: Character-level encoding for out-of-vocabulary tokens
-
+{"- Handles raw Telugu text directly (no preprocessing needed)" if is_sp else "- **Telugu text**: Segmented into morphemes using Morfessor with `@@` continuation markers"}
+{"- Byte-fallback for out-of-vocabulary characters" if is_sp else "- **Non-Telugu text** (English, numbers, URLs): Handled by BPE subword encoding"}
+{"- Split digits for better number handling" if is_sp else "- **Fallback**: Character-level encoding for out-of-vocabulary tokens"}
+{"- NFKC normalization" if is_sp else ""}
+{"" if is_sp else """
 **Important**: The tokenizer expects **pre-segmented** input (with `@@` markers). For raw Telugu text, you need to run Morfessor segmentation first.
+"""}
+## Architecture
 
-### Full pipeline (raw Telugu text)
-
-For raw Telugu text, segment with Morfessor first:
-
-```python
-import morfessor
-
-# Load Morfessor model
-io = morfessor.MorfessorIO()
-morf_model = io.read_binary_model_file("morfessor_telugu.bin")
-
-def segment_telugu(text, separator="@@"):
-    import re
-    TELUGU_RE = re.compile(r"[\\u0C00-\\u0C7F]+")
-    tokens = []
-    for word in text.split():
-        if TELUGU_RE.fullmatch(word):
-            segments = morf_model.viterbi_segment(word)[0]
-            for i, seg in enumerate(segments):
-                tokens.append(seg + separator if i < len(segments) - 1 else seg)
-        else:
-            tokens.append(word)
-    return " ".join(tokens)
-
-# Segment, then tokenize and generate
-raw_text = "తెలుగు భాష చాలా అందమైనది"
-segmented = segment_telugu(raw_text)
-inputs = tokenizer(segmented, return_tensors="pt")
-outputs = model.generate(**inputs, max_new_tokens=100, do_sample=True)
-print(tokenizer.decode(outputs[0], skip_special_tokens=True))
-```
+Key features:
+- **Grouped Query Attention (GQA)**: {n_heads} query heads, {n_kv_heads} KV heads — 4x KV cache reduction
+- **Block-wise Weight Sharing**: {n_layers} HF layers mapped from {n_layers // 2} unique blocks (each used twice), following MobileLLM-LS
+- **SwiGLU MLP** with {intermediate} intermediate size
+- **RoPE** positional encoding (theta={config.get("rope_theta", 10000.0)})
+- **RMSNorm** (no bias in any linear layer)
 
 ## Training
 
 - **Data**: Telugu text corpus (Sangraha dataset)
-- **Preprocessing**: Morfessor morpheme segmentation + BPE for non-Telugu
+- **Preprocessing**: {"SentencePiece tokenization (raw text)" if is_sp else "Morfessor morpheme segmentation + BPE for non-Telugu"}
 - **Optimizer**: AdamW (lr=3e-4, weight_decay=0.1, beta1=0.9, beta2=0.95)
-- **Schedule**: Cosine LR decay with 500-step warmup
+- **Schedule**: WSD (Warmup-Stable-Decay)
 - **Precision**: bf16 mixed precision
-- **Hardware**: Single GPU
+- **Hardware**: Single NVIDIA B200 GPU
 
 ## Limitations
 
 - This is a **base model** (not instruction-tuned) — it performs text completion, not instruction following
-- The tokenizer requires **Morfessor-segmented input** for best results
 - Trained primarily on Telugu text; limited multilingual capability
 - Small model size ({param_str}) limits reasoning and knowledge capacity
 
@@ -1101,7 +1144,7 @@ Apache 2.0
 # ===========================================================================
 # Verification
 # ===========================================================================
-def verify_conversion(output_dir: Path, checkpoint: dict, tokenizer_dir: Path):
+def verify_conversion(output_dir: Path, checkpoint: dict, tokenizer_dir: Path, is_sp: bool = False):
     """Verify the converted model loads correctly with HuggingFace."""
     import torch
 
@@ -1140,53 +1183,62 @@ def verify_conversion(output_dir: Path, checkpoint: dict, tokenizer_dir: Path):
         logger.error("[FAIL] Tokenizer loading failed: %s", e)
         return False
 
-    # 3. Compare tokenization (on pre-segmented text)
-    # NOTE: We only test with tokens that are whole vocab entries (direct lookup).
-    # Our custom tokenizer has char-level/BPE fallback for OOV tokens, which
-    # HF's WordLevel model can't replicate (it returns <unk> instead).
-    # This is expected — for real usage, encode with our tokenizer and use
-    # HF only for model inference and decoding.
-    sys.path.insert(0, str(Path(__file__).parent))
-    from train_tokenizer import MorfessorTokenizer
-    try:
-        our_tokenizer = MorfessorTokenizer(tokenizer_dir)
+    # 3. Compare tokenization
+    if is_sp:
+        # For SentencePiece, just do a basic encode/decode round-trip
+        try:
+            test_text = "తెలుగు భాష చాలా అందమైనది"
+            ids = hf_tokenizer.encode(test_text)
+            decoded = hf_tokenizer.decode(ids, skip_special_tokens=True)
+            logger.info("[PASS] SP tokenization round-trip: '%s' → %d tokens → '%s'",
+                        test_text, len(ids), decoded[:50])
+        except Exception as e:
+            logger.warning("[WARN] SP tokenization test failed: %s", e)
+    else:
+        # Morfessor: compare our tokenizer vs HF WordLevel
+        # NOTE: We only test with tokens that are whole vocab entries (direct lookup).
+        # Our custom tokenizer has char-level/BPE fallback for OOV tokens, which
+        # HF's WordLevel model can't replicate (it returns <unk> instead).
+        sys.path.insert(0, str(Path(__file__).parent))
+        from train_tokenizer import MorfessorTokenizer
+        try:
+            our_tokenizer = MorfessorTokenizer(tokenizer_dir)
 
-        # Build test texts using tokens that are actually in the vocab
-        # Pick a few high-frequency tokens we know exist
-        test_tokens = []
-        for token, tid in list(our_tokenizer.token_to_id.items())[10:20]:
-            if token and not token.startswith("<"):
-                test_tokens.append(token)
-        if len(test_tokens) >= 4:
-            test_texts = [
-                " ".join(test_tokens[:2]),
-                " ".join(test_tokens[2:4]),
-            ]
-        else:
-            test_texts = ["తెలుగు భాష"]
-
-        all_match = True
-        for text in test_texts:
-            our_ids = our_tokenizer.encode(text, add_bos=True, add_eos=False)
-            hf_ids = hf_tokenizer.encode(text, add_special_tokens=True)
-
-            if our_ids == hf_ids:
-                logger.info("[PASS] Tokenization matches for: '%s'", text[:40])
+            # Build test texts using tokens that are actually in the vocab
+            test_tokens = []
+            for token, tid in list(our_tokenizer.token_to_id.items())[10:20]:
+                if token and not token.startswith("<"):
+                    test_tokens.append(token)
+            if len(test_tokens) >= 4:
+                test_texts = [
+                    " ".join(test_tokens[:2]),
+                    " ".join(test_tokens[2:4]),
+                ]
             else:
-                logger.warning("[WARN] Tokenization mismatch for: '%s'", text[:40])
-                logger.warning("  Ours: %s", our_ids[:15])
-                logger.warning("  HF:   %s", hf_ids[:15])
-                all_match = False
+                test_texts = ["తెలుగు భాష"]
 
-        if all_match:
-            logger.info("[PASS] All tokenization tests match")
+            all_match = True
+            for text in test_texts:
+                our_ids = our_tokenizer.encode(text, add_bos=True, add_eos=False)
+                hf_ids = hf_tokenizer.encode(text, add_special_tokens=True)
 
-        logger.info("[INFO] Note: HF WordLevel tokenizer returns <unk> for OOV tokens.")
-        logger.info("       Our tokenizer has char/BPE fallback for those cases.")
-        logger.info("       For best results, encode with our tokenizer, decode with HF.")
+                if our_ids == hf_ids:
+                    logger.info("[PASS] Tokenization matches for: '%s'", text[:40])
+                else:
+                    logger.warning("[WARN] Tokenization mismatch for: '%s'", text[:40])
+                    logger.warning("  Ours: %s", our_ids[:15])
+                    logger.warning("  HF:   %s", hf_ids[:15])
+                    all_match = False
 
-    except Exception as e:
-        logger.warning("[WARN] Could not compare tokenization: %s", e)
+            if all_match:
+                logger.info("[PASS] All tokenization tests match")
+
+            logger.info("[INFO] Note: HF WordLevel tokenizer returns <unk> for OOV tokens.")
+            logger.info("       Our tokenizer has char/BPE fallback for those cases.")
+            logger.info("       For best results, encode with our tokenizer, decode with HF.")
+
+        except Exception as e:
+            logger.warning("[WARN] Could not compare tokenization: %s", e)
 
     # 4. Compare model outputs (logits)
     try:
@@ -1302,9 +1354,15 @@ Examples:
         logger.error("Checkpoint not found: %s", checkpoint_path)
         sys.exit(1)
 
+    # Detect tokenizer type: SentencePiece or Morfessor
+    sp_model_path = tokenizer_dir / "sp_telugu.model" if tokenizer_dir.is_dir() else None
     tok_json = tokenizer_dir / "tokenizer.json" if tokenizer_dir.is_dir() else tokenizer_dir
-    if not tok_json.exists():
-        logger.error("Tokenizer not found: %s", tok_json)
+    is_sp_tokenizer = sp_model_path is not None and sp_model_path.exists()
+
+    if not is_sp_tokenizer and not tok_json.exists():
+        logger.error("Tokenizer not found. Expected either:")
+        logger.error("  - %s (SentencePiece)", tokenizer_dir / "sp_telugu.model")
+        logger.error("  - %s (Morfessor)", tok_json)
         sys.exit(1)
 
     # Create output directory
@@ -1335,11 +1393,15 @@ Examples:
     else:
         logger.info("Detected base (pretrained) checkpoint")
 
-    # Part 1: Convert tokenizer FIRST — may add extra vocab entries for BPE merge intermediates
+    # Part 1: Convert tokenizer
     logger.info("")
-    logger.info("--- Part 1: Converting tokenizer ---")
-    hf_vocab_size = convert_tokenizer(tokenizer_dir, output_dir, original_vocab_size,
-                                       is_sft=is_sft, sft_special_tokens=sft_special_tokens)
+    if is_sp_tokenizer:
+        logger.info("--- Part 1: Converting SentencePiece tokenizer ---")
+        hf_vocab_size = convert_tokenizer_sp(tokenizer_dir, output_dir, original_vocab_size)
+    else:
+        logger.info("--- Part 1: Converting Morfessor tokenizer ---")
+        hf_vocab_size = convert_tokenizer(tokenizer_dir, output_dir, original_vocab_size,
+                                           is_sft=is_sft, sft_special_tokens=sft_special_tokens)
 
     # Part 2: config.json — use the (possibly expanded) HF vocab size
     logger.info("")
@@ -1356,10 +1418,11 @@ Examples:
     hf_state_dict = convert_weights(checkpoint, config, output_dir,
                                      original_vocab_size=original_vocab_size)
 
-    # Part 3b: Custom tokenizer class
-    logger.info("")
-    logger.info("--- Part 3b: Creating tokenizer_class.py ---")
-    create_tokenizer_class(output_dir, is_sft=is_sft)
+    # Part 3b: Custom tokenizer class (Morfessor only — SP uses native HF decode)
+    if not is_sp_tokenizer:
+        logger.info("")
+        logger.info("--- Part 3b: Creating tokenizer_class.py ---")
+        create_tokenizer_class(output_dir, is_sft=is_sft)
 
     # Part 4: generation_config.json
     logger.info("")
@@ -1373,7 +1436,7 @@ Examples:
     if is_sft:
         create_sft_model_card(config, output_dir, sft_special_tokens, checkpoint)
     else:
-        create_model_card(config, output_dir)
+        create_model_card(config, output_dir, is_sp=is_sp_tokenizer)
 
     # Copy Morfessor model if provided
     if args.morfessor_model:
@@ -1403,7 +1466,7 @@ Examples:
     if not args.no_verify:
         logger.info("")
         logger.info("--- Verification ---")
-        verify_conversion(output_dir, checkpoint, tokenizer_dir)
+        verify_conversion(output_dir, checkpoint, tokenizer_dir, is_sp=is_sp_tokenizer)
     else:
         logger.info("")
         logger.info("Skipping verification (--no-verify)")
