@@ -738,6 +738,35 @@ def create_model_card(config: dict, output_dir: Path, is_sp: bool = False):
     model_name = "pothana-base-300M"
     tok_tag = "sentencepiece" if is_sp else "morfessor"
     tok_desc = "SentencePiece Unigram (48K)" if is_sp else "Morfessor + BPE (Telugu morpheme-aware)"
+    trust_remote = "" if is_sp else ", trust_remote_code=True"
+    rope_theta = config.get("rope_theta", 10000.0)
+
+    # Build conditional sections outside f-string to avoid nested quote issues
+    if is_sp:
+        trust_note = ""
+        tok_section = (
+            "This model uses a **SentencePiece Unigram** tokenizer with a 48K vocabulary, "
+            "trained directly on Telugu text.\n\n"
+            "- Handles raw Telugu text directly (no preprocessing needed)\n"
+            "- Byte-fallback for out-of-vocabulary characters\n"
+            "- Split digits for better number handling\n"
+            "- NFKC normalization"
+        )
+        preproc = "SentencePiece tokenization (raw text)"
+    else:
+        trust_note = (
+            "\n> **Note**: `trust_remote_code=True` is required for the custom tokenizer "
+            "that handles `@@` morpheme joining. Without it, `@@` markers will appear in the output.\n"
+        )
+        tok_section = (
+            "This model uses a **Morfessor + BPE hybrid tokenizer** designed for Telugu.\n\n"
+            "- **Telugu text**: Segmented into morphemes using Morfessor with `@@` continuation markers\n"
+            "- **Non-Telugu text** (English, numbers, URLs): Handled by BPE subword encoding\n"
+            "- **Fallback**: Character-level encoding for out-of-vocabulary tokens\n\n"
+            "**Important**: The tokenizer expects **pre-segmented** input (with `@@` markers). "
+            "For raw Telugu text, you need to run Morfessor segmentation first."
+        )
+        preproc = "Morfessor morpheme segmentation + BPE for non-Telugu"
 
     card = f"""---
 language:
@@ -787,13 +816,11 @@ Developed by **[Dvitva AI](https://dvitva.ai)**.
 ```python
 from transformers import pipeline
 
-pipe = pipeline("text-generation", model="dvitvaai/{model_name}"{"" if is_sp else ", trust_remote_code=True"})
+pipe = pipeline("text-generation", model="dvitvaai/{model_name}"{trust_remote})
 result = pipe("తెలుగు భాష", max_new_tokens=50, do_sample=True, temperature=0.8)
 print(result[0]["generated_text"])
 ```
-{"" if is_sp else '''
-> **Note**: `trust_remote_code=True` is required for the custom tokenizer that handles `@@` morpheme joining. Without it, `@@` markers will appear in the output.
-'''}
+{trust_note}
 ### Manual loading
 
 ```python
@@ -801,7 +828,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
 model = AutoModelForCausalLM.from_pretrained("dvitvaai/{model_name}")
-tokenizer = AutoTokenizer.from_pretrained("dvitvaai/{model_name}"{"" if is_sp else ", trust_remote_code=True"})
+tokenizer = AutoTokenizer.from_pretrained("dvitvaai/{model_name}"{trust_remote})
 
 text = "తెలుగు భాష చాలా అందమైనది"
 inputs = tokenizer(text, return_tensors="pt")
@@ -820,28 +847,21 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 
 ## Tokenizer
 
-{"This model uses a **SentencePiece Unigram** tokenizer with a 48K vocabulary, trained directly on Telugu text." if is_sp else "This model uses a **Morfessor + BPE hybrid tokenizer** designed for Telugu."}
+{tok_section}
 
-{"- Handles raw Telugu text directly (no preprocessing needed)" if is_sp else "- **Telugu text**: Segmented into morphemes using Morfessor with `@@` continuation markers"}
-{"- Byte-fallback for out-of-vocabulary characters" if is_sp else "- **Non-Telugu text** (English, numbers, URLs): Handled by BPE subword encoding"}
-{"- Split digits for better number handling" if is_sp else "- **Fallback**: Character-level encoding for out-of-vocabulary tokens"}
-{"- NFKC normalization" if is_sp else ""}
-{"" if is_sp else """
-**Important**: The tokenizer expects **pre-segmented** input (with `@@` markers). For raw Telugu text, you need to run Morfessor segmentation first.
-"""}
 ## Architecture
 
 Key features:
 - **Grouped Query Attention (GQA)**: {n_heads} query heads, {n_kv_heads} KV heads — 4x KV cache reduction
 - **Block-wise Weight Sharing**: {n_layers} HF layers mapped from {n_layers // 2} unique blocks (each used twice), following MobileLLM-LS
 - **SwiGLU MLP** with {intermediate} intermediate size
-- **RoPE** positional encoding (theta={config.get("rope_theta", 10000.0)})
+- **RoPE** positional encoding (theta={rope_theta})
 - **RMSNorm** (no bias in any linear layer)
 
 ## Training
 
 - **Data**: Telugu text corpus (Sangraha dataset)
-- **Preprocessing**: {"SentencePiece tokenization (raw text)" if is_sp else "Morfessor morpheme segmentation + BPE for non-Telugu"}
+- **Preprocessing**: {preproc}
 - **Optimizer**: AdamW (lr=3e-4, weight_decay=0.1, beta1=0.9, beta2=0.95)
 - **Schedule**: WSD (Warmup-Stable-Decay)
 - **Precision**: bf16 mixed precision
