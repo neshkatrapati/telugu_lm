@@ -10,33 +10,30 @@ This normalizes away vocabulary size and tokenization granularity differences,
 making it fair to compare a 32K Morfessor model against a 48K SentencePiece model.
 
 Usage:
-    # Compare two HuggingFace models on a Telugu text file
-    python eval_bpc.py \\
-        --model-a dvitvaai/pothana-v1-morfessor \\
-        --model-b dvitvaai/pothana-base-300M \\
+    # Compare Morfessor vs SentencePiece model
+    python eval_bpc.py \
+        --model-a dvitvaai/pothana-v1 --label-a "Morfessor v1" \
+            --preprocess-a morfessor --morfessor-model ./data/morfessor/morfessor_telugu.bin \
+        --model-b dvitvaai/pothana-base-300M --label-b "SP v2" \
         --eval-text eval_corpus.txt
 
-    # With labels for cleaner output
-    python eval_bpc.py \\
-        --model-a dvitvaai/pothana-v1-morfessor --label-a "Morfessor v1" \\
-        --model-b dvitvaai/pothana-base-300M    --label-b "SP v2" \\
+    # Single SP model (no preprocessing needed)
+    python eval_bpc.py \
+        --model-a dvitvaai/pothana-base-300M \
         --eval-text eval_corpus.txt
 
-    # Use a parquet file instead
-    python eval_bpc.py \\
-        --model-a dvitvaai/pothana-v1-morfessor \\
-        --model-b dvitvaai/pothana-base-300M \\
+    # Use a parquet file
+    python eval_bpc.py \
+        --model-a dvitvaai/pothana-v1 --preprocess-a morfessor \
+            --morfessor-model ./data/morfessor/morfessor_telugu.bin \
+        --model-b dvitvaai/pothana-base-300M \
         --eval-parquet data.parquet --text-column text --max-samples 500
-
-    # Single model eval
-    python eval_bpc.py \\
-        --model-a dvitvaai/pothana-base-300M \\
-        --eval-text eval_corpus.txt
 """
 
 import argparse
 import logging
 import math
+import re
 import sys
 import time
 from pathlib import Path
@@ -53,7 +50,73 @@ logger = logging.getLogger(__name__)
 
 LOG2_E = math.log2(math.e)  # ≈ 1.4427
 
+# Telugu Unicode range
+TELUGU_WORD_RE = re.compile(r"[\u0C00-\u0C7F]+")
 
+
+# ===========================================================================
+# Morfessor Preprocessing
+# ===========================================================================
+def load_morfessor_model(model_path):
+    """Load a Morfessor model from .bin file."""
+    import morfessor
+    io = morfessor.MorfessorIO()
+    model = io.read_binary_model_file(str(model_path))
+    logger.info("Loaded Morfessor model: %s", model_path)
+    return model
+
+
+def segment_text_morfessor(text, morf_model, separator="@@"):
+    """Segment raw text using Morfessor with @@ continuation markers.
+
+    Telugu words are split into morphemes with @@ joining markers.
+    Non-Telugu tokens (English, numbers, punctuation) pass through unchanged.
+
+    Example: "అందమైనది" → "అందమైన@@ ది"
+    """
+    tokens = text.split()
+    seg_tokens = []
+
+    for token in tokens:
+        if TELUGU_WORD_RE.fullmatch(token):
+            # Pure Telugu word — segment with Morfessor
+            segments = morf_model.viterbi_segment(token)[0]
+            for i, seg in enumerate(segments):
+                if i < len(segments) - 1:
+                    seg_tokens.append(seg + separator)
+                else:
+                    seg_tokens.append(seg)
+        elif TELUGU_WORD_RE.search(token):
+            # Mixed token (Telugu + non-Telugu) — split and segment Telugu parts
+            parts = re.split(r"([\u0C00-\u0C7F]+)", token)
+            parts = [p for p in parts if p]
+            for part_idx, part in enumerate(parts):
+                is_last_part = (part_idx == len(parts) - 1)
+                if TELUGU_WORD_RE.fullmatch(part):
+                    segments = morf_model.viterbi_segment(part)[0]
+                    for i, seg in enumerate(segments):
+                        if i < len(segments) - 1:
+                            seg_tokens.append(seg + separator)
+                        else:
+                            if not is_last_part:
+                                seg_tokens.append(seg + separator)
+                            else:
+                                seg_tokens.append(seg)
+                else:
+                    if not is_last_part:
+                        seg_tokens.append(part + separator)
+                    else:
+                        seg_tokens.append(part)
+        else:
+            # Non-Telugu token — pass through
+            seg_tokens.append(token)
+
+    return " ".join(seg_tokens)
+
+
+# ===========================================================================
+# Data Loading
+# ===========================================================================
 def load_eval_texts(args):
     """Load evaluation texts from file or parquet. Returns list of strings."""
     texts = []
@@ -112,16 +175,24 @@ def load_eval_texts(args):
     return texts
 
 
-def compute_bpc(model_id, texts, device, max_length, batch_size, label=None):
+# ===========================================================================
+# BPC Computation
+# ===========================================================================
+def compute_bpc(model_id, texts, device, max_length, label=None,
+                preprocess=None, morf_model=None):
     """Compute BPC for a single model over the given texts.
 
     For each text:
-      1. Tokenize with the model's tokenizer
-      2. Slide a window of max_length tokens, computing NLL at each position
-      3. Sum up total NLL (in nats) across all tokens
-      4. Count raw characters in the original text
+      1. Optionally preprocess (e.g., Morfessor segmentation)
+      2. Tokenize with the model's tokenizer
+      3. Slide a window of max_length tokens, computing NLL at each position
+      4. Sum up total NLL (in nats) across all tokens
+      5. Count raw characters in the ORIGINAL text (before preprocessing)
 
     BPC = (total_nll_nats × log₂(e)) / total_characters
+
+    The character count always uses the original raw text, ensuring fair
+    comparison even when preprocessing changes the text representation.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -130,6 +201,11 @@ def compute_bpc(model_id, texts, device, max_length, batch_size, label=None):
     logger.info("=" * 60)
     logger.info("Evaluating: %s", name)
     logger.info("=" * 60)
+
+    if preprocess == "morfessor":
+        logger.info("Preprocessing: Morfessor segmentation (raw text → @@ morphemes)")
+    else:
+        logger.info("Preprocessing: none (raw text)")
 
     # Load model and tokenizer
     t0 = time.time()
@@ -149,23 +225,37 @@ def compute_bpc(model_id, texts, device, max_length, batch_size, label=None):
     total_nll_nats = 0.0
     total_tokens = 0
     total_chars = 0
+    total_unk = 0
     n_texts = 0
 
     t0 = time.time()
 
-    for i, text in enumerate(texts):
-        n_chars = len(text)
+    # Get unk token id for tracking
+    unk_id = tokenizer.unk_token_id
+
+    for i, raw_text in enumerate(texts):
+        n_chars = len(raw_text)
         if n_chars == 0:
             continue
 
+        # Preprocess if needed — but ALWAYS count chars from raw_text
+        if preprocess == "morfessor" and morf_model is not None:
+            model_input = segment_text_morfessor(raw_text, morf_model)
+        else:
+            model_input = raw_text
+
         # Tokenize — let the tokenizer handle BOS/EOS
-        encoding = tokenizer(text, return_tensors="pt", truncation=False,
+        encoding = tokenizer(model_input, return_tensors="pt", truncation=False,
                              add_special_tokens=True)
         input_ids = encoding["input_ids"][0]  # (seq_len,)
         seq_len = input_ids.size(0)
 
         if seq_len < 2:
             continue  # need at least 2 tokens for 1 prediction
+
+        # Track UNK tokens
+        if unk_id is not None:
+            total_unk += (input_ids == unk_id).sum().item()
 
         # Sliding window for sequences longer than max_length
         # Accumulate NLL for every token position (except the first)
@@ -180,14 +270,8 @@ def compute_bpc(model_id, texts, device, max_length, batch_size, label=None):
             # Target: shift by 1
             target_ids = chunk_ids.clone()
             # Mask out tokens in the overlap region that were already scored
-            # Only score tokens from max(1, begin) onward relative to chunk start
             if begin > 0:
-                overlap = begin + max_length - end  # how many tokens overlap
-                # Actually simpler: in the overlap region, mask targets
-                # so we don't double-count
-                n_already_scored = stride  # tokens before the new stride portion
-                # But first chunk starts scoring from position 1
-                # Subsequent chunks: only score the stride portion at the end
+                # Subsequent chunks: only score the new stride portion at the end
                 target_ids[0, :max(0, end - begin - stride)] = -100
             else:
                 # First chunk: don't score position 0 (no context for it)
@@ -225,10 +309,12 @@ def compute_bpc(model_id, texts, device, max_length, batch_size, label=None):
     avg_nll = total_nll_nats / total_tokens if total_tokens > 0 else float("inf")
     ppl = math.exp(avg_nll) if avg_nll < 20 else float("inf")  # avoid overflow
     tok_per_char = total_tokens / total_chars if total_chars > 0 else 0
+    unk_rate = total_unk / total_tokens if total_tokens > 0 else 0
 
     results = {
         "model": model_id,
         "label": name,
+        "preprocess": preprocess or "none",
         "bpc": bpc,
         "perplexity": ppl,
         "avg_nll_nats": avg_nll,
@@ -236,6 +322,8 @@ def compute_bpc(model_id, texts, device, max_length, batch_size, label=None):
         "total_tokens": total_tokens,
         "total_chars": total_chars,
         "tokens_per_char": tok_per_char,
+        "unk_tokens": total_unk,
+        "unk_rate": unk_rate,
         "n_texts": n_texts,
         "eval_time_s": eval_time,
         "vocab_size": tokenizer.vocab_size,
@@ -247,10 +335,14 @@ def compute_bpc(model_id, texts, device, max_length, batch_size, label=None):
     logger.info("  Perplexity:       %.2f", ppl)
     logger.info("  Avg NLL (nats):   %.4f", avg_nll)
     logger.info("  Tokens/char:      %.3f", tok_per_char)
+    logger.info("  UNK tokens:       %d (%.2f%%)", total_unk, unk_rate * 100)
     logger.info("  Total tokens:     %d", total_tokens)
     logger.info("  Total chars:      %d", total_chars)
     logger.info("  Texts evaluated:  %d", n_texts)
     logger.info("  Eval time:        %.1fs", eval_time)
+
+    if unk_rate > 0.05:
+        logger.warning("  ⚠ High UNK rate (%.1f%%) — BPC may be unreliable!", unk_rate * 100)
 
     # Free GPU memory
     del model
@@ -259,6 +351,9 @@ def compute_bpc(model_id, texts, device, max_length, batch_size, label=None):
     return results
 
 
+# ===========================================================================
+# Comparison
+# ===========================================================================
 def print_comparison(results_a, results_b):
     """Print a side-by-side comparison table."""
     a = results_a
@@ -285,44 +380,78 @@ def print_comparison(results_a, results_b):
     row("Perplexity", a["perplexity"], b["perplexity"], fmt=".2f")
     row("Avg NLL (nats)", a["avg_nll_nats"], b["avg_nll_nats"])
     row("Tokens/char", a["tokens_per_char"], b["tokens_per_char"], fmt=".3f")
+    row("UNK rate (%)", a["unk_rate"] * 100, b["unk_rate"] * 100, fmt=".2f")
     row("Vocab size", a["vocab_size"], b["vocab_size"], fmt="d", lower_better=False)
 
     logger.info("")
+
+    # Warn if either model has high UNK rate
+    for r in [a, b]:
+        if r["unk_rate"] > 0.05:
+            logger.warning("⚠ %s has %.1f%% UNK rate — its BPC may be unreliable!",
+                          r["label"], r["unk_rate"] * 100)
+
     bpc_diff = b["bpc"] - a["bpc"]
     pct = (bpc_diff / a["bpc"]) * 100 if a["bpc"] > 0 else 0
     if abs(bpc_diff) < 0.001:
         logger.info("Models are virtually identical in BPC.")
     else:
         winner = a["label"] if bpc_diff > 0 else b["label"]
-        logger.info("%s is better by %.4f BPC (%.1f%% relative improvement)", winner, abs(bpc_diff), abs(pct))
+        logger.info("%s is better by %.4f BPC (%.1f%% relative improvement)",
+                    winner, abs(bpc_diff), abs(pct))
 
 
+# ===========================================================================
+# Main
+# ===========================================================================
 def main():
     parser = argparse.ArgumentParser(
         description="Compare language models using Bits-Per-Character (BPC)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Compare two models
+  # Compare Morfessor vs SP model
   python eval_bpc.py \\
       --model-a dvitvaai/pothana-v1 --label-a "Morfessor v1" \\
+          --preprocess-a morfessor --morfessor-model ./morfessor_telugu.bin \\
       --model-b dvitvaai/pothana-base-300M --label-b "SP v2" \\
       --eval-text eval_corpus.txt
 
-  # Single model
+  # Single SP model (no preprocessing)
   python eval_bpc.py --model-a dvitvaai/pothana-base-300M --eval-text eval.txt
+
+  # Both models need Morfessor
+  python eval_bpc.py \\
+      --model-a ./old_model --preprocess-a morfessor \\
+      --model-b ./new_model --preprocess-b morfessor \\
+      --morfessor-model ./morfessor_telugu.bin \\
+      --eval-text eval_corpus.txt
         """,
     )
 
     # Models
-    parser.add_argument("--model-a", type=str, required=True, help="HF model ID or local path (model A)")
-    parser.add_argument("--model-b", type=str, default=None, help="HF model ID or local path (model B, optional)")
-    parser.add_argument("--label-a", type=str, default=None, help="Display label for model A")
-    parser.add_argument("--label-b", type=str, default=None, help="Display label for model B")
+    parser.add_argument("--model-a", type=str, required=True,
+                        help="HF model ID or local path (model A)")
+    parser.add_argument("--model-b", type=str, default=None,
+                        help="HF model ID or local path (model B, optional)")
+    parser.add_argument("--label-a", type=str, default=None,
+                        help="Display label for model A")
+    parser.add_argument("--label-b", type=str, default=None,
+                        help="Display label for model B")
+
+    # Preprocessing
+    parser.add_argument("--preprocess-a", type=str, default="none",
+                        choices=["none", "morfessor"],
+                        help="Preprocessing for model A (default: none)")
+    parser.add_argument("--preprocess-b", type=str, default="none",
+                        choices=["none", "morfessor"],
+                        help="Preprocessing for model B (default: none)")
+    parser.add_argument("--morfessor-model", type=str, default=None,
+                        help="Path to morfessor_telugu.bin (required if --preprocess-X morfessor)")
 
     # Data
     parser.add_argument("--eval-text", type=str, default=None,
-                        help="Path to evaluation text file (one document/paragraph per line)")
+                        help="Path to eval text file (one document/paragraph per line)")
     parser.add_argument("--eval-parquet", type=str, default=None,
                         help="Path to parquet file for evaluation")
     parser.add_argument("--text-column", type=str, default="text",
@@ -342,6 +471,18 @@ Examples:
 
     args = parser.parse_args()
 
+    # Validate Morfessor model path
+    needs_morfessor = args.preprocess_a == "morfessor" or args.preprocess_b == "morfessor"
+    morf_model = None
+    if needs_morfessor:
+        if not args.morfessor_model:
+            parser.error("--morfessor-model is required when using --preprocess-X morfessor")
+        morf_path = Path(args.morfessor_model)
+        if not morf_path.exists():
+            logger.error("Morfessor model not found: %s", morf_path)
+            sys.exit(1)
+        morf_model = load_morfessor_model(morf_path)
+
     # Device
     if args.device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -357,16 +498,20 @@ Examples:
 
     # Evaluate model A
     results_a = compute_bpc(
-        args.model_a, texts, device, args.max_length, batch_size=1,
+        args.model_a, texts, device, args.max_length,
         label=args.label_a,
+        preprocess=args.preprocess_a if args.preprocess_a != "none" else None,
+        morf_model=morf_model,
     )
 
     # Evaluate model B (if provided)
     results_b = None
     if args.model_b:
         results_b = compute_bpc(
-            args.model_b, texts, device, args.max_length, batch_size=1,
+            args.model_b, texts, device, args.max_length,
             label=args.label_b,
+            preprocess=args.preprocess_b if args.preprocess_b != "none" else None,
+            morf_model=morf_model,
         )
 
     # Comparison
