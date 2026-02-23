@@ -271,20 +271,32 @@ def convert_weights(checkpoint: dict, config: dict, output_dir: Path,
     )
 
     # Transformer layers
+    # Track which unique layers we've already mapped. When weight sharing
+    # causes the same source layer to appear twice, we .clone() the second
+    # copy so safetensors doesn't see shared memory.
+    _seen_unique_layers = set()
+
     for hf_i, ours_i in enumerate(hf_to_ours):
         prefix_ours = f"transformer.h.{ours_i}"
         prefix_hf = f"model.layers.{hf_i}"
+        need_clone = ours_i in _seen_unique_layers
+        _seen_unique_layers.add(ours_i)
+
+        def _get(key):
+            """Get tensor, cloning if this is a weight-shared duplicate."""
+            t = state_dict[key]
+            return t.clone() if need_clone else t
 
         # Input LayerNorm (RMSNorm)
         hf_state_dict[f"{prefix_hf}.input_layernorm.weight"] = (
-            state_dict[f"{prefix_ours}.ln_1.weight"]
+            _get(f"{prefix_ours}.ln_1.weight")
         )
 
         if has_separate_qkv:
             # New format: separate projections (GQA-aware)
-            q_proj = state_dict[f"{prefix_ours}.attn.q_proj.weight"]
-            k_proj = state_dict[f"{prefix_ours}.attn.k_proj.weight"]
-            v_proj = state_dict[f"{prefix_ours}.attn.v_proj.weight"]
+            q_proj = _get(f"{prefix_ours}.attn.q_proj.weight")
+            k_proj = _get(f"{prefix_ours}.attn.k_proj.weight")
+            v_proj = _get(f"{prefix_ours}.attn.v_proj.weight")
 
             # Permute Q and K for RoPE convention:
             # Our model: interleaved complex pairs [(d0,d1), (d2,d3), ...]
@@ -293,7 +305,7 @@ def convert_weights(checkpoint: dict, config: dict, output_dir: Path,
             k_proj = _interleaved_to_half_rotation(k_proj, n_kv_heads, dim=0)
         else:
             # Old format: fused c_attn (full MHA, n_kv_heads == n_heads)
-            c_attn_weight = state_dict[f"{prefix_ours}.attn.c_attn.weight"]
+            c_attn_weight = _get(f"{prefix_ours}.attn.c_attn.weight")
             assert c_attn_weight.shape[0] == 3 * n_embd, (
                 f"Expected c_attn shape ({3*n_embd}, {n_embd}), got {c_attn_weight.shape}"
             )
@@ -308,23 +320,23 @@ def convert_weights(checkpoint: dict, config: dict, output_dir: Path,
 
         # Output projection — no permutation needed.
         hf_state_dict[f"{prefix_hf}.self_attn.o_proj.weight"] = (
-            state_dict[f"{prefix_ours}.attn.c_proj.weight"]
+            _get(f"{prefix_ours}.attn.c_proj.weight")
         )
 
         # Post-attention LayerNorm (RMSNorm)
         hf_state_dict[f"{prefix_hf}.post_attention_layernorm.weight"] = (
-            state_dict[f"{prefix_ours}.ln_2.weight"]
+            _get(f"{prefix_ours}.ln_2.weight")
         )
 
         # SwiGLU MLP
         hf_state_dict[f"{prefix_hf}.mlp.gate_proj.weight"] = (
-            state_dict[f"{prefix_ours}.mlp.w_gate.weight"]
+            _get(f"{prefix_ours}.mlp.w_gate.weight")
         )
         hf_state_dict[f"{prefix_hf}.mlp.up_proj.weight"] = (
-            state_dict[f"{prefix_ours}.mlp.w_up.weight"]
+            _get(f"{prefix_ours}.mlp.w_up.weight")
         )
         hf_state_dict[f"{prefix_hf}.mlp.down_proj.weight"] = (
-            state_dict[f"{prefix_ours}.mlp.w_down.weight"]
+            _get(f"{prefix_ours}.mlp.w_down.weight")
         )
 
     # Final LayerNorm
