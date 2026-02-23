@@ -604,10 +604,14 @@ def convert_tokenizer_sp(tokenizer_dir: Path, output_dir: Path, vocab_size: int)
     shutil.copy2(str(sp_model_path), str(dest_model))
     logger.info("Copied %s → %s", sp_model_path.name, dest_model.name)
 
-    # 2. tokenizer_config.json — use LlamaTokenizer (native SP support)
+    # 2. tokenizer_config.json — use our custom TeluguSPTokenizer
+    #    which extends LlamaTokenizer to clean up ▁ markers in decode output.
     #    Our SP model uses custom token names: <bos>/<eos> not <s>/</s>
     tokenizer_config = {
         "tokenizer_class": "LlamaTokenizer",
+        "auto_map": {
+            "AutoTokenizer": ["tokenizer_class.TeluguSPTokenizer", "tokenizer_class.TeluguSPTokenizer"]
+        },
         "model_max_length": 2048,
         "bos_token": "<bos>",
         "eos_token": "<eos>",
@@ -692,6 +696,42 @@ class TeluguTokenizer(PreTrainedTokenizerFast):
     logger.info("Saved tokenizer_class.py (custom TeluguTokenizer)")
 
 
+def create_tokenizer_class_sp(output_dir: Path):
+    """Create a custom tokenizer class for SentencePiece that cleans ▁ markers.
+
+    LlamaTokenizer preserves SentencePiece's ▁ (U+2581) word boundary markers
+    in decode output. Our custom class extends LlamaTokenizer to:
+      - Replace ▁ with spaces
+      - Strip leading space
+      - Clean up extra whitespace
+    """
+    code = '''\
+"""Custom Telugu SentencePiece tokenizer with clean decode output."""
+from transformers import LlamaTokenizer
+
+
+class TeluguSPTokenizer(LlamaTokenizer):
+    """Telugu SentencePiece tokenizer that produces clean decoded text.
+
+    Extends LlamaTokenizer to clean up SentencePiece's ▁ (U+2581) word
+    boundary markers, producing natural text output.
+    """
+
+    def decode(self, token_ids, skip_special_tokens=False, **kwargs):
+        text = super().decode(token_ids, skip_special_tokens=skip_special_tokens, **kwargs)
+        # SentencePiece uses ▁ (U+2581) as word boundary marker
+        # Replace with space, then clean up
+        text = text.replace("\\u2581", " ")
+        # Clean up extra whitespace
+        text = " ".join(text.split())
+        return text
+'''
+    path = output_dir / "tokenizer_class.py"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(code)
+    logger.info("Saved tokenizer_class.py (custom TeluguSPTokenizer)")
+
+
 # ===========================================================================
 # Part 4: generation_config.json
 # ===========================================================================
@@ -726,36 +766,44 @@ def create_generation_config(output_dir: Path, is_sft: bool = False,
 # ===========================================================================
 # Part 5: Model card (README.md)
 # ===========================================================================
-def create_model_card(config: dict, output_dir: Path, is_sp: bool = False):
+def create_model_card(config: dict, output_dir: Path, is_sp: bool = False,
+                      n_unique_layers: int = None):
     """Create a HuggingFace model card (README.md)."""
 
     vocab_size = config["vocab_size"]
-    n_layers = config["num_hidden_layers"]
+    n_layers = config["num_hidden_layers"]  # HF layers (unrolled, e.g. 60)
     n_heads = config["num_attention_heads"]
     n_kv_heads = config.get("num_key_value_heads", n_heads)
     hidden = config["hidden_size"]
     intermediate = config["intermediate_size"]
     ctx_len = config["max_position_embeddings"]
 
-    # Rough param count (same formula as GPTConfig.param_count)
+    # Unique layer count for param counting (weight sharing doesn't add params)
+    if n_unique_layers is None:
+        n_unique_layers = n_layers
+
+    # Param count uses UNIQUE layers only
     emb = vocab_size * hidden
     head_dim = hidden // n_heads
     attn_per_layer = (n_heads + 2 * n_kv_heads) * head_dim * hidden + hidden ** 2
     mlp_per_layer = 3 * hidden * intermediate
-    tfm = n_layers * (attn_per_layer + mlp_per_layer)
-    norms = (2 * n_layers + 1) * hidden
+    tfm = n_unique_layers * (attn_per_layer + mlp_per_layer)
+    norms = (2 * n_unique_layers + 1) * hidden
     n_params = emb + tfm + norms
     param_str = f"{n_params / 1e6:.0f}M"
 
     model_name = "pothana-base-300M"
     tok_tag = "sentencepiece" if is_sp else "morfessor"
     tok_desc = "SentencePiece Unigram (48K)" if is_sp else "Morfessor + BPE (Telugu morpheme-aware)"
-    trust_remote = "" if is_sp else ", trust_remote_code=True"
+    trust_remote = ", trust_remote_code=True"
     rope_theta = config.get("rope_theta", 10000.0)
 
     # Build conditional sections outside f-string to avoid nested quote issues
     if is_sp:
-        trust_note = ""
+        trust_note = (
+            "\n> **Note**: `trust_remote_code=True` is required for the custom tokenizer "
+            "that cleans up SentencePiece word boundary markers for readable output.\n"
+        )
         tok_section = (
             "This model uses a **SentencePiece Unigram** tokenizer with a 48K vocabulary, "
             "trained directly on Telugu text.\n\n"
@@ -810,9 +858,9 @@ Developed by **[Dvitva AI](https://dvitva.ai)**.
 |---|---|
 | **Model** | {model_name} |
 | **Architecture** | LLaMA (RoPE + SwiGLU + RMSNorm + GQA) |
-| **Parameters** | {param_str} |
+| **Parameters** | {param_str} (unique) |
 | **Hidden size** | {hidden} |
-| **Layers** | {n_layers} |
+| **Layers** | {n_unique_layers} unique ({n_layers} effective via weight sharing) |
 | **Attention heads** | {n_heads} Q / {n_kv_heads} KV (Grouped Query Attention) |
 | **Intermediate size** | {intermediate} |
 | **Context length** | {ctx_len} |
@@ -865,7 +913,7 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 
 Key features:
 - **Grouped Query Attention (GQA)**: {n_heads} query heads, {n_kv_heads} KV heads — 4x KV cache reduction
-- **Block-wise Weight Sharing**: {n_layers} HF layers mapped from {n_layers // 2} unique blocks (each used twice), following MobileLLM-LS
+- **Block-wise Weight Sharing**: {n_unique_layers} unique blocks, each used twice = {n_layers} effective layers (MobileLLM-LS)
 - **SwiGLU MLP** with {intermediate} intermediate size
 - **RoPE** positional encoding (theta={rope_theta})
 - **RMSNorm** (no bias in any linear layer)
@@ -1450,10 +1498,12 @@ Examples:
     hf_state_dict = convert_weights(checkpoint, config, output_dir,
                                      original_vocab_size=original_vocab_size)
 
-    # Part 3b: Custom tokenizer class (Morfessor only — SP uses native HF decode)
-    if not is_sp_tokenizer:
-        logger.info("")
-        logger.info("--- Part 3b: Creating tokenizer_class.py ---")
+    # Part 3b: Custom tokenizer class
+    logger.info("")
+    logger.info("--- Part 3b: Creating tokenizer_class.py ---")
+    if is_sp_tokenizer:
+        create_tokenizer_class_sp(output_dir)
+    else:
         create_tokenizer_class(output_dir, is_sft=is_sft)
 
     # Part 4: generation_config.json
@@ -1468,7 +1518,10 @@ Examples:
     if is_sft:
         create_sft_model_card(config, output_dir, sft_special_tokens, checkpoint)
     else:
-        create_model_card(config, output_dir, is_sp=is_sp_tokenizer)
+        _ckpt_cfg = checkpoint["config"]
+        _n_unique = _ckpt_cfg["n_layer"]  # unique layers before weight-sharing unroll
+        create_model_card(config, output_dir, is_sp=is_sp_tokenizer,
+                          n_unique_layers=_n_unique)
 
     # Copy Morfessor model if provided
     if args.morfessor_model:
