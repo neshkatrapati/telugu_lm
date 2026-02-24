@@ -1165,27 +1165,37 @@ Examples:
         logger.info("  Suffix coverage: %.1f%%", args.suffix_coverage)
         logger.info("=" * 70)
 
-        # Pass 1: Collect suffix frequencies
-        solo_freq, initial_freq, cont_freq, final_freq = collect_suffix_frequencies(
-            input_dir, model_path, output_dir, args.workers, args.num_docs,
-        )
-
-        # Compute suffix set
-        suffix_set, threshold = compute_suffix_set(
-            solo_freq, initial_freq, cont_freq, final_freq,
-            target_coverage=args.suffix_coverage,
-        )
-
-        # Save suffix set for reference
+        # Check if suffix_set.json already exists (from a previous sample run)
         suffix_path = output_dir / "suffix_set.json"
-        with open(suffix_path, "w", encoding="utf-8") as f:
-            json.dump({
-                "threshold": threshold,
-                "coverage": args.suffix_coverage,
-                "count": len(suffix_set),
-                "morphemes": sorted(suffix_set),
-            }, f, ensure_ascii=False, indent=2)
-        logger.info("Saved suffix set (%d morphemes) to %s", len(suffix_set), suffix_path)
+        if suffix_path.exists():
+            logger.info("Loading existing suffix set from %s", suffix_path)
+            with open(suffix_path, "r", encoding="utf-8") as f:
+                suffix_data = json.load(f)
+            suffix_set = set(suffix_data["morphemes"])
+            threshold = suffix_data["threshold"]
+            logger.info("  Loaded %d morphemes (threshold=%d, coverage=%.1f%%)",
+                        len(suffix_set), threshold, suffix_data["coverage"])
+        else:
+            # Pass 1: Collect suffix frequencies
+            solo_freq, initial_freq, cont_freq, final_freq = collect_suffix_frequencies(
+                input_dir, model_path, output_dir, args.workers, args.num_docs,
+            )
+
+            # Compute suffix set
+            suffix_set, threshold = compute_suffix_set(
+                solo_freq, initial_freq, cont_freq, final_freq,
+                target_coverage=args.suffix_coverage,
+            )
+
+            # Save suffix set for reference
+            with open(suffix_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "threshold": threshold,
+                    "coverage": args.suffix_coverage,
+                    "count": len(suffix_set),
+                    "morphemes": sorted(suffix_set),
+                }, f, ensure_ascii=False, indent=2)
+            logger.info("Saved suffix set (%d morphemes) to %s", len(suffix_set), suffix_path)
 
         # Pass 2: Segment with v4 format
         segment_corpus(input_dir, model_path, output_dir, suffix_set, args.workers, args.num_docs)

@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-BPE Training for Non-Telugu Text (v2)
+BPE Training for Non-Telugu Text (v4)
 =======================================
 Extracts non-Telugu tokens from the Morfessor-segmented corpus and trains
 a Byte Pair Encoding (BPE) model on them.
 
-v2: Segmented corpus uses ▁ as a word-boundary separator token.
-All morphemes/subwords are bare (no @@ suffix). BPE produces bare subwords.
+v4: Segmented corpus uses reversed @@ prefix for Telugu suffixes.
+Non-Telugu tokens are bare and separated by whitespace.
+@@-prefixed tokens (Telugu suffixes) and bare Telugu tokens are skipped.
 
 Usage:
-    python train_bpe.py --seg-corpus ./data/morfessor/segmented_corpus/sangraha/ --num-merges 8000
-    python train_bpe.py --seg-corpus ./path/to/telugu_verified.seg.txt --num-merges 4000
+    python train_bpe.py --seg-corpus ./data/sample.seg.txt --num-merges 8000
+    python train_bpe.py --seg-corpus ./path/to/file.seg.txt --num-merges 4000
 
 Output:
     bpe_merges.txt   — ordered merge rules (one per line: "a b")
@@ -53,31 +54,34 @@ def _has_telugu(s: str) -> bool:
 def _scan_chunk(args: tuple) -> tuple[Counter, int, int]:
     """Worker: scan a chunk of lines, return (non_telugu_counter, total_toks, non_telugu_toks).
 
-    v2: Tokens are bare (no @@ suffix). The ▁ separator token is skipped.
+    v4: @@-prefixed tokens are Telugu suffixes — skipped.
+    Bare tokens with Telugu chars — skipped.
+    Remaining bare non-Telugu tokens — counted.
     """
-    lines, separator, sep_len = args
+    lines = args[0]
     freq: Counter = Counter()
     total = 0
     non_tel = 0
     for line in lines:
         for token in line.split():
-            # Skip the word-boundary separator token
-            if token == separator:
+            # Skip @@-prefixed Telugu suffixes
+            if token.startswith("@@"):
                 continue
             total += 1
-            # v2: tokens are already bare, no stripping needed
+            # Skip bare Telugu tokens
             if not _has_telugu(token):
                 freq[token] += 1
                 non_tel += 1
     return freq, total, non_tel
 
 
-def extract_non_telugu(seg_corpus_path: Path, separator: str = "\u2581", num_workers: int = 0) -> Counter:
+def extract_non_telugu(seg_corpus_path: Path, num_workers: int = 0) -> Counter:
     """Scan .seg.txt files and collect non-Telugu token frequencies.
 
+    v4: Skips @@-prefixed tokens (Telugu suffixes) and bare Telugu tokens.
     Parallelized: reads file in large chunks, distributes across workers.
 
-    Returns Counter mapping raw surface form (no @@) -> frequency.
+    Returns Counter mapping raw surface form -> frequency.
     """
     from multiprocessing import Pool, cpu_count
     from tqdm import tqdm
@@ -95,7 +99,6 @@ def extract_non_telugu(seg_corpus_path: Path, separator: str = "\u2581", num_wor
         num_workers = max(1, cpu_count() - 1)
 
     CHUNK_SIZE = 50_000  # lines per chunk
-    sep_len = len(separator)
 
     logger.info("Scanning %d file(s) for non-Telugu tokens (%d workers)...", len(seg_files), num_workers)
     word_freq: Counter = Counter()
@@ -106,7 +109,6 @@ def extract_non_telugu(seg_corpus_path: Path, separator: str = "\u2581", num_wor
         logger.info("  Scanning %s", fpath.name)
 
         if num_workers > 1:
-            # Stream lines into chunks, submit to pool as they fill up
             from concurrent.futures import ProcessPoolExecutor, as_completed
 
             futures = []
@@ -122,10 +124,10 @@ def extract_non_telugu(seg_corpus_path: Path, separator: str = "\u2581", num_wor
                     line_count += 1
                     pbar.update(1)
                     if len(current_chunk) >= CHUNK_SIZE:
-                        futures.append(executor.submit(_scan_chunk, (current_chunk, separator, sep_len)))
+                        futures.append(executor.submit(_scan_chunk, (current_chunk,)))
                         current_chunk = []
             if current_chunk:
-                futures.append(executor.submit(_scan_chunk, (current_chunk, separator, sep_len)))
+                futures.append(executor.submit(_scan_chunk, (current_chunk,)))
 
             pbar.set_description(f"{fpath.name} (merging {len(futures)} chunks)")
 
@@ -140,15 +142,15 @@ def extract_non_telugu(seg_corpus_path: Path, separator: str = "\u2581", num_wor
             logger.info("    %d lines, %d chunks", line_count, len(futures))
 
         else:
-            # Single-threaded: direct scan with progress bar per line
+            # Single-threaded
             with open(fpath, "r", encoding="utf-8") as f:
                 for line in tqdm(f, desc=fpath.name, unit=" lines"):
                     for token in line.split():
-                        # Skip the word-boundary separator token
-                        if token == separator:
+                        # Skip @@-prefixed Telugu suffixes
+                        if token.startswith("@@"):
                             continue
                         total_tokens += 1
-                        # v2: tokens are already bare, no stripping needed
+                        # Skip bare Telugu tokens
                         if not _has_telugu(token):
                             word_freq[token] += 1
                             non_telugu_tokens += 1
@@ -310,8 +312,8 @@ def train_bpe(word_freqs: Counter, num_merges: int) -> tuple[list[tuple[str, str
 def bpe_encode(word: str, merges: list[tuple[str, str]]) -> list[str]:
     """Encode a word into BPE subwords using the learned merge table.
 
-    v2: Returns bare subwords (no @@ suffix). Word boundaries are handled
-    by the ▁ separator token at a higher level.
+    Returns bare subwords. Word boundaries are handled by the v4
+    reversed @@ prefix scheme at a higher level.
 
         "international" -> ["inter", "nation", "al"]
 
@@ -413,10 +415,6 @@ Examples:
         help="Output directory for BPE files (default: ./data/morfessor/bpe)",
     )
     parser.add_argument(
-        "--separator", type=str, default="\u2581",
-        help="Word boundary separator token (default: ▁ U+2581)",
-    )
-    parser.add_argument(
         "--min-freq", type=int, default=5,
         help="Minimum word frequency to include in BPE training (default: 5)",
     )
@@ -432,7 +430,7 @@ Examples:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Step 1: Extract non-Telugu tokens
-    word_freqs = extract_non_telugu(seg_path, args.separator, args.workers)
+    word_freqs = extract_non_telugu(seg_path, args.workers)
 
     # Filter by minimum frequency
     if args.min_freq > 1:
