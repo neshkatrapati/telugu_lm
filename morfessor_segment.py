@@ -4,11 +4,26 @@ Telugu Morphological Segmentation with Morfessor Baseline
 ==========================================================
 Trains a Morfessor Baseline model on Telugu text and applies segmentation.
 
+v4: Reversed @@ prefix scheme
+  - Clean split at Telugu/non-Telugu script boundaries BEFORE segmentation
+  - Morfessor segments only pure Telugu words
+  - First morpheme of each word is bare (root/stem)
+  - Subsequent morphemes get @@ prefix if they appear as suffix often enough
+  - Non-Telugu tokens kept as-is, separated by whitespace
+
+  Example:
+    "విద్యార్థులకు went 2024లో"
+    → split scripts: "విద్యార్థులకు went 2024 లో"
+    → segment: "విద్యార్థు @@ల @@కు went 2024 లో"
+    → decode: concatenate tokens, @@ prefix = join to previous, else new word
+    → "విద్యార్థులకు went 2024 లో"
+
 Pipeline:
-  1. Extract words + frequencies from downloaded corpus
+  1. Extract Telugu words + frequencies (with script-boundary cleanup)
   2. Train Morfessor Baseline model
-  3. Inspect segmentation quality on sample words
-  4. Apply segmentation to full corpus
+  3. Inspect segmentation quality
+  4. Pass 1: Segment corpus, collect suffix position frequencies
+  5. Pass 2: Re-segment with @@ prefix on qualifying suffixes
 
 Requirements:
     pip install morfessor tqdm
@@ -23,14 +38,11 @@ Usage:
     # Segment only (using a previously trained model)
     python morfessor_segment.py --input ./data --segment-only --model ./data/morfessor/morfessor_telugu.bin
 
-    # Custom sample size for training
-    python morfessor_segment.py --input ./data --sample-size 10000000
-
     # Custom corpus weight (higher = less segmentation, lower = more)
-    python morfessor_segment.py --input ./data --corpus-weight 1.0
+    python morfessor_segment.py --input ./data --corpus-weight 0.5
 
-    # v2: Output uses ▁ as word-boundary separator, bare morphemes (no @@):
-    #   "విద్యార్థులకు went" → "▁ విద్యార్థు ల కు ▁ went"
+    # Set min suffix coverage (default: 99.0%)
+    python morfessor_segment.py --input ./data --suffix-coverage 99.5
 """
 
 import os
@@ -85,17 +97,50 @@ def check_dependencies():
 # ---------------------------------------------------------------------------
 
 # Telugu Unicode range: 0C00-0C7F
+TELUGU_CHAR_RE = re.compile(r"[\u0C00-\u0C7F]")
 TELUGU_WORD_RE = re.compile(r"[\u0C00-\u0C7F]+")
+
+# Script boundary split: split at transitions between Telugu and non-Telugu
+# This regex matches the zero-width boundary between the two script classes
+SCRIPT_BOUNDARY_RE = re.compile(
+    r"(?<=[^\u0C00-\u0C7F])(?=[\u0C00-\u0C7F])"
+    r"|"
+    r"(?<=[\u0C00-\u0C7F])(?=[^\u0C00-\u0C7F])"
+)
 
 
 def is_telugu(text: str) -> bool:
     """Check if text contains Telugu characters."""
-    return bool(TELUGU_WORD_RE.search(text))
+    return bool(TELUGU_CHAR_RE.search(text))
 
 
 def extract_telugu_words(text: str) -> list[str]:
     """Extract Telugu words from a line of text."""
     return TELUGU_WORD_RE.findall(text)
+
+
+def split_script_boundaries(token: str) -> list[str]:
+    """Split a token at Telugu/non-Telugu script boundaries.
+
+    "తెలుసా..?" → ["తెలుసా", "..?"]
+    "2024లో" → ["2024", "లో"]
+    "IPLలో" → ["IPL", "లో"]
+    "hello" → ["hello"]
+    "విద్యార్థులకు" → ["విద్యార్థులకు"]
+    """
+    parts = SCRIPT_BOUNDARY_RE.split(token)
+    return [p for p in parts if p]
+
+
+def clean_text_script_boundaries(text: str) -> str:
+    """Split all tokens at script boundaries, producing clean tokens.
+
+    "తెలుసా..? 2024లో" → "తెలుసా ..? 2024 లో"
+    """
+    result = []
+    for token in text.split():
+        result.extend(split_script_boundaries(token))
+    return " ".join(result)
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +154,9 @@ def build_word_frequencies(
     """
     Scan downloaded data files and build a word frequency list.
     Stops after collecting `sample_size` word tokens.
+
+    v4: Applies script-boundary cleanup before extracting Telugu words,
+    so "తెలుసా..?" is split into "తెలుసా" + "..?" and only "తెలుసా" is counted.
     """
     from tqdm import tqdm
 
@@ -156,7 +204,9 @@ def build_word_frequencies(
         try:
             lines = _iter_text_from_file(fpath)
             for text in tqdm(lines, desc=fpath.name, unit=" docs", leave=False):
-                words = extract_telugu_words(text)
+                # v4: Clean script boundaries before extracting Telugu words
+                cleaned = clean_text_script_boundaries(text)
+                words = extract_telugu_words(cleaned)
                 word_freq.update(words)
                 total_tokens += len(words)
 
@@ -233,6 +283,7 @@ def train_morfessor(
     output_dir: Path,
     corpus_weight: float,
     dampening: str,
+    freq_threshold: int = 2,
 ) -> Path:
     """Train a Morfessor Baseline model on the word frequency list."""
     import morfessor
@@ -249,12 +300,8 @@ def train_morfessor(
     logger.info("  Frequency file: %s", freq_path)
     logger.info("  Corpus weight:  %s", corpus_weight)
     logger.info("  Dampening:      %s", dampening)
+    logger.info("  Freq threshold: %d", freq_threshold)
 
-    # Read word frequencies as (count, word) tuples
-    # Our format is: "count word" per line
-    # We parse it manually because read_corpus_file treats input as raw text
-    # and ignores the count column, while read_corpus_list_file expects the
-    # correct "count word" format but returns (count, (word,)) tuples.
     io = morfessor.MorfessorIO()
     word_counts = list(io.read_corpus_list_file(str(freq_path)))
     logger.info("Read %d word types from frequency file", len(word_counts))
@@ -272,7 +319,7 @@ def train_morfessor(
         count_modifier = None
 
     # Load data
-    model.load_data(word_counts, freqthreshold=2, count_modifier=count_modifier)
+    model.load_data(word_counts, freqthreshold=freq_threshold, count_modifier=count_modifier)
 
     # Train
     start = time.time()
@@ -469,22 +516,18 @@ def compute_vocab_stats(model_path: Path, freq_path: Path, output_dir: Path):
 
 
 # ---------------------------------------------------------------------------
-# Step 4: Segment full corpus (with caching + multiprocessing)
+# Step 4: Segment full corpus
 # ---------------------------------------------------------------------------
 
-def _build_segmentation_cache(model, freq_path: Path, separator: str) -> dict[str, list[str]]:
+def _build_segmentation_cache(model, freq_path: Path) -> dict[str, list[str]]:
     """
     Pre-segment all known words into a lookup dict.
-    This avoids calling viterbi_segment millions of times during corpus pass.
-
-    v2: Returns bare morphemes (no @@ suffix). The separator (▁) is inserted
-    at the word level by the caller, not attached to individual morphemes.
+    Returns dict mapping word → list of bare morphemes.
     """
     from tqdm import tqdm
 
     cache = {}
 
-    # Count lines first for progress bar
     num_lines = 0
     with open(freq_path, "r", encoding="utf-8") as f:
         for _ in f:
@@ -498,28 +541,24 @@ def _build_segmentation_cache(model, freq_path: Path, separator: str) -> dict[st
             if len(parts) != 2:
                 continue
             _, word = parts
-
             segments = model.viterbi_segment(word)[0]
-            # Store bare morphemes — no separator suffix
             cache[word] = list(segments)
 
     logger.info("Cached segmentations for %d word types", len(cache))
     return cache
 
 
-MAX_TOKEN_LEN = 80  # Skip viterbi for tokens longer than this (URLs, garbage, etc.)
+MAX_TOKEN_LEN = 80
 
 
-def _segment_telugu_word(cache: dict, model, word: str, separator: str) -> list[str]:
+def _segment_telugu_word(cache: dict, model, word: str) -> list[str]:
     """Segment a pure-Telugu word into bare morphemes using cache.
 
-    v2: Returns bare morphemes without any separator suffix.
-    e.g. ["విద్యార్థు", "ల", "కు"]
-    The ▁ word-boundary separator is inserted at a higher level.
+    Returns list of bare morphemes, e.g. ["విద్యార్థు", "ల", "కు"]
     """
     cached = cache.get(word)
     if cached is not None:
-        return list(cached)  # cache stores list[str] of bare morphemes
+        return list(cached)
 
     if len(word) > MAX_TOKEN_LEN:
         cache[word] = [word]
@@ -530,113 +569,274 @@ def _segment_telugu_word(cache: dict, model, word: str, separator: str) -> list[
     return segments
 
 
-def _segment_text_cached(cache: dict, model, text: str, separator: str) -> str:
+def _segment_text_bare(cache: dict, model, text: str) -> list[list[str]]:
+    """Segment text into a list of words, each being a list of bare morphemes.
+
+    v4: Applies script-boundary cleanup. Each token is split at Telugu/non-Telugu
+    boundaries first. Pure Telugu parts get Morfessor segmentation.
+    Non-Telugu parts are kept as single-morpheme words.
+
+    Returns list of words, where each word is a list of morpheme strings.
+    Example: "విద్యార్థులకు went" → [["విద్యార్థు", "ల", "కు"], ["went"]]
     """
-    Segment text into sub-word tokens using Morfessor for Telugu words.
-
-    v2: Uses ▁ (separator) as a dedicated word-boundary token inserted BETWEEN
-    words. All morphemes are stored as bare forms (no @@ suffix).
-
-    Output format:
-        "విద్యార్థులకు went" → "▁ విద్యార్థు ల కు ▁ went"
-        Decode: concatenate all, ▁ → space, strip → "విద్యార్థులకు went"
-
-    - Pure Telugu words → ▁ + bare Morfessor morphemes
-    - Non-Telugu tokens → ▁ + kept as-is
-    - Mixed-script tokens (e.g. 2024లో) → ▁ + fragments concatenated as
-      separate tokens (all bare, no suffixes)
-    """
-    tokens = text.split()
-    result = []
-
-    for token in tokens:
-        # Insert word boundary separator before each word
-        result.append(separator)
-
-        # No Telugu characters — keep as-is
-        if not TELUGU_WORD_RE.search(token):
-            result.append(token)
-            continue
-
-        # Purely Telugu token
-        if TELUGU_WORD_RE.fullmatch(token):
-            result.extend(_segment_telugu_word(cache, model, token, separator))
-            continue
-
-        # Mixed token — split on Telugu boundaries
-        # e.g. "2024లో" → ["2024", "లో"], "IPLలో" → ["IPL", "లో"]
-        parts = re.split(r"([\u0C00-\u0C7F]+)", token)
-        parts = [p for p in parts if p]  # remove empties
-
+    words = []
+    for token in text.split():
+        # Split at script boundaries
+        parts = split_script_boundaries(token)
         for part in parts:
             if TELUGU_WORD_RE.fullmatch(part):
-                result.extend(_segment_telugu_word(cache, model, part, separator))
+                morphemes = _segment_telugu_word(cache, model, part)
+                words.append(morphemes)
             else:
-                result.append(part)
+                words.append([part])
+    return words
 
+
+def _format_word_v4(morphemes: list[str], suffix_set: set[str] | None) -> list[str]:
+    """Format a single word's morphemes in v4 reversed @@ format.
+
+    First morpheme is bare. Subsequent morphemes get @@ prefix if they
+    are in suffix_set (or if suffix_set is None → all get @@).
+
+    Args:
+        morphemes: List of bare morphemes for one word.
+        suffix_set: Set of morphemes that qualify for @@ prefix form.
+                    None = all non-initial morphemes get @@.
+
+    Returns list of formatted tokens.
+    """
+    if len(morphemes) <= 1:
+        return morphemes
+
+    result = [morphemes[0]]  # first morpheme always bare
+    for m in morphemes[1:]:
+        if suffix_set is None or m in suffix_set:
+            result.append("@@" + m)
+        else:
+            # No @@ form — force word break (treat as standalone)
+            result.append(m)
+    return result
+
+
+def _segment_text_v4(cache: dict, model, text: str, suffix_set: set[str] | None) -> str:
+    """Segment text in v4 reversed @@ format.
+
+    Args:
+        cache: Segmentation cache.
+        model: Morfessor model.
+        text: Raw input text.
+        suffix_set: Set of morphemes qualifying for @@ prefix.
+                    None = all non-initial morphemes get @@.
+
+    Returns space-separated token string in v4 format.
+    """
+    words = _segment_text_bare(cache, model, text)
+    result = []
+    for morphemes in words:
+        result.extend(_format_word_v4(morphemes, suffix_set))
     return " ".join(result)
 
+
+# ---------------------------------------------------------------------------
+# Pass 1: Collect suffix position frequencies
+# ---------------------------------------------------------------------------
+def collect_suffix_frequencies(
+    input_dir: Path,
+    model_path: Path,
+    output_dir: Path,
+    num_workers: int = 0,
+    num_docs: int = 0,
+) -> tuple[Counter, Counter, Counter, Counter]:
+    """Segment corpus and count morpheme positions: solo, initial, cont, final.
+
+    Returns (solo_freq, initial_freq, cont_freq, final_freq) Counters.
+    Each maps morpheme_base → count in that position.
+    """
+    import morfessor
+    from tqdm import tqdm
+
+    logger.info("Pass 1: Collecting suffix position frequencies...")
+
+    # Load model and cache
+    freq_path = output_dir / "word_frequencies.txt"
+    if not freq_path.exists():
+        freq_path = model_path.parent / "word_frequencies.txt"
+
+    io = morfessor.MorfessorIO()
+    model = io.read_binary_model_file(str(model_path))
+    cache = _build_segmentation_cache(model, freq_path)
+
+    # Find data files
+    if input_dir.is_file():
+        data_files = [input_dir]
+    else:
+        data_files = []
+        for ext in ("*.parquet", "*.jsonl", "*.txt"):
+            data_files.extend(input_dir.rglob(ext))
+        data_files = [f for f in data_files if "morfessor" not in str(f)]
+        data_files.sort()
+
+    solo_freq = Counter()
+    initial_freq = Counter()
+    cont_freq = Counter()
+    final_freq = Counter()
+    doc_count = 0
+
+    for fpath in data_files:
+        for text in tqdm(
+            _iter_text_from_file(fpath),
+            desc=f"Pass 1: {fpath.name}",
+            unit=" docs",
+            total=num_docs if num_docs > 0 else None,
+        ):
+            words = _segment_text_bare(cache, model, text)
+            for morphemes in words:
+                if len(morphemes) == 1:
+                    if is_telugu(morphemes[0]):
+                        solo_freq[morphemes[0]] += 1
+                else:
+                    for idx, m in enumerate(morphemes):
+                        if not is_telugu(m):
+                            continue
+                        if idx == 0:
+                            initial_freq[m] += 1
+                        elif idx == len(morphemes) - 1:
+                            final_freq[m] += 1
+                        else:
+                            cont_freq[m] += 1
+
+            doc_count += 1
+            if num_docs > 0 and doc_count >= num_docs:
+                break
+
+        if num_docs > 0 and doc_count >= num_docs:
+            break
+
+    logger.info("Pass 1 complete: %d documents processed", doc_count)
+
+    # Stats
+    all_morphs = set(solo_freq) | set(initial_freq) | set(cont_freq) | set(final_freq)
+    logger.info("  Unique Telugu morphemes: %d", len(all_morphs))
+    logger.info("  Solo: %d types, Initial: %d types, Cont: %d types, Final: %d types",
+                len(solo_freq), len(initial_freq), len(cont_freq), len(final_freq))
+
+    return solo_freq, initial_freq, cont_freq, final_freq
+
+
+def compute_suffix_set(
+    solo_freq: Counter,
+    initial_freq: Counter,
+    cont_freq: Counter,
+    final_freq: Counter,
+    target_coverage: float = 99.0,
+) -> tuple[set[str], int]:
+    """Determine which morphemes get @@ prefix form based on target suffix coverage.
+
+    A morpheme needs @@ prefix form if it appears as cont or final in multi-morpheme words.
+    We find the minimum suffix frequency threshold that achieves target_coverage% of all
+    suffix occurrences.
+
+    Args:
+        solo_freq, initial_freq, cont_freq, final_freq: Position counters.
+        target_coverage: Target percentage of suffix occurrences to cover (default: 99.0).
+
+    Returns:
+        (suffix_set, threshold): Set of morphemes qualifying for @@ prefix, and the
+        min_suffix threshold used.
+    """
+    # Count suffix occurrences per morpheme
+    suffix_occ = Counter()
+    all_morphs = set(cont_freq) | set(final_freq)
+    for m in all_morphs:
+        suffix_occ[m] = cont_freq[m] + final_freq[m]
+
+    total_suffix = sum(suffix_occ.values())
+    if total_suffix == 0:
+        logger.warning("No suffix occurrences found!")
+        return set(), 0
+
+    # Sort morphemes by their suffix frequency descending
+    sorted_morphs = sorted(suffix_occ.items(), key=lambda x: x[1], reverse=True)
+
+    # Find threshold that covers target_coverage%
+    cumulative = 0
+    threshold = 0
+    for m, count in sorted_morphs:
+        cumulative += count
+        coverage = 100 * cumulative / total_suffix
+        if coverage >= target_coverage:
+            threshold = count
+            break
+
+    # Build suffix set: all morphemes with suffix_occ >= threshold
+    suffix_set = {m for m, c in suffix_occ.items() if c >= threshold}
+
+    # Compute actual stats
+    covered = sum(c for m, c in suffix_occ.items() if m in suffix_set)
+    actual_coverage = 100 * covered / total_suffix
+
+    all_tel = set(solo_freq) | set(initial_freq) | set(cont_freq) | set(final_freq)
+    total_freq = Counter()
+    for m in all_tel:
+        total_freq[m] = solo_freq[m] + initial_freq[m] + cont_freq[m] + final_freq[m]
+    total_all = sum(total_freq.values())
+    missed = total_suffix - covered
+
+    logger.info("Suffix set computation:")
+    logger.info("  Target coverage: %.1f%%", target_coverage)
+    logger.info("  Min suffix threshold: %d", threshold)
+    logger.info("  Morphemes with @@ form: %d", len(suffix_set))
+    logger.info("  Total unique Telugu morphemes: %d", len(all_tel))
+    logger.info("  Total vocab entries (bare + @@): %d", len(all_tel) + len(suffix_set))
+    logger.info("  Suffix coverage: %.2f%% (%d / %d)", actual_coverage, covered, total_suffix)
+    logger.info("  Missed suffix occurrences: %d (%.3f%% of all tokens)",
+                missed, 100 * missed / total_all if total_all else 0)
+
+    # Save suffix set
+    return suffix_set, threshold
+
+
+# ---------------------------------------------------------------------------
+# Pass 2: Segment corpus with final v4 format
+# ---------------------------------------------------------------------------
 
 # Module-level globals for shared state across forked workers
 _shared_cache = None
 _shared_model = None
-_shared_separator = None
+_shared_suffix_set = None
 
 
-def _init_worker(cache, model, separator):
+def _init_worker(cache, model, suffix_set):
     """Initializer for pool workers — sets shared globals from parent."""
-    global _shared_cache, _shared_model, _shared_separator
+    global _shared_cache, _shared_model, _shared_suffix_set
     _shared_cache = cache
     _shared_model = model
-    _shared_separator = separator
+    _shared_suffix_set = suffix_set
 
 
-def _segment_batch(texts):
-    """
-    Worker function: segment a batch of texts using shared cache + model.
-    Returns list of segmented texts. Skips docs that cause errors.
-    """
-    cache = _shared_cache  # read-only from parent via fork (copy-on-write)
-    model = _shared_model
-    separator = _shared_separator
-    results = []
-    for text in texts:
-        try:
-            results.append(_segment_text_cached(cache, model, text, separator))
-        except Exception:
-            # Skip problematic docs rather than hanging
-            results.append(text)
-    return results
-
-
-MAX_DOC_CHARS = 500_000  # Skip segmentation for docs with more chars than this
+MAX_DOC_CHARS = 500_000
 
 
 def _segment_single(text):
-    """Worker function: segment a single text. For imap_unordered."""
+    """Worker function: segment a single text in v4 format."""
     try:
         if len(text) > MAX_DOC_CHARS:
-            return text  # Giant doc — skip segmentation, keep raw
-        return _segment_text_cached(_shared_cache, _shared_model, text, _shared_separator)
+            return text
+        return _segment_text_v4(_shared_cache, _shared_model, text, _shared_suffix_set)
     except Exception:
         return text
-
-
-BATCH_SIZE = 2000  # docs per batch sent to workers (smaller = more responsive)
 
 
 def segment_corpus(
     input_dir: Path,
     model_path: Path,
     output_dir: Path,
-    separator: str,
+    suffix_set: set[str],
     num_workers: int = 0,
     num_docs: int = 0,
 ):
     """
-    Apply Morfessor segmentation to all corpus files.
-    Builds cache ONCE, then processes each file with parallel batch segmentation.
-    Progress bar updates per batch so you always see movement.
+    Pass 2: Segment full corpus in v4 reversed @@ format.
     """
     import morfessor
     from multiprocessing import Pool, cpu_count
@@ -644,12 +844,12 @@ def segment_corpus(
 
     seg_dir = output_dir
     seg_dir.mkdir(parents=True, exist_ok=True)
-    # Look for word_frequencies.txt in output_dir first, then next to the model
+
     freq_path = output_dir / "word_frequencies.txt"
     if not freq_path.exists():
         freq_path = model_path.parent / "word_frequencies.txt"
 
-    # Find all data files — input_dir can be a file or a directory
+    # Find data files
     if input_dir.is_file():
         data_files = [input_dir]
         base_dir = input_dir.parent
@@ -665,16 +865,17 @@ def segment_corpus(
         logger.error("No data files found in %s", input_dir)
         sys.exit(1)
 
-    # ---- Build cache + load model ONCE in parent process ----
-    logger.info("Loading model and building segmentation cache (once)...")
+    # Load model and cache
+    logger.info("Pass 2: Loading model and building segmentation cache...")
     io = morfessor.MorfessorIO()
     model = io.read_binary_model_file(str(model_path))
-    cache = _build_segmentation_cache(model, freq_path, separator)
+    cache = _build_segmentation_cache(model, freq_path)
 
     if num_workers <= 0:
         num_workers = max(1, cpu_count() - 1)
 
-    # ---- Process each file ----
+    logger.info("Suffix set: %d morphemes with @@ prefix form", len(suffix_set))
+
     for fpath in data_files:
         try:
             rel = fpath.relative_to(base_dir)
@@ -689,14 +890,11 @@ def segment_corpus(
             logger.info("SKIPPING %s — already segmented", rel)
             continue
 
-        total_str = f"/{num_docs}" if num_docs > 0 else ""
-        logger.info("Segmenting %s -> %s (%d workers%s)", rel, out_file.name, num_workers,
-                     f", limit {num_docs} docs" if num_docs > 0 else "")
+        logger.info("Segmenting %s -> %s (%d workers)", rel, out_file.name, num_workers)
         start = time.time()
         doc_count = 0
 
         if num_workers <= 1:
-            # ---- Sequential: simple loop with progress bar ----
             with open(out_file, "w", encoding="utf-8") as fout:
                 for text in tqdm(
                     _iter_text_from_file(fpath),
@@ -704,26 +902,21 @@ def segment_corpus(
                     unit=" docs",
                     total=num_docs if num_docs > 0 else None,
                 ):
-                    segmented_text = _segment_text_cached(
-                        cache, model, text, separator
-                    )
+                    segmented_text = _segment_text_v4(cache, model, text, suffix_set)
                     fout.write(segmented_text + "\n")
                     doc_count += 1
                     if num_docs > 0 and doc_count >= num_docs:
                         break
         else:
-            # ---- Parallel: stream docs through imap_unordered for responsiveness ----
             with Pool(
                 processes=num_workers,
                 initializer=_init_worker,
-                initargs=(cache, model, separator),
+                initargs=(cache, model, suffix_set),
             ) as pool, open(out_file, "w", encoding="utf-8") as fout:
 
                 pbar = tqdm(desc=fpath.name, unit=" docs",
                             total=num_docs if num_docs > 0 else None)
 
-                # imap_unordered streams results as they complete — no blocking on slow docs
-                # chunksize=1 ensures one stuck doc cannot block any other results
                 for seg_text in pool.imap_unordered(
                     _segment_single,
                     _iter_text_from_file(fpath),
@@ -733,7 +926,6 @@ def segment_corpus(
                     doc_count += 1
                     pbar.update(1)
 
-                    # Flush periodically so file size visibly grows
                     if doc_count % 50000 == 0:
                         fout.flush()
 
@@ -786,7 +978,7 @@ def print_summary(output_dir: Path):
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Telugu morphological segmentation with Morfessor Baseline",
+        description="Telugu morphological segmentation with Morfessor Baseline (v4: reversed @@ prefix)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -794,94 +986,66 @@ Examples:
   %(prog)s --input ./data --train-only              # Train + inspect only
   %(prog)s --input ./data --segment-only \\
            --model ./data/morfessor/morfessor_telugu.bin   # Segment with existing model
-  %(prog)s --input ./data --sample-size 10000000    # Train on 10M word tokens
-  %(prog)s --input ./data --corpus-weight 2.0       # Less segmentation
   %(prog)s --input ./data --corpus-weight 0.5       # More segmentation
-  %(prog)s --input ./data --separator " "            # Space-separated morphemes
-  %(prog)s --input ./data --vocab-stats             # Show morpheme vocab stats
-  %(prog)s --segment-only --vocab-stats             # Stats on existing model only
+  %(prog)s --input ./data --suffix-coverage 99.5    # Higher suffix coverage
         """,
     )
 
     parser.add_argument(
-        "--input",
-        type=str,
-        default="./data",
+        "--input", type=str, default="./data",
         help="Input data directory (default: ./data)",
     )
     parser.add_argument(
-        "--output",
-        type=str,
-        default=None,
+        "--output", type=str, default=None,
         help="Output directory (default: <input>/morfessor)",
     )
     parser.add_argument(
-        "--sample-size",
-        type=int,
-        default=5_000_000,
+        "--sample-size", type=int, default=5_000_000,
         help="Number of word tokens to sample for training (default: 5M)",
     )
     parser.add_argument(
-        "--corpus-weight",
-        type=float,
-        default=1.0,
+        "--corpus-weight", type=float, default=1.0,
         help="Morfessor corpus weight: higher = less segmentation, lower = more (default: 1.0)",
     )
     parser.add_argument(
-        "--dampening",
-        choices=["log", "ones", "none"],
-        default="log",
-        help="Frequency dampening: 'log' (recommended), 'ones' (ignore freq), 'none' (raw freq) (default: log)",
+        "--dampening", choices=["log", "ones", "none"], default="log",
+        help="Frequency dampening (default: log)",
     )
     parser.add_argument(
-        "--separator",
-        type=str,
-        default="\u2581",
-        help="Word boundary separator token for segmented output (default: ▁ U+2581)",
+        "--freq-threshold", type=int, default=2,
+        help="Minimum word frequency for Morfessor training (default: 2)",
     )
     parser.add_argument(
-        "--train-only",
-        action="store_true",
-        help="Only build word frequencies, train model, and inspect — skip full corpus segmentation",
+        "--suffix-coverage", type=float, default=99.0,
+        help="Target suffix coverage percentage for @@ prefix selection (default: 99.0)",
     )
     parser.add_argument(
-        "--segment-only",
-        action="store_true",
+        "--train-only", action="store_true",
+        help="Only build word frequencies, train model, and inspect",
+    )
+    parser.add_argument(
+        "--segment-only", action="store_true",
         help="Only segment corpus using an existing model (requires --model)",
     )
     parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="Path to a pre-trained Morfessor model (.bin) for --segment-only mode",
+        "--model", type=str, default=None,
+        help="Path to a pre-trained Morfessor model (.bin)",
     )
     parser.add_argument(
-        "--freq-threshold",
-        type=int,
-        default=2,
-        help="Minimum word frequency to include in training (default: 2)",
+        "--vocab-stats", action="store_true",
+        help="Compute and display morpheme vocabulary statistics",
     )
     parser.add_argument(
-        "--vocab-stats",
-        action="store_true",
-        help="Compute and display morpheme vocabulary statistics (can be used standalone with --model)",
+        "--workers", type=int, default=0,
+        help="Number of parallel workers (default: auto = cpu_count - 1)",
     )
     parser.add_argument(
-        "--workers",
-        type=int,
-        default=0,
-        help="Number of parallel workers for corpus segmentation (default: auto = cpu_count - 1)",
-    )
-    parser.add_argument(
-        "--num-docs",
-        type=int,
-        default=0,
-        help="Limit segmentation to first N documents (0 = all, default: 0). Useful for quick tests.",
+        "--num-docs", type=int, default=0,
+        help="Limit to first N documents (0 = all, default: 0)",
     )
 
     args = parser.parse_args()
 
-    # Check dependencies
     check_dependencies()
 
     input_dir = Path(args.input)
@@ -911,51 +1075,97 @@ Examples:
         model_path = Path(args.model) if args.model else output_dir / "morfessor_telugu.bin"
         if not model_path.exists():
             logger.error("Model file not found: %s", model_path)
-            logger.error("Train a model first or provide --model path.")
             sys.exit(1)
 
         logger.info("=" * 70)
-        logger.info("Morfessor Segmentation (segment-only mode)")
-        logger.info("  Model:     %s", model_path)
-        logger.info("  Input:     %s", input_dir)
-        logger.info("  Output:    %s", output_dir)
-        logger.info("  Separator: '%s'", args.separator)
+        logger.info("Morfessor Segmentation v4 (reversed @@ prefix)")
+        logger.info("  Model:           %s", model_path)
+        logger.info("  Input:           %s", input_dir)
+        logger.info("  Output:          %s", output_dir)
+        logger.info("  Suffix coverage: %.1f%%", args.suffix_coverage)
         logger.info("=" * 70)
 
-        segment_corpus(input_dir, model_path, output_dir, args.separator, args.workers, args.num_docs)
+        # Pass 1: Collect suffix frequencies
+        solo_freq, initial_freq, cont_freq, final_freq = collect_suffix_frequencies(
+            input_dir, model_path, output_dir, args.workers, args.num_docs,
+        )
+
+        # Compute suffix set
+        suffix_set, threshold = compute_suffix_set(
+            solo_freq, initial_freq, cont_freq, final_freq,
+            target_coverage=args.suffix_coverage,
+        )
+
+        # Save suffix set for reference
+        suffix_path = output_dir / "suffix_set.json"
+        with open(suffix_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "threshold": threshold,
+                "coverage": args.suffix_coverage,
+                "count": len(suffix_set),
+                "morphemes": sorted(suffix_set),
+            }, f, ensure_ascii=False, indent=2)
+        logger.info("Saved suffix set (%d morphemes) to %s", len(suffix_set), suffix_path)
+
+        # Pass 2: Segment with v4 format
+        segment_corpus(input_dir, model_path, output_dir, suffix_set, args.workers, args.num_docs)
 
     else:
         # Full pipeline or train-only
         logger.info("=" * 70)
-        logger.info("Morfessor Telugu Pipeline")
+        logger.info("Morfessor Telugu Pipeline v4")
         logger.info("=" * 70)
-        logger.info("  Input dir:     %s", input_dir)
-        logger.info("  Output dir:    %s", output_dir)
-        logger.info("  Sample size:   %d tokens", args.sample_size)
-        logger.info("  Corpus weight: %.2f", args.corpus_weight)
-        logger.info("  Dampening:     %s", args.dampening)
-        logger.info("  Separator:     '%s'", args.separator)
-        logger.info("  Mode:          %s", "train-only" if args.train_only else "full pipeline")
+        logger.info("  Input dir:       %s", input_dir)
+        logger.info("  Output dir:      %s", output_dir)
+        logger.info("  Sample size:     %d tokens", args.sample_size)
+        logger.info("  Corpus weight:   %.2f", args.corpus_weight)
+        logger.info("  Dampening:       %s", args.dampening)
+        logger.info("  Freq threshold:  %d", args.freq_threshold)
+        logger.info("  Suffix coverage: %.1f%%", args.suffix_coverage)
+        logger.info("  Mode:            %s", "train-only" if args.train_only else "full pipeline")
         logger.info("=" * 70)
 
-        # Step 1: Build word frequencies
+        # Step 1: Build word frequencies (with script-boundary cleanup)
         freq_path = build_word_frequencies(input_dir, args.sample_size, output_dir)
 
         # Step 2: Train model
         model_path = train_morfessor(
-            freq_path, output_dir, args.corpus_weight, args.dampening,
+            freq_path, output_dir, args.corpus_weight, args.dampening, args.freq_threshold,
         )
 
         # Step 3: Inspect
         inspect_segmentation(model_path, output_dir)
 
-        # Step 3b: Vocab stats (if requested or always during train-only)
+        # Step 3b: Vocab stats
         if args.vocab_stats or args.train_only:
             compute_vocab_stats(model_path, freq_path, output_dir)
 
-        # Step 4: Segment full corpus (unless train-only)
+        # Step 4+5: Segment full corpus (unless train-only)
         if not args.train_only:
-            segment_corpus(input_dir, model_path, output_dir, args.separator, args.workers, args.num_docs)
+            # Pass 1: Collect suffix frequencies
+            solo_freq, initial_freq, cont_freq, final_freq = collect_suffix_frequencies(
+                input_dir, model_path, output_dir, args.workers, args.num_docs,
+            )
+
+            # Compute suffix set
+            suffix_set, threshold = compute_suffix_set(
+                solo_freq, initial_freq, cont_freq, final_freq,
+                target_coverage=args.suffix_coverage,
+            )
+
+            # Save suffix set
+            suffix_path = output_dir / "suffix_set.json"
+            with open(suffix_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "threshold": threshold,
+                    "coverage": args.suffix_coverage,
+                    "count": len(suffix_set),
+                    "morphemes": sorted(suffix_set),
+                }, f, ensure_ascii=False, indent=2)
+            logger.info("Saved suffix set (%d morphemes) to %s", len(suffix_set), suffix_path)
+
+            # Pass 2: Segment with v4 format
+            segment_corpus(input_dir, model_path, output_dir, suffix_set, args.workers, args.num_docs)
 
     elapsed_total = time.time() - start_total
     print_summary(output_dir)
