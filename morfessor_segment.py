@@ -640,6 +640,39 @@ def _segment_text_v4(cache: dict, model, text: str, suffix_set: set[str] | None)
 # ---------------------------------------------------------------------------
 # Pass 1: Collect suffix position frequencies
 # ---------------------------------------------------------------------------
+
+def _count_positions_single(text):
+    """Worker function: segment one text and return position counts.
+
+    Returns (solo, initial, cont, final) as dicts.
+    """
+    try:
+        if len(text) > MAX_DOC_CHARS:
+            return {}, {}, {}, {}
+        words = _segment_text_bare(_shared_cache, _shared_model, text)
+        solo = {}
+        initial = {}
+        cont = {}
+        final = {}
+        for morphemes in words:
+            if len(morphemes) == 1:
+                if TELUGU_CHAR_RE.search(morphemes[0]):
+                    solo[morphemes[0]] = solo.get(morphemes[0], 0) + 1
+            else:
+                for idx, m in enumerate(morphemes):
+                    if not TELUGU_CHAR_RE.search(m):
+                        continue
+                    if idx == 0:
+                        initial[m] = initial.get(m, 0) + 1
+                    elif idx == len(morphemes) - 1:
+                        final[m] = final.get(m, 0) + 1
+                    else:
+                        cont[m] = cont.get(m, 0) + 1
+        return solo, initial, cont, final
+    except Exception:
+        return {}, {}, {}, {}
+
+
 def collect_suffix_frequencies(
     input_dir: Path,
     model_path: Path,
@@ -649,10 +682,13 @@ def collect_suffix_frequencies(
 ) -> tuple[Counter, Counter, Counter, Counter]:
     """Segment corpus and count morpheme positions: solo, initial, cont, final.
 
+    Parallelized: uses multiprocessing Pool for throughput.
+
     Returns (solo_freq, initial_freq, cont_freq, final_freq) Counters.
     Each maps morpheme_base → count in that position.
     """
     import morfessor
+    from multiprocessing import Pool, cpu_count
     from tqdm import tqdm
 
     logger.info("Pass 1: Collecting suffix position frequencies...")
@@ -676,6 +712,9 @@ def collect_suffix_frequencies(
         data_files = [f for f in data_files if "morfessor" not in str(f)]
         data_files.sort()
 
+    if num_workers <= 0:
+        num_workers = max(1, cpu_count() - 1)
+
     solo_freq = Counter()
     initial_freq = Counter()
     cont_freq = Counter()
@@ -683,31 +722,65 @@ def collect_suffix_frequencies(
     doc_count = 0
 
     for fpath in data_files:
-        for text in tqdm(
-            _iter_text_from_file(fpath),
-            desc=f"Pass 1: {fpath.name}",
-            unit=" docs",
-            total=num_docs if num_docs > 0 else None,
-        ):
-            words = _segment_text_bare(cache, model, text)
-            for morphemes in words:
-                if len(morphemes) == 1:
-                    if is_telugu(morphemes[0]):
-                        solo_freq[morphemes[0]] += 1
-                else:
-                    for idx, m in enumerate(morphemes):
-                        if not is_telugu(m):
-                            continue
-                        if idx == 0:
-                            initial_freq[m] += 1
-                        elif idx == len(morphemes) - 1:
-                            final_freq[m] += 1
-                        else:
-                            cont_freq[m] += 1
+        if num_workers <= 1:
+            # Sequential
+            for text in tqdm(
+                _iter_text_from_file(fpath),
+                desc=f"Pass 1: {fpath.name}",
+                unit=" docs",
+                total=num_docs if num_docs > 0 else None,
+            ):
+                words = _segment_text_bare(cache, model, text)
+                for morphemes in words:
+                    if len(morphemes) == 1:
+                        if is_telugu(morphemes[0]):
+                            solo_freq[morphemes[0]] += 1
+                    else:
+                        for idx, m in enumerate(morphemes):
+                            if not is_telugu(m):
+                                continue
+                            if idx == 0:
+                                initial_freq[m] += 1
+                            elif idx == len(morphemes) - 1:
+                                final_freq[m] += 1
+                            else:
+                                cont_freq[m] += 1
 
-            doc_count += 1
-            if num_docs > 0 and doc_count >= num_docs:
-                break
+                doc_count += 1
+                if num_docs > 0 and doc_count >= num_docs:
+                    break
+        else:
+            # Parallel
+            with Pool(
+                processes=num_workers,
+                initializer=_init_worker_pass1,
+                initargs=(cache, model),
+            ) as pool:
+                pbar = tqdm(desc=f"Pass 1: {fpath.name}", unit=" docs",
+                            total=num_docs if num_docs > 0 else None)
+
+                for solo, initial, cont, final in pool.imap_unordered(
+                    _count_positions_single,
+                    _iter_text_from_file(fpath),
+                    chunksize=1,
+                ):
+                    for m, c in solo.items():
+                        solo_freq[m] += c
+                    for m, c in initial.items():
+                        initial_freq[m] += c
+                    for m, c in cont.items():
+                        cont_freq[m] += c
+                    for m, c in final.items():
+                        final_freq[m] += c
+
+                    doc_count += 1
+                    pbar.update(1)
+
+                    if num_docs > 0 and doc_count >= num_docs:
+                        pool.terminate()
+                        break
+
+                pbar.close()
 
         if num_docs > 0 and doc_count >= num_docs:
             break
@@ -806,8 +879,15 @@ _shared_model = None
 _shared_suffix_set = None
 
 
+def _init_worker_pass1(cache, model):
+    """Initializer for Pass 1 pool workers — sets cache and model only."""
+    global _shared_cache, _shared_model
+    _shared_cache = cache
+    _shared_model = model
+
+
 def _init_worker(cache, model, suffix_set):
-    """Initializer for pool workers — sets shared globals from parent."""
+    """Initializer for Pass 2 pool workers — sets shared globals from parent."""
     global _shared_cache, _shared_model, _shared_suffix_set
     _shared_cache = cache
     _shared_model = model
