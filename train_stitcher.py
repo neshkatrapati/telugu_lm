@@ -145,7 +145,7 @@ class FeatureExtractor:
         bigram_freq = Counter()
         char_ngram_freq = Counter()
 
-        for left, right, label in examples:
+        for left, right, label in tqdm(examples, desc="Fitting features", unit=" boundaries"):
             morph_freq[left] += 1
             morph_freq[right] += 1
             bigram_freq[(left, right)] += 1
@@ -350,7 +350,7 @@ class StitcherModel:
             np.random.shuffle(indices)
 
         total_loss = 0.0
-        for idx in indices:
+        for idx in tqdm(indices, desc="Training", unit=" examples"):
             left, right, label = examples[idx]
             active = feature_extractor.transform_one(left, right)
 
@@ -376,7 +376,7 @@ class StitcherModel:
         """Evaluate on examples. Returns accuracy, precision, recall, F1 for both classes."""
         tp = fp = tn = fn = 0
 
-        for left, right, label in examples:
+        for left, right, label in tqdm(examples, desc="Evaluating", unit=" examples"):
             active = feature_extractor.transform_one(left, right)
             pred = self.predict(active)
 
