@@ -81,7 +81,7 @@ def iter_texts(input_path: Path, num_docs: int = 0):
                         return
 
 
-def load_morf_tokenizer(tokenizer_dir: Path):
+def load_morf_tokenizer(tokenizer_dir: Path, morf_model: str = None, suffix_set_path: str = None):
     """Load Morfessor v4 tokenizer + model for segmentation."""
     sys.path.insert(0, str(tokenizer_dir.parent))
     from train_tokenizer import MorfessorTokenizer
@@ -96,27 +96,44 @@ def load_morf_tokenizer(tokenizer_dir: Path):
     # Load Morfessor model for segmentation
     model = None
     suffix_set = None
-    for mpath in [Path("./data/morfessor/morfessor_telugu.bin"),
-                  Path("./morfessor_telugu.bin")]:
+
+    search_model = [Path("./data/morfessor/morfessor_telugu.bin"),
+                    Path("./morfessor_telugu.bin")]
+    if morf_model:
+        search_model.insert(0, Path(morf_model))
+
+    for mpath in search_model:
         if mpath.exists():
             io = morfessor.MorfessorIO()
             model = io.read_binary_model_file(str(mpath))
+            logger.info("Loaded Morfessor model from %s", mpath)
             break
 
-    # Load suffix set
-    for spath in [Path("./data/morfessor/suffix_set.json"),
-                  Path("./suffix_set.json")]:
+    # Load suffix set — search near the model too
+    search_suffix = [Path("./data/morfessor/suffix_set.json"),
+                     Path("./suffix_set.json")]
+    if suffix_set_path:
+        search_suffix.insert(0, Path(suffix_set_path))
+    if model is not None:
+        # Also look next to the model file
+        for mpath in search_model:
+            if mpath.exists():
+                search_suffix.insert(0, mpath.parent / "suffix_set.json")
+                break
+
+    for spath in search_suffix:
         if spath.exists():
             with open(spath, "r", encoding="utf-8") as f:
                 suffix_data = json.load(f)
             suffix_set = set(suffix_data["morphemes"])
+            logger.info("Loaded suffix set from %s (%d morphemes)", spath, len(suffix_set))
             break
 
     if model is None:
-        logger.error("Morfessor model not found! Need data/morfessor/morfessor_telugu.bin")
+        logger.error("Morfessor model not found! Searched: %s", [str(p) for p in search_model])
         sys.exit(1)
     if suffix_set is None:
-        logger.error("suffix_set.json not found!")
+        logger.error("suffix_set.json not found! Searched: %s", [str(p) for p in search_suffix])
         sys.exit(1)
 
     logger.info("Loaded Morfessor v4 tokenizer (vocab=%d, suffix_set=%d)",
@@ -230,6 +247,10 @@ def main():
                         help="Path to Morfessor v4 tokenizer dir")
     parser.add_argument("--sp-model", type=str, default=None,
                         help="Path to SentencePiece .model file")
+    parser.add_argument("--morf-model", type=str, default=None,
+                        help="Path to morfessor_telugu.bin")
+    parser.add_argument("--suffix-set", type=str, default=None,
+                        help="Path to suffix_set.json")
     parser.add_argument("--num-docs", type=int, default=10000,
                         help="Number of documents to test (default: 10000)")
 
@@ -250,7 +271,7 @@ def main():
     # --- Morfessor v4 ---
     morf_dir = Path(args.morf_tokenizer)
     if morf_dir.exists():
-        tokenizer, morf_encode = load_morf_tokenizer(morf_dir)
+        tokenizer, morf_encode = load_morf_tokenizer(morf_dir, args.morf_model, args.suffix_set)
         stats = compute_stats(texts, morf_encode, "Morfessor v4")
         results.append(stats)
     else:
