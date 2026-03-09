@@ -1,36 +1,32 @@
 #!/usr/bin/env python3
 """
-Telugu Morfessor + BPE Tokenizer Builder (v3 — ▁ separator)
-=============================================================
+Telugu Morfessor + BPE Tokenizer Builder (v4 — reversed @@ prefix)
+====================================================================
 Builds a unified tokenizer that handles:
-  - Telugu morphemes from Morfessor (bare forms, no @@ duplication)
+  - Telugu morphemes from Morfessor (bare roots + @@-prefixed suffixes)
   - Non-Telugu text (English, numbers, URLs) via BPE subword encoding
   - Character-level fallback for anything not covered
-  - ▁ (U+2581) as a dedicated word-boundary separator token
 
-v3 changes from v2:
-  - Eliminated @@ suffix duplication — each morpheme stored ONCE
-  - ▁ is a single token (ID=4) inserted between words in the token stream
-  - Decode: concatenate all tokens, ▁ → space, strip
-  - Vocab size: ~33K Telugu + ~8-9K BPE + ~1K chars + 5 special ≈ ~43K
+v4 changes from v3:
+  - Eliminated ▁ separator token — word boundaries are implicit
+  - Bare token = new word (space before when decoding)
+  - @@-prefixed token = continuation (join to previous, no space)
+  - Vocab has both bare and @@-prefixed forms for qualifying Telugu suffixes
+  - Decode: scan tokens left-to-right, @@prefix → join, bare → space + token
 
 Pipeline:
-  1. Scan segmented corpus — collect TELUGU tokens (bare, no @@)
-     The ▁ separator tokens and non-Telugu tokens are skipped here.
+  1. Scan segmented corpus — collect ALL tokens (bare Telugu + @@-prefixed)
+     Non-Telugu tokens are skipped (handled by BPE).
   2. Load BPE vocab (from train_bpe.py) — handles all non-Telugu text
-  3. Add character-level fallback (single form per char, no @@ variants)
+  3. Add character-level fallback
   4. Build token-to-id / id-to-token mappings
-  5. Save as JSON tokenizer (v3.0)
+  5. Save as JSON tokenizer (v4.0)
 
 Usage:
     python train_tokenizer.py \\
-        --segmented-corpus ./data/morfessor/segmented_corpus/sangraha/ \\
+        --segmented-corpus ./data/morfessor/sample.seg.txt \\
         --bpe-vocab ./data/morfessor/bpe/bpe_vocab.tsv \\
         --bpe-merges ./data/morfessor/bpe/bpe_merges.txt \\
-        --output ./tokenizer
-
-    python train_tokenizer.py \\
-        --segmented-corpus ./data/morfessor/segmented_corpus/sangraha/ \\
         --output ./tokenizer
 """
 
@@ -60,7 +56,6 @@ SPECIAL_TOKENS = OrderedDict([
     ("<unk>", 1),
     ("<bos>", 2),
     ("<eos>", 3),
-    ("\u2581", 4),  # ▁ word-boundary separator
 ])
 
 NUM_SPECIAL = len(SPECIAL_TOKENS)
@@ -84,53 +79,46 @@ def _has_telugu(s: str) -> bool:
 # Step 1: Build vocabulary from segmented corpus (parallelized)
 # ---------------------------------------------------------------------------
 
-def _count_chunk(args: tuple) -> tuple[Counter, int, int]:
-    """Worker: count Telugu-containing token frequencies in a chunk of lines.
+def _count_chunk(args: tuple) -> tuple[Counter, Counter, int]:
+    """Worker: count token frequencies in a chunk of lines.
 
-    v3: Tokens are bare (no @@ suffix). The ▁ separator is skipped.
-    Only tokens containing at least one Telugu character are counted.
-    Non-Telugu tokens (English, numbers, URLs) are skipped — they are
-    handled entirely by BPE subwords.
+    v4: Tokens are either bare (roots/standalone) or @@-prefixed (suffixes).
+    Both types with Telugu chars are counted separately.
+    Non-Telugu tokens (English, numbers, URLs) are skipped — handled by BPE.
 
-    Returns (telugu_token_freq, total_tokens_seen, telugu_tokens_counted).
+    Returns (bare_telugu_freq, prefix_telugu_freq, total_tokens_seen).
     """
-    lines, separator, sep_len = args
-    freq: Counter = Counter()
+    lines = args[0]
+    bare_freq: Counter = Counter()
+    prefix_freq: Counter = Counter()
     total = 0
-    telugu_count = 0
     for line in lines:
         for token in line.split():
             if not token:
                 continue
-            # Skip the word-boundary separator token
-            if token == separator:
-                continue
             total += 1
-            # v3: tokens are bare — count base form directly
-            if _has_telugu(token):
-                freq[token] += 1
-                telugu_count += 1
-    return freq, total, telugu_count
+            if token.startswith("@@"):
+                # @@-prefixed suffix — check if Telugu
+                base = token[2:]
+                if _has_telugu(base):
+                    prefix_freq[token] += 1
+            else:
+                # Bare token — count if Telugu
+                if _has_telugu(token):
+                    bare_freq[token] += 1
+    return bare_freq, prefix_freq, total
 
 
-def build_vocab_from_corpus(corpus_path: Path, separator: str, num_workers: int = 0) -> list[tuple[str, int]]:
-    """Scan segmented corpus files and count TELUGU-CONTAINING tokens only.
+def build_vocab_from_corpus(corpus_path: Path, num_workers: int = 0) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    """Scan segmented corpus files and count Telugu token frequencies.
 
-    v3 changes:
-      1. Tokens are bare (no @@ suffix). Each morpheme stored once.
-      2. The ▁ separator token is skipped during counting.
-      3. Only tokens containing at least one Telugu character are counted.
-         Non-Telugu text (English, numbers, URLs) is handled entirely by BPE.
+    v4: Collects both bare Telugu morphemes and @@-prefixed suffixes separately.
+    Non-Telugu text is skipped (handled by BPE).
 
     Parallelized: streams lines into chunks, dispatches to workers.
 
-    Args:
-        corpus_path: Path to a .seg.txt file or a directory containing them.
-        separator: The word-boundary separator token (e.g. '▁').
-        num_workers: Number of parallel workers (0 = auto).
-
     Returns:
-        List of (token, frequency) tuples sorted by frequency descending.
+        (bare_morphemes, prefix_morphemes) — each a list of (token, freq) sorted by freq desc.
     """
     from tqdm import tqdm
     from multiprocessing import cpu_count
@@ -148,14 +136,12 @@ def build_vocab_from_corpus(corpus_path: Path, separator: str, num_workers: int 
         num_workers = max(1, cpu_count() - 1)
 
     CHUNK_SIZE = 50_000  # lines per chunk
-    sep_len = len(separator)
 
     logger.info("Scanning %d segmented file(s) for Telugu morphemes (%d workers)...",
                 len(seg_files), num_workers)
-    logger.info("  (Non-Telugu tokens skipped — handled by BPE)")
-    token_freq: Counter = Counter()
+    bare_freq: Counter = Counter()
+    prefix_freq: Counter = Counter()
     total_tokens = 0
-    telugu_tokens = 0
 
     for fpath in seg_files:
         logger.info("  Scanning %s", fpath.name)
@@ -176,18 +162,18 @@ def build_vocab_from_corpus(corpus_path: Path, separator: str, num_workers: int 
                     line_count += 1
                     pbar.update(1)
                     if len(current_chunk) >= CHUNK_SIZE:
-                        futures.append(executor.submit(_count_chunk, (current_chunk, separator, sep_len)))
+                        futures.append(executor.submit(_count_chunk, (current_chunk,)))
                         current_chunk = []
             if current_chunk:
-                futures.append(executor.submit(_count_chunk, (current_chunk, separator, sep_len)))
+                futures.append(executor.submit(_count_chunk, (current_chunk,)))
 
             pbar.set_description(f"{fpath.name} (merging {len(futures)} chunks)")
 
             for fut in as_completed(futures):
-                freq, total, tel_count = fut.result()
-                token_freq += freq
+                bf, pf, total = fut.result()
+                bare_freq += bf
+                prefix_freq += pf
                 total_tokens += total
-                telugu_tokens += tel_count
 
             executor.shutdown(wait=False)
             pbar.close()
@@ -200,25 +186,30 @@ def build_vocab_from_corpus(corpus_path: Path, separator: str, num_workers: int 
                     for token in line.split():
                         if not token:
                             continue
-                        # Skip the word-boundary separator token
-                        if token == separator:
-                            continue
                         total_tokens += 1
-                        # v3: tokens are bare — count base form directly
-                        if _has_telugu(token):
-                            token_freq[token] += 1
-                            telugu_tokens += 1
+                        if token.startswith("@@"):
+                            base = token[2:]
+                            if _has_telugu(base):
+                                prefix_freq[token] += 1
+                        else:
+                            if _has_telugu(token):
+                                bare_freq[token] += 1
 
+    tel_tokens = sum(bare_freq.values()) + sum(prefix_freq.values())
+    non_tel = total_tokens - tel_tokens
     logger.info("Total tokens scanned: %d", total_tokens)
-    logger.info("Telugu tokens: %d (%.1f%%)", telugu_tokens,
-                100 * telugu_tokens / total_tokens if total_tokens else 0)
-    logger.info("Non-Telugu tokens skipped: %d (%.1f%%)", total_tokens - telugu_tokens,
-                100 * (total_tokens - telugu_tokens) / total_tokens if total_tokens else 0)
-    logger.info("Unique Telugu morpheme types: %d (single form, no @@ duplication)",
-                len(token_freq))
+    logger.info("Telugu bare tokens: %d (%.1f%%), unique: %d",
+                sum(bare_freq.values()), 100 * sum(bare_freq.values()) / total_tokens if total_tokens else 0,
+                len(bare_freq))
+    logger.info("Telugu @@-prefixed tokens: %d (%.1f%%), unique: %d",
+                sum(prefix_freq.values()), 100 * sum(prefix_freq.values()) / total_tokens if total_tokens else 0,
+                len(prefix_freq))
+    logger.info("Non-Telugu tokens skipped: %d (%.1f%%)", non_tel,
+                100 * non_tel / total_tokens if total_tokens else 0)
 
-    morphemes = sorted(token_freq.items(), key=lambda x: x[1], reverse=True)
-    return morphemes
+    bare_morphemes = sorted(bare_freq.items(), key=lambda x: x[1], reverse=True)
+    prefix_morphemes = sorted(prefix_freq.items(), key=lambda x: x[1], reverse=True)
+    return bare_morphemes, prefix_morphemes
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +245,6 @@ def load_bpe_merges(merges_path: Path) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 def build_tokenizer(
     output_dir: Path,
-    separator: str,
     segmented_corpus: Path = None,
     morfessor_dir: Path = None,
     vocab_size: int = 0,
@@ -265,16 +255,17 @@ def build_tokenizer(
 ):
     """Build a unified tokenizer from Morfessor morphemes + BPE subwords.
 
-    v3 Vocabulary structure:
-        [special tokens incl ▁] + [Telugu morphemes (bare)] + [BPE subwords (bare)] + [char fallbacks (bare)]
+    v4 Vocabulary structure:
+        [special tokens] + [bare Telugu morphemes] + [@@-prefixed Telugu suffixes]
+        + [BPE subwords] + [char fallbacks]
 
-    Each morpheme/subword/character is stored ONCE — no @@ duplication.
-    The ▁ word-boundary separator is a special token (ID=4).
+    Word boundary semantics:
+      - Bare token → new word (space before during decode)
+      - @@-prefixed token → continuation (join to previous, no space)
 
     Args:
         output_dir: Where to save tokenizer files.
-        separator: Word-boundary separator token (default: ▁).
-        segmented_corpus: Path to .seg.txt files — scanned for Telugu morphemes only.
+        segmented_corpus: Path to .seg.txt files — scanned for Telugu morphemes.
         morfessor_dir: Fallback — directory containing morpheme_vocab.tsv.
         vocab_size: Cap vocab at this size (0 = use all).
         bpe_vocab_path: Path to bpe_vocab.tsv from train_bpe.py.
@@ -284,72 +275,62 @@ def build_tokenizer(
 
     # --- Collect Morfessor morphemes ---
     if segmented_corpus is not None:
-        morphemes = build_vocab_from_corpus(segmented_corpus, separator, num_workers)
+        bare_morphemes, prefix_morphemes = build_vocab_from_corpus(segmented_corpus, num_workers)
 
-        # Filter by minimum frequency — removes rare junk (URLs, garbage, hapax legomena)
+        # Filter by minimum frequency
         if min_freq > 1:
-            before = len(morphemes)
-            morphemes = [(tok, freq) for tok, freq in morphemes if freq >= min_freq]
-            dropped = before - len(morphemes)
-            logger.info("Filtered by min_freq=%d: %d -> %d types (%d rare tokens dropped)",
-                        min_freq, before, len(morphemes), dropped)
-    elif morfessor_dir is not None:
-        vocab_path = morfessor_dir / "morpheme_vocab.tsv"
-        if not vocab_path.exists():
-            logger.error("morpheme_vocab.tsv not found at %s", vocab_path)
-            logger.error("Run: python morfessor_segment.py --input ./data --train-only")
-            logger.error("Or use --segmented-corpus to build vocab from segmented text files")
-            sys.exit(1)
-
-        logger.info("Reading morpheme vocabulary from %s", vocab_path)
-        morphemes = []
-        with open(vocab_path, "r", encoding="utf-8") as f:
-            header = f.readline()
-            for line in f:
-                parts = line.strip().split("\t")
-                if len(parts) == 2:
-                    morphemes.append((parts[0], int(parts[1])))
+            before_bare = len(bare_morphemes)
+            bare_morphemes = [(tok, freq) for tok, freq in bare_morphemes if freq >= min_freq]
+            before_pfx = len(prefix_morphemes)
+            prefix_morphemes = [(tok, freq) for tok, freq in prefix_morphemes if freq >= min_freq]
+            logger.info("Filtered by min_freq=%d: bare %d->%d, @@-prefixed %d->%d",
+                        min_freq, before_bare, len(bare_morphemes),
+                        before_pfx, len(prefix_morphemes))
     else:
-        logger.error("Must provide either --segmented-corpus or --morfessor-dir")
+        logger.error("Must provide --segmented-corpus")
         sys.exit(1)
 
-    logger.info("Telugu morphemes to add: %d types", len(morphemes))
-
-    # Sort by frequency
-    morphemes.sort(key=lambda x: x[1], reverse=True)
-
-    # Cap if requested
-    if vocab_size > 0:
-        max_morphemes = vocab_size - NUM_SPECIAL
-        if len(morphemes) > max_morphemes:
-            logger.info("Capping morphemes from %d to %d", len(morphemes), max_morphemes)
-            morphemes = morphemes[:max_morphemes]
+    logger.info("Bare Telugu morphemes to add: %d", len(bare_morphemes))
+    logger.info("@@-prefixed Telugu suffixes to add: %d", len(prefix_morphemes))
 
     # --- Build token-to-id mapping ---
     token_to_id = dict(SPECIAL_TOKENS)
     id_to_token = {v: k for k, v in SPECIAL_TOKENS.items()}
     next_id = NUM_SPECIAL
 
-    # Add morfessor morphemes (bare forms only — no @@ duplication)
-    morfessor_count = 0
-    for morph, freq in morphemes:
+    # Add bare Telugu morphemes (roots + standalone words)
+    bare_count = 0
+    for morph, freq in bare_morphemes:
         if morph not in token_to_id:
             token_to_id[morph] = next_id
             id_to_token[next_id] = morph
             next_id += 1
-            morfessor_count += 1
+            bare_count += 1
+    bare_end_id = next_id - 1
 
-    logger.info("Added %d Morfessor morpheme tokens (IDs %d-%d)",
-                morfessor_count, NUM_SPECIAL, next_id - 1)
+    logger.info("Added %d bare Telugu morpheme tokens (IDs %d-%d)",
+                bare_count, NUM_SPECIAL, bare_end_id)
 
-    # --- Add BPE subwords (non-Telugu) — bare forms only, no @@ duplication ---
+    # Add @@-prefixed Telugu suffixes
+    prefix_count = 0
+    for morph, freq in prefix_morphemes:
+        if morph not in token_to_id:
+            token_to_id[morph] = next_id
+            id_to_token[next_id] = morph
+            next_id += 1
+            prefix_count += 1
+    prefix_end_id = next_id - 1
+
+    logger.info("Added %d @@-prefixed Telugu suffix tokens (IDs %d-%d)",
+                prefix_count, bare_end_id + 1, prefix_end_id)
+
+    # --- Add BPE subwords (non-Telugu) ---
     bpe_merges = []
     bpe_count = 0
     if bpe_vocab_path and bpe_merges_path:
         bpe_vocab = load_bpe_vocab(bpe_vocab_path)
         bpe_merges = load_bpe_merges(bpe_merges_path)
 
-        # Add BPE subwords that aren't already in the vocab (bare form only)
         for subword, freq in sorted(bpe_vocab.items(), key=lambda x: -x[1]):
             if subword not in token_to_id:
                 token_to_id[subword] = next_id
@@ -357,13 +338,11 @@ def build_tokenizer(
                 next_id += 1
                 bpe_count += 1
 
-        logger.info("Added %d BPE subword tokens (bare, no @@ duplication)", bpe_count)
+        logger.info("Added %d BPE subword tokens", bpe_count)
     else:
         logger.info("No BPE vocab provided — non-Telugu text will use character fallback")
 
-    # --- Add character-level fallback (bare forms only, no @@ duplication) ---
-    # For any token not covered by morphemes or BPE, we fall back to characters.
-    # v3: single form per character — no continuation/word-final split.
+    # --- Add character-level fallback ---
     char_ranges = []
     # Printable ASCII (32-126)
     char_ranges.extend(chr(c) for c in range(32, 127))
@@ -382,24 +361,24 @@ def build_tokenizer(
 
     final_vocab_size = len(token_to_id)
 
-    logger.info("Added %d character fallback tokens (bare, no @@ duplication)", char_count)
+    logger.info("Added %d character fallback tokens", char_count)
     logger.info("")
-    logger.info("Tokenizer built (v3.0 — ▁ separator):")
-    logger.info("  Vocab size:       %d", final_vocab_size)
-    logger.info("  Special tokens:   %d (incl ▁ separator)", NUM_SPECIAL)
-    logger.info("  Morfessor tokens: %d", morfessor_count)
-    logger.info("  BPE tokens:       %d", bpe_count)
-    logger.info("  Char fallbacks:   %d", char_count)
+    logger.info("Tokenizer built (v4.0 — reversed @@ prefix):")
+    logger.info("  Vocab size:          %d", final_vocab_size)
+    logger.info("  Special tokens:      %d", NUM_SPECIAL)
+    logger.info("  Bare Telugu tokens:  %d", bare_count)
+    logger.info("  @@-prefix tokens:    %d", prefix_count)
+    logger.info("  BPE tokens:          %d", bpe_count)
+    logger.info("  Char fallbacks:      %d", char_count)
 
     # --- Save tokenizer ---
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Save as JSON (human-readable)
+    # 1. Save as JSON
     tokenizer_json = {
-        "version": "3.0",
-        "type": "morfessor_bpe_telugu",
+        "version": "4.0",
+        "type": "morfessor_bpe_telugu_v4",
         "vocab_size": final_vocab_size,
-        "separator": separator,
         "special_tokens": dict(SPECIAL_TOKENS),
         "token_to_id": token_to_id,
         "bpe_merges": [[a, b] for a, b in bpe_merges],
@@ -419,13 +398,17 @@ def build_tokenizer(
     # 3. Save token frequencies (for analysis)
     freq_path = output_dir / "token_frequencies.tsv"
     with open(freq_path, "w", encoding="utf-8") as f:
-        f.write("token_id\ttoken\tfrequency\n")
+        f.write("token_id\ttoken\tfrequency\tsource\n")
         for name, tid in SPECIAL_TOKENS.items():
-            f.write(f"{tid}\t{name}\t0\n")
-        for i, (morph, freq) in enumerate(morphemes):
+            f.write(f"{tid}\t{name}\t0\tspecial\n")
+        for morph, freq in bare_morphemes:
             tid = token_to_id.get(morph)
             if tid is not None:
-                f.write(f"{tid}\t{morph}\t{freq}\n")
+                f.write(f"{tid}\t{morph}\t{freq}\tbare_telugu\n")
+        for morph, freq in prefix_morphemes:
+            tid = token_to_id.get(morph)
+            if tid is not None:
+                f.write(f"{tid}\t{morph}\t{freq}\tprefix_telugu\n")
     logger.info("Saved token frequencies to %s", freq_path)
 
     return token_to_id, id_to_token, final_vocab_size
@@ -435,7 +418,6 @@ def build_tokenizer(
 # BPE encode helper (used at encode time for non-Telugu tokens)
 # ---------------------------------------------------------------------------
 
-# Module-level cache for the merge priority dict (built once, reused)
 _bpe_merge_ranks: dict[tuple[str, str], int] | None = None
 
 
@@ -452,10 +434,9 @@ def bpe_encode_word(word: str, merges: list[tuple[str, str]]) -> list[str]:
     """Encode a word into BPE subwords using the learned merge table.
 
     Uses priority-based pair merging: at each step, finds the highest-priority
-    (lowest rank) pair present in the current symbols and merges it. This is
-    O(word_length² × log) instead of O(num_merges × word_length).
+    (lowest rank) pair present in the current symbols and merges it.
 
-    v3: Returns bare subwords (no @@ suffix). Word boundaries handled by ▁.
+    v4: Returns bare subwords. Word boundaries handled by @@ prefix scheme.
         "international" -> ["inter", "nation", "al"]
     """
     if not word:
@@ -465,9 +446,8 @@ def bpe_encode_word(word: str, merges: list[tuple[str, str]]) -> list[str]:
     symbols = list(word)
 
     while len(symbols) > 1:
-        # Find the pair with the lowest merge rank in current symbols
         best_pair = None
-        best_rank = len(merges)  # sentinel: worse than any real rank
+        best_rank = len(merges)
         for i in range(len(symbols) - 1):
             pair = (symbols[i], symbols[i + 1])
             r = ranks.get(pair)
@@ -476,9 +456,8 @@ def bpe_encode_word(word: str, merges: list[tuple[str, str]]) -> list[str]:
                 best_pair = pair
 
         if best_pair is None:
-            break  # no more merges possible
+            break
 
-        # Merge all occurrences of best_pair
         a, b = best_pair
         merged = a + b
         new_symbols = []
@@ -492,7 +471,6 @@ def bpe_encode_word(word: str, merges: list[tuple[str, str]]) -> list[str]:
                 i += 1
         symbols = new_symbols
 
-    # v3: return bare subwords — no @@ suffix
     return symbols
 
 
@@ -503,14 +481,16 @@ class MorfessorTokenizer:
     """
     Unified tokenizer for Morfessor-segmented Telugu + BPE non-Telugu text.
 
-    v3: Uses ▁ (U+2581) as a dedicated word-boundary separator token.
-    All morphemes/subwords are stored as single bare forms (no @@ duplication).
+    v4: Reversed @@ prefix scheme for word boundaries.
+    - Bare token = new word (space before when decoding)
+    - @@-prefixed token = continuation (join to previous, no space)
+    - No ▁ separator token
 
-    Expects input text that has already been segmented (by morfessor_segment.py
-    or inference.py's segment_text), with ▁ tokens between words.
+    Expects input text that has already been segmented by morfessor_segment.py
+    (v4 format with @@ prefix on suffixes).
 
     Example:
-        segmented = "▁ విద్యార్థు ల కు ▁ went ▁ to ▁ school"
+        segmented = "విద్యార్థు @@ల @@కు went to school"
         ids = tokenizer.encode(segmented)
         text = tokenizer.decode(ids)
         # text == "విద్యార్థులకు went to school"
@@ -527,9 +507,7 @@ class MorfessorTokenizer:
 
         self.version = data.get("version", "1.0")
         self.vocab_size = data["vocab_size"]
-        self.separator = data["separator"]
         self.token_to_id = data["token_to_id"]
-        # Rebuild id_to_token properly: iterate token_to_id
         self.id_to_token = {}
         for token, tid in self.token_to_id.items():
             self.id_to_token[tid] = token
@@ -540,7 +518,6 @@ class MorfessorTokenizer:
         self.unk_id = self.special_tokens["<unk>"]
         self.bos_id = self.special_tokens["<bos>"]
         self.eos_id = self.special_tokens["<eos>"]
-        self.sep_id = self.special_tokens.get("\u2581", self.token_to_id.get("\u2581"))
 
         # Load BPE merges if present
         self.bpe_merges = []
@@ -548,8 +525,7 @@ class MorfessorTokenizer:
             self.bpe_merges = [(a, b) for a, b in data["bpe_merges"]]
             logger.info("Loaded %d BPE merge rules from tokenizer", len(self.bpe_merges))
 
-        # Cache for BPE encode results — same word always produces same subwords
-        # Avoids re-running 8K merge rules for repeated tokens (huge speedup)
+        # Cache for BPE encode results
         self._bpe_cache: dict[str, list[int]] = {}
 
     def _is_telugu(self, token: str) -> bool:
@@ -559,10 +535,8 @@ class MorfessorTokenizer:
     def _encode_token_bpe(self, word: str) -> list[int]:
         """Encode a single non-Telugu word using BPE merges, with char fallback.
 
-        v3: BPE produces bare subwords. No @@ handling needed.
-        Results are cached — the same word always produces the same IDs.
+        v4: BPE produces bare subwords. Results are cached.
         """
-        # Check cache first
         cached = self._bpe_cache.get(word)
         if cached is not None:
             return cached
@@ -575,23 +549,18 @@ class MorfessorTokenizer:
                 if tid is not None:
                     ids.append(tid)
                 else:
-                    # BPE subword not in vocab — char fallback
                     for ch in sw:
                         cid = self.token_to_id.get(ch, self.unk_id)
                         ids.append(cid)
             self._bpe_cache[word] = ids
             return ids
         else:
-            # No BPE — pure character fallback
             ids = self._encode_token_chars(word)
             self._bpe_cache[word] = ids
             return ids
 
     def _encode_token_chars(self, word: str) -> list[int]:
-        """Encode a word character-by-character.
-
-        v3: No @@ continuation — each character maps to its bare form.
-        """
+        """Encode a word character-by-character."""
         ids = []
         for ch in word:
             cid = self.token_to_id.get(ch, self.unk_id)
@@ -601,14 +570,14 @@ class MorfessorTokenizer:
     def encode(self, text: str, add_bos: bool = False, add_eos: bool = True) -> list[int]:
         """Encode segmented text to token IDs.
 
-        v3: Input text has ▁ as word-boundary separators and bare morphemes.
-        Example: "▁ విద్యార్థు ల కు ▁ went ▁ to ▁ school"
+        v4: Input text has bare roots and @@-prefixed suffixes.
+        Example: "విద్యార్థు @@ల @@కు went to school"
 
         Each whitespace-separated token is looked up directly in the vocab.
-        The ▁ token maps to sep_id. For unknown tokens, BPE or char fallback.
+        For unknown tokens, BPE or char fallback is used.
 
         Args:
-            text: Segmented text with ▁ word boundaries.
+            text: Segmented text in v4 format.
             add_bos: Prepend <bos> token.
             add_eos: Append <eos> token.
 
@@ -623,15 +592,22 @@ class MorfessorTokenizer:
             if not token:
                 continue
 
-            # Direct lookup — this is the primary path
-            # Covers ▁ separator, morphemes, BPE subwords, characters
+            # Direct lookup — primary path
+            # Handles bare morphemes, @@-prefixed suffixes, BPE subwords, chars
             tid = self.token_to_id.get(token)
             if tid is not None:
                 ids.append(tid)
                 continue
 
             # Token not in vocab — need fallback
-            if not self._is_telugu(token):
+            if token.startswith("@@"):
+                # @@-prefixed token not in vocab — try char fallback on the base
+                base = token[2:]
+                if self._is_telugu(base):
+                    ids.extend(self._encode_token_chars(base))
+                else:
+                    ids.extend(self._encode_token_bpe(base))
+            elif not self._is_telugu(token):
                 # Non-Telugu: try BPE encoding
                 ids.extend(self._encode_token_bpe(token))
             else:
@@ -646,18 +622,16 @@ class MorfessorTokenizer:
     def encode_lines_to_array(self, lines: list[str], add_eos: bool = True) -> tuple:
         """Batch-encode multiple lines into a flat uint32 array + stats.
 
-        v3: Tokens are bare (no @@ handling). ▁ separator maps to sep_id.
-        Optimized for data preparation — avoids per-line Python overhead.
-        Uses local variable references for hot-path speedup.
+        v4: Tokens are bare or @@-prefixed. Direct lookup for most tokens.
+        Optimized for data preparation.
 
         Args:
-            lines: List of segmented text lines (with ▁ word boundaries).
+            lines: List of segmented text lines (v4 format).
             add_eos: Append <eos> after each line.
 
         Returns:
             (np.uint32 array of all IDs, total_token_count, unk_count)
         """
-        # Local refs for hot-path (avoids repeated attribute lookups)
         _get = self.token_to_id.get
         _unk = self.unk_id
         _eos = self.eos_id
@@ -674,8 +648,7 @@ class MorfessorTokenizer:
                 continue
 
             for token in line.split():
-                # Fast path: direct vocab lookup (handles ~90%+ of tokens)
-                # Covers ▁, morphemes, BPE subwords, and characters
+                # Fast path: direct vocab lookup (handles ~95%+ of tokens)
                 tid = _get(token)
                 if tid is not None:
                     all_ids.append(tid)
@@ -687,7 +660,15 @@ class MorfessorTokenizer:
                 # Slow path: token not in vocab
                 total += 1
 
-                if not _is_tel(token):
+                if token.startswith("@@"):
+                    # @@-prefixed OOV — char fallback on base
+                    base = token[2:]
+                    for ch in base:
+                        cid = _get(ch, _unk)
+                        all_ids.append(cid)
+                        if cid == _unk:
+                            unk_count += 1
+                elif not _is_tel(token):
                     # Non-Telugu → BPE (cached)
                     sub_ids = _bpe(token)
                     all_ids.extend(sub_ids)
@@ -709,8 +690,10 @@ class MorfessorTokenizer:
     def decode(self, ids: list[int]) -> str:
         """Decode token IDs back to text.
 
-        v3: Concatenate all tokens directly. ▁ token produces a space.
-        Strip leading/trailing whitespace.
+        v4: Reversed @@ prefix scheme.
+          - @@-prefixed token → join directly to previous (no space)
+          - Bare token → new word (space before)
+          - Strip leading/trailing whitespace
 
         Args:
             ids: List of integer token IDs.
@@ -721,11 +704,14 @@ class MorfessorTokenizer:
         parts = []
         for tid in ids:
             token = self.id_to_token.get(tid, "")
-            if token in ("<pad>", "<bos>", "<eos>"):
+            if token in ("<pad>", "<bos>", "<eos>", "<unk>"):
                 continue
-            if token == "\u2581":
-                parts.append(" ")
+            if token.startswith("@@"):
+                # Continuation — join to previous (no space)
+                parts.append(token[2:])
             else:
+                # New word — space before
+                parts.append(" ")
                 parts.append(token)
 
         return "".join(parts).strip()
@@ -737,7 +723,7 @@ class MorfessorTokenizer:
 # ---------------------------------------------------------------------------
 # Test tokenization
 # ---------------------------------------------------------------------------
-def test_tokenizer(tokenizer_dir: Path, test_texts: list[str], separator: str):
+def test_tokenizer(tokenizer_dir: Path, test_texts: list[str]):
     """Test the tokenizer on sample texts."""
     tokenizer = MorfessorTokenizer(tokenizer_dir)
 
@@ -749,33 +735,48 @@ def test_tokenizer(tokenizer_dir: Path, test_texts: list[str], separator: str):
     logger.info("  BPE merges: %d", len(tokenizer.bpe_merges))
     logger.info("")
 
-    # If we have a morfessor model, we can segment the test texts
-    morfessor_model_path = tokenizer_dir.parent / "data" / "morfessor" / "morfessor_telugu.bin"
-    # Also check relative to tokenizer dir
-    alt_path = Path("./data/morfessor/morfessor_telugu.bin")
+    # Try loading Morfessor model for test segmentation
     model = None
-    for mpath in [morfessor_model_path, alt_path]:
+    suffix_set = None
+    for mpath in [Path("./data/morfessor/morfessor_telugu.bin"),
+                  tokenizer_dir.parent / "data" / "morfessor" / "morfessor_telugu.bin"]:
         if mpath.exists():
             try:
                 import morfessor
                 io = morfessor.MorfessorIO()
                 model = io.read_binary_model_file(str(mpath))
                 logger.info("  (Using Morfessor model for test segmentation: %s)", mpath)
+                # Try to load suffix_set
+                for spath in [Path("./data/morfessor/suffix_set.json"),
+                              mpath.parent / "suffix_set.json"]:
+                    if spath.exists():
+                        import json as _json
+                        with open(spath, "r", encoding="utf-8") as f:
+                            suffix_data = _json.load(f)
+                        suffix_set = set(suffix_data["morphemes"])
+                        logger.info("  (Loaded suffix set: %d morphemes)", len(suffix_set))
+                        break
                 break
             except ImportError:
                 pass
 
     for text in test_texts:
-        # Segment with Morfessor if available — v3: ▁ separator format
+        # Segment with Morfessor if available — v4 format
         if model:
+            from morfessor_segment import (
+                split_script_boundaries, TELUGU_WORD_RE as _TEL_RE,
+                _segment_telugu_word, _format_word_v4,
+            )
             seg_tokens = []
+            cache = {}
             for word in text.split():
-                seg_tokens.append(separator)  # ▁ before each word
-                if TELUGU_WORD_RE.fullmatch(word):
-                    segments = model.viterbi_segment(word)[0]
-                    seg_tokens.extend(segments)  # bare morphemes
-                else:
-                    seg_tokens.append(word)
+                parts = split_script_boundaries(word)
+                for part in parts:
+                    if _TEL_RE.fullmatch(part):
+                        morphemes = _segment_telugu_word(cache, model, part)
+                        seg_tokens.extend(_format_word_v4(morphemes, suffix_set))
+                    else:
+                        seg_tokens.append(part)
             segmented = " ".join(seg_tokens)
         else:
             segmented = text  # assume already segmented
@@ -794,7 +795,7 @@ def test_tokenizer(tokenizer_dir: Path, test_texts: list[str], separator: str):
 
         # Verify round-trip
         if text == decoded.strip():
-            logger.info("  Round-trip: PASS")
+            logger.info("  Round-trip: PASS ✓")
         else:
             logger.info("  Round-trip: MISMATCH")
             logger.info("    Expected: '%s'", text)
@@ -809,20 +810,17 @@ def test_tokenizer(tokenizer_dir: Path, test_texts: list[str], separator: str):
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Build Telugu tokenizer from Morfessor morphemes + BPE (v2)",
+        description="Build Telugu tokenizer from Morfessor morphemes + BPE (v4 — reversed @@ prefix)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Full build with BPE:
-  %(prog)s --segmented-corpus ./data/morfessor/segmented_corpus/sangraha/ \\
+  %(prog)s --segmented-corpus ./data/morfessor/sample.seg.txt \\
            --bpe-vocab ./data/morfessor/bpe/bpe_vocab.tsv \\
            --bpe-merges ./data/morfessor/bpe/bpe_merges.txt
 
   # Without BPE (character fallback for non-Telugu):
-  %(prog)s --segmented-corpus ./data/morfessor/segmented_corpus/sangraha/
-
-  # From morpheme_vocab.tsv:
-  %(prog)s --morfessor-dir ./data/morfessor
+  %(prog)s --segmented-corpus ./data/morfessor/sample.seg.txt
 
   # Test:
   %(prog)s --test "తెలుగు భాష చాలా అందమైనది"
@@ -832,11 +830,7 @@ Examples:
     parser.add_argument(
         "--segmented-corpus", type=str, default=None,
         help="Path to segmented corpus file or directory (.seg.txt). "
-             "Builds vocab directly from the corpus (recommended).",
-    )
-    parser.add_argument(
-        "--morfessor-dir", type=str, default="./data/morfessor",
-        help="Directory containing morpheme_vocab.tsv (fallback if no --segmented-corpus).",
+             "Builds vocab directly from the corpus.",
     )
     parser.add_argument(
         "--output", type=str, default="./tokenizer",
@@ -844,11 +838,7 @@ Examples:
     )
     parser.add_argument(
         "--vocab-size", type=int, default=0,
-        help="Cap vocabulary size (0 = use all morphemes, default: 0).",
-    )
-    parser.add_argument(
-        "--separator", type=str, default="\u2581",
-        help="Word boundary separator token (default: ▁ U+2581).",
+        help="Cap vocabulary size (0 = use all, default: 0).",
     )
     parser.add_argument(
         "--bpe-vocab", type=str, default=None,
@@ -864,18 +854,17 @@ Examples:
     )
     parser.add_argument(
         "--workers", type=int, default=0,
-        help="Number of parallel workers for corpus scan (default: auto = cpu_count - 1).",
+        help="Number of parallel workers for corpus scan (default: auto).",
     )
     parser.add_argument(
         "--min-freq", type=int, default=2,
-        help="Minimum token frequency to include in vocab. Filters rare junk (default: 2).",
+        help="Minimum token frequency to include in vocab (default: 2).",
     )
 
     args = parser.parse_args()
 
     output_dir = Path(args.output)
     seg_corpus = Path(args.segmented_corpus) if args.segmented_corpus else None
-    morfessor_dir = Path(args.morfessor_dir) if args.morfessor_dir else None
     bpe_vocab_path = Path(args.bpe_vocab) if args.bpe_vocab else None
     bpe_merges_path = Path(args.bpe_merges) if args.bpe_merges else None
 
@@ -887,9 +876,7 @@ Examples:
     # Build tokenizer
     build_tokenizer(
         output_dir=output_dir,
-        separator=args.separator,
         segmented_corpus=seg_corpus,
-        morfessor_dir=morfessor_dir,
         vocab_size=args.vocab_size,
         bpe_vocab_path=bpe_vocab_path,
         bpe_merges_path=bpe_merges_path,
@@ -905,13 +892,13 @@ Examples:
         "భారతదేశంలో అనేక భాషలు మాట్లాడతారు",
     ]
 
-    test_tokenizer(output_dir, test_texts, args.separator)
+    test_tokenizer(output_dir, test_texts)
 
     logger.info("")
-    logger.info("Tokenizer v3.0 (▁ separator) ready at %s", output_dir.resolve())
+    logger.info("Tokenizer v4.0 (reversed @@ prefix) ready at %s", output_dir.resolve())
     logger.info("  vocab.txt             — one token per line")
     logger.info("  tokenizer.json        — full tokenizer config + BPE merges")
-    logger.info("  token_frequencies.tsv — token ID + frequency")
+    logger.info("  token_frequencies.tsv — token ID + frequency + source")
 
 
 if __name__ == "__main__":
