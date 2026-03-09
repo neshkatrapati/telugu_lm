@@ -290,8 +290,52 @@ def build_tokenizer(
         logger.error("Must provide --segmented-corpus")
         sys.exit(1)
 
-    logger.info("Bare Telugu morphemes to add: %d", len(bare_morphemes))
-    logger.info("@@-prefixed Telugu suffixes to add: %d", len(prefix_morphemes))
+    logger.info("Bare Telugu morphemes available: %d", len(bare_morphemes))
+    logger.info("@@-prefixed Telugu suffixes available: %d", len(prefix_morphemes))
+
+    # --- Load BPE if provided ---
+    bpe_merges = []
+    bpe_subwords = []  # (subword, freq) sorted by freq desc
+    if bpe_vocab_path and bpe_merges_path:
+        bpe_vocab = load_bpe_vocab(bpe_vocab_path)
+        bpe_merges = load_bpe_merges(bpe_merges_path)
+        bpe_subwords = sorted(bpe_vocab.items(), key=lambda x: -x[1])
+    else:
+        logger.info("No BPE vocab provided — non-Telugu text will use character fallback")
+
+    # --- Character fallback pool ---
+    char_pool = []
+    # Printable ASCII (32-126)
+    char_pool.extend(chr(c) for c in range(32, 127))
+    # Telugu Unicode block (0C00-0C7F)
+    char_pool.extend(chr(c) for c in range(0x0C00, 0x0C80))
+    # Common punctuation & symbols
+    char_pool.extend(list("\u2013\u2014\u2018\u2019\u201c\u201d\u2026\u2022\u00b7\u20ac\u20b9\u00b0\u00b1\u00d7\u00f7"))
+
+    # --- Budget allocation when vocab_size is capped ---
+    # Priority: special > chars > BPE > @@-prefix Telugu > bare Telugu (trim rarest bare)
+    # Chars and BPE are essential for non-Telugu; @@-prefix are essential for suffix coverage.
+    # Bare Telugu is the largest pool and most trimmable (rarest roots go to char fallback).
+    n_chars_est = len(set(char_pool))  # upper bound (some may overlap with other tokens)
+    n_bpe = len(bpe_subwords)
+    n_prefix = len(prefix_morphemes)
+    n_bare = len(bare_morphemes)
+
+    if vocab_size > 0:
+        # Reserved slots = special + chars + BPE + @@-prefix
+        reserved = NUM_SPECIAL + n_chars_est + n_bpe + n_prefix
+        bare_budget = vocab_size - reserved
+        if bare_budget < n_bare:
+            if bare_budget < 0:
+                logger.warning("vocab_size=%d is too small! Need at least %d for non-bare tokens.",
+                               vocab_size, reserved)
+                bare_budget = max(1000, n_bare // 2)  # fallback
+            logger.info("Capping bare Telugu from %d to %d (vocab_size=%d)",
+                        n_bare, bare_budget, vocab_size)
+            bare_morphemes = bare_morphemes[:bare_budget]
+        else:
+            logger.info("vocab_size=%d — all %d bare Telugu fit (budget: %d)",
+                        vocab_size, n_bare, bare_budget)
 
     # --- Build token-to-id mapping ---
     token_to_id = dict(SPECIAL_TOKENS)
@@ -324,35 +368,21 @@ def build_tokenizer(
     logger.info("Added %d @@-prefixed Telugu suffix tokens (IDs %d-%d)",
                 prefix_count, bare_end_id + 1, prefix_end_id)
 
-    # --- Add BPE subwords (non-Telugu) ---
-    bpe_merges = []
+    # Add BPE subwords (non-Telugu)
     bpe_count = 0
-    if bpe_vocab_path and bpe_merges_path:
-        bpe_vocab = load_bpe_vocab(bpe_vocab_path)
-        bpe_merges = load_bpe_merges(bpe_merges_path)
+    for subword, freq in bpe_subwords:
+        if subword not in token_to_id:
+            token_to_id[subword] = next_id
+            id_to_token[next_id] = subword
+            next_id += 1
+            bpe_count += 1
 
-        for subword, freq in sorted(bpe_vocab.items(), key=lambda x: -x[1]):
-            if subword not in token_to_id:
-                token_to_id[subword] = next_id
-                id_to_token[next_id] = subword
-                next_id += 1
-                bpe_count += 1
-
+    if bpe_count:
         logger.info("Added %d BPE subword tokens", bpe_count)
-    else:
-        logger.info("No BPE vocab provided — non-Telugu text will use character fallback")
 
-    # --- Add character-level fallback ---
-    char_ranges = []
-    # Printable ASCII (32-126)
-    char_ranges.extend(chr(c) for c in range(32, 127))
-    # Telugu Unicode block (0C00-0C7F)
-    char_ranges.extend(chr(c) for c in range(0x0C00, 0x0C80))
-    # Common punctuation & symbols
-    char_ranges.extend(list("\u2013\u2014\u2018\u2019\u201c\u201d\u2026\u2022\u00b7\u20ac\u20b9\u00b0\u00b1\u00d7\u00f7"))
-
+    # Add character-level fallback
     char_count = 0
-    for ch in char_ranges:
+    for ch in char_pool:
         if ch not in token_to_id:
             token_to_id[ch] = next_id
             id_to_token[next_id] = ch
