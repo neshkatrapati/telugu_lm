@@ -897,14 +897,32 @@ def _init_worker(cache, model, suffix_set):
 MAX_DOC_CHARS = 500_000
 
 
-def _segment_single(text):
-    """Worker function: segment a single text in v4 format."""
-    try:
-        if len(text) > MAX_DOC_CHARS:
-            return text
-        return _segment_text_v4(_shared_cache, _shared_model, text, _shared_suffix_set)
-    except Exception:
-        return text
+def _segment_batch(texts):
+    """Worker function: segment a batch of texts in v4 format."""
+    results = []
+    for text in texts:
+        try:
+            if len(text) > MAX_DOC_CHARS:
+                results.append(text)
+            else:
+                results.append(
+                    _segment_text_v4(_shared_cache, _shared_model, text, _shared_suffix_set)
+                )
+        except Exception:
+            results.append(text)
+    return results
+
+
+def _iter_batches(iterable, batch_size: int):
+    """Yield lists of up to batch_size items from iterable."""
+    batch = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def segment_corpus(
@@ -917,6 +935,11 @@ def segment_corpus(
 ):
     """
     Pass 2: Segment full corpus in v4 reversed @@ format.
+
+    Uses batch-based parallelism: documents are grouped into batches of ~500,
+    each batch is sent as one task to a worker. This avoids the IPC overhead
+    of chunksize=1 and prevents the pool from eagerly buffering millions of
+    documents into memory.
     """
     import morfessor
     from multiprocessing import Pool, cpu_count
@@ -954,7 +977,10 @@ def segment_corpus(
     if num_workers <= 0:
         num_workers = max(1, cpu_count() - 1)
 
+    BATCH_SIZE = 500  # docs per batch sent to each worker
+
     logger.info("Suffix set: %d morphemes with @@ prefix form", len(suffix_set))
+    logger.info("Batch size: %d docs/batch, %d workers", BATCH_SIZE, num_workers)
 
     for fpath in data_files:
         try:
@@ -973,6 +999,7 @@ def segment_corpus(
         logger.info("Segmenting %s -> %s (%d workers)", rel, out_file.name, num_workers)
         start = time.time()
         doc_count = 0
+        done = False
 
         if num_workers <= 1:
             with open(out_file, "w", encoding="utf-8") as fout:
@@ -997,20 +1024,24 @@ def segment_corpus(
                 pbar = tqdm(desc=fpath.name, unit=" docs",
                             total=num_docs if num_docs > 0 else None)
 
-                for seg_text in pool.imap_unordered(
-                    _segment_single,
-                    _iter_text_from_file(fpath),
-                    chunksize=1,
+                # Process in batches to control memory and avoid IPC overhead
+                for batch_results in pool.imap_unordered(
+                    _segment_batch,
+                    _iter_batches(_iter_text_from_file(fpath), BATCH_SIZE),
+                    chunksize=1,  # each "item" is already a batch of 500 docs
                 ):
-                    fout.write(seg_text + "\n")
-                    doc_count += 1
-                    pbar.update(1)
+                    for seg_text in batch_results:
+                        fout.write(seg_text + "\n")
+                        doc_count += 1
 
-                    if doc_count % 50000 == 0:
+                    pbar.update(len(batch_results))
+
+                    if doc_count % 100_000 == 0:
                         fout.flush()
 
                     if num_docs > 0 and doc_count >= num_docs:
                         pool.terminate()
+                        done = True
                         break
 
                 pbar.close()
@@ -1018,9 +1049,12 @@ def segment_corpus(
         elapsed = time.time() - start
         size_mb = out_file.stat().st_size / (1024 ** 2)
         logger.info(
-            "  Done: %d docs, %.1f MB, %.1f min",
+            "  Done: %d docs, %.1f MB, %.1f min (%.0f docs/sec)",
             doc_count, size_mb, elapsed / 60,
+            doc_count / elapsed if elapsed > 0 else 0,
         )
+        if done:
+            break
 
 
 # ---------------------------------------------------------------------------
