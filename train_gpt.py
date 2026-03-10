@@ -1158,6 +1158,11 @@ def train(
         logger.info("Gradient checkpointing enabled — activation memory will be O(sqrt(layers))")
 
     # Compile (after loading weights so keys match)
+    # NOTE: torch.compile is incompatible with engrams (CPU↔GPU memory table
+    # lookup causes Dynamo device propagation error)
+    if model_config.use_engrams and train_config.compile_model:
+        logger.warning("Disabling torch.compile — incompatible with engram CPU memory table")
+        train_config.compile_model = False
     if train_config.compile_model and hasattr(torch, "compile"):
         logger.info("Compiling model with torch.compile...")
         model = torch.compile(model)
