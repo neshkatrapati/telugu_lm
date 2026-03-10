@@ -72,6 +72,18 @@ class GPTConfig:
     rope_theta: float = 10000.0  # RoPE base frequency
     use_weight_sharing: bool = True  # MobileLLM-LS block-wise sharing (2x effective depth)
 
+    # Learned Engrams (conditional memory module)
+    use_engrams: bool = False
+    engram_table_size: int = 1_000_000     # slots in CPU hash table
+    engram_dim: int = 128                   # per-slot embedding dimension
+    engram_n_heads: int = 4                 # independent hash heads
+    engram_window: int = 6                  # local context window W
+    engram_mdl_lambda: float = 0.01         # MDL regularisation weight
+    engram_mdl_prior: float = 0.3           # Bernoulli prior π for mask sparsity
+    engram_inject_indices: tuple = (4, 30)  # schedule indices for injection
+    engram_table_lr_mult: float = 5.0       # LR multiplier for memory table
+    engram_freeze_table_steps: int = 1000   # freeze table for first N steps
+
     def effective_depth(self):
         """Number of block forward passes (2x unique layers if weight sharing)."""
         return self.n_layer * 2 if self.use_weight_sharing else self.n_layer
@@ -498,7 +510,7 @@ def build_model(config: GPTConfig, device: str = "cuda"):
             self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
             self.resid_dropout = nn.Dropout(config.dropout)
 
-        def forward(self, x, freqs_cis):
+        def forward(self, x, freqs_cis, return_qk=False):
             B, T, C = x.size()
 
             q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
@@ -515,16 +527,36 @@ def build_model(config: GPTConfig, device: str = "cuda"):
                 v = v.unsqueeze(2).expand(B, self.n_kv_head, self.n_rep, T, self.head_dim)
                 v = v.reshape(B, self.n_head, T, self.head_dim)
 
-            # Flash attention (PyTorch >= 2.0)
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                dropout_p=self.dropout if self.training else 0,
-                is_causal=True,
-            )
-            y = y.transpose(1, 2).contiguous().view(B, T, C)
-            y = self.resid_dropout(self.c_proj(y))
-            return y
+            if return_qk:
+                # Manual attention path (no Flash) — needed to extract QK logits
+                scale = 1.0 / math.sqrt(self.head_dim)
+                qk = (q @ k.transpose(-2, -1)) * scale  # (B, n_head, T, T)
+
+                # Causal mask: upper triangle = -inf
+                causal_mask = torch.triu(
+                    torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
+                )
+                qk = qk.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+                attn_weights = F.softmax(qk, dim=-1)
+                if self.training and self.dropout > 0:
+                    attn_weights = F.dropout(attn_weights, p=self.dropout)
+                y = attn_weights @ v  # (B, n_head, T, head_dim)
+
+                y = y.transpose(1, 2).contiguous().view(B, T, C)
+                y = self.resid_dropout(self.c_proj(y))
+                return y, qk  # qk is pre-softmax logits (B, n_head, T, T)
+            else:
+                # Flash attention (PyTorch >= 2.0)
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    dropout_p=self.dropout if self.training else 0,
+                    is_causal=True,
+                )
+                y = y.transpose(1, 2).contiguous().view(B, T, C)
+                y = self.resid_dropout(self.c_proj(y))
+                return y
 
     # ----- SwiGLU MLP (replaces GELU MLP) -----
     class SwiGLUMLP(nn.Module):
@@ -541,6 +573,229 @@ def build_model(config: GPTConfig, device: str = "cuda"):
         def forward(self, x):
             return self.dropout(self.w_down(F.silu(self.w_gate(x)) * self.w_up(x)))
 
+    # ----- Learned Engram Module (conditional memory) -----
+    class LearnedEngramModule(nn.Module):
+        """Attention-derived conditional memory lookup with MDL regularisation.
+
+        Takes hidden states + QK attention logits, selects a local window
+        of token IDs via Gumbel-sigmoid masks, hashes into a CPU-resident
+        memory table, and returns a gated additive residual.
+
+        Zero-initialised so the module starts as identity (no contribution).
+        """
+
+        def __init__(self, config):
+            super().__init__()
+            W = config.engram_window          # 6
+            n_embd = config.n_embd            # 768
+            engram_dim = config.engram_dim    # 128
+            n_heads = config.engram_n_heads   # 4
+
+            self.W = W
+            self.n_embd = n_embd
+            self.engram_dim = engram_dim
+            self.n_heads = n_heads
+            self.head_dim = engram_dim // n_heads  # 32
+
+            # MDL hyperparams
+            self.mdl_lambda = config.engram_mdl_lambda
+            self.mdl_prior = config.engram_mdl_prior
+
+            # Pattern predictor: QK window logits → binary mask logits
+            self.pattern_mlp = nn.Sequential(
+                nn.Linear(W, 2 * W),
+                nn.SiLU(),
+                nn.Linear(2 * W, W),
+            )
+
+            # Memory → hidden projections
+            self.W_K = nn.Linear(engram_dim, n_embd, bias=False)
+            self.W_V = nn.Linear(engram_dim, n_embd, bias=False)
+
+            # Layer norms for gating
+            self.ln_k = RMSNorm(n_embd)
+            self.ln_h = RMSNorm(n_embd)
+
+            # Depthwise causal convolution
+            self.conv = nn.Conv1d(
+                n_embd, n_embd, kernel_size=4,
+                padding=3, groups=n_embd,  # depthwise
+            )
+            self.conv_act = nn.SiLU()
+
+            # Hashing: 4 primes near 250K for multi-head hashing
+            hash_primes = torch.tensor([249989, 249973, 249961, 249947], dtype=torch.long)
+            self.register_buffer("hash_primes", hash_primes)
+            # Random multiplicative weights per (head, position)
+            hash_weights = torch.randint(1, 1_000_000, (n_heads, W), dtype=torch.long)
+            self.register_buffer("hash_weights", hash_weights)
+
+            # Sentinel offset for padding positions
+            self.sentinel_base = config.vocab_size + 1
+
+            # Zero-init: module starts as identity (no contribution)
+            nn.init.zeros_(self.W_V.weight)
+            nn.init.zeros_(self.conv.weight)
+            nn.init.zeros_(self.conv.bias)
+
+        def forward(self, h, qk_logits, token_ids, memory_table, tau=1.0):
+            """
+            Args:
+                h:            (B, T, n_embd) — hidden states after attention
+                qk_logits:    (B, n_head, T, T) — pre-softmax QK logits
+                token_ids:    (B, T) — input token IDs (int)
+                memory_table: nn.Embedding on CPU (table_size, engram_dim)
+                tau:          Gumbel temperature for mask sampling
+
+            Returns:
+                engram_out:   (B, T, n_embd) — additive residual
+                mdl_loss:     scalar — MDL regularisation loss
+            """
+            B, T, C = h.shape
+            W = self.W
+            device = h.device
+
+            # --- 1. Build window token IDs: (B, T, W) ---
+            # For position p, gather token_ids[:, p-W:p]
+            # Sentinel values for positions that fall before the sequence start
+            sentinels = torch.arange(W, 0, -1, device=device, dtype=token_ids.dtype)
+            sentinels = self.sentinel_base + sentinels  # (W,) unique sentinel IDs
+
+            # Pad token_ids with sentinels at the front
+            # sentinel_pad shape: (B, W)
+            sentinel_pad = sentinels.unsqueeze(0).expand(B, -1)
+            padded_ids = torch.cat([sentinel_pad, token_ids], dim=1)  # (B, T+W)
+
+            # Gather windows: for each position p in [0, T), gather [p, p+1, ..., p+W-1]
+            # which corresponds to original positions [p-W, p-W+1, ..., p-1]
+            offsets = torch.arange(W, device=device).unsqueeze(0)  # (1, W)
+            positions = torch.arange(T, device=device).unsqueeze(1)  # (T, 1)
+            gather_idx = positions + offsets  # (T, W)
+            gather_idx = gather_idx.unsqueeze(0).expand(B, -1, -1)  # (B, T, W)
+            window_ids = torch.gather(
+                padded_ids.unsqueeze(1).expand(-1, T, -1),
+                dim=2, index=gather_idx
+            )  # (B, T, W) -- but this is wrong, let me fix
+
+            # Actually simpler: just index padded_ids directly
+            # padded_ids is (B, T+W). For position p (0-indexed in original),
+            # the window is padded_ids[:, p:p+W]
+            window_ids = padded_ids.unfold(1, W, 1)[:, :T, :]  # (B, T, W)
+
+            # --- 2. Extract QK window logits: (B, T, W) ---
+            # qk_logits is (B, n_head, T, T). For each query position p,
+            # gather the W key positions [p-W, ..., p-1] → average over heads
+            # Build gather indices for keys (same padding logic)
+            # Key positions for query p: max(0, p-W) to p-1
+            # In padded indexing: positions [p, p+1, ..., p+W-1] in the original T dim
+            # But QK is (T, T) not padded. We need to handle boundary carefully.
+
+            # For each query p, the W key indices are [p-W, ..., p-1]
+            # Clamp negatives to 0 and use mask for OOB
+            key_indices = positions - W + offsets  # (T, W), values in [-W+1, T-1]
+            valid_mask = key_indices >= 0  # (T, W)
+            key_indices_clamped = key_indices.clamp(min=0)  # (T, W)
+
+            # Gather from qk_logits: (B, n_head, T, T) → need (B, n_head, T, W)
+            ki_expanded = key_indices_clamped.unsqueeze(0).unsqueeze(0).expand(
+                B, qk_logits.size(1), -1, -1
+            )  # (B, n_head, T, W)
+            qk_window = torch.gather(qk_logits, dim=3, index=ki_expanded)  # (B, n_head, T, W)
+
+            # Mask out-of-bounds positions (before sequence start)
+            valid_mask_expanded = valid_mask.unsqueeze(0).unsqueeze(0).expand_as(qk_window)
+            qk_window = qk_window.masked_fill(~valid_mask_expanded, 0.0)
+
+            # Average across attention heads → (B, T, W)
+            qk_window = qk_window.mean(dim=1)
+
+            # --- 3. Pattern predictor → mask logits ---
+            mask_logits = self.pattern_mlp(qk_window)  # (B, T, W)
+
+            # --- 4. Gumbel-sigmoid for differentiable binary masks ---
+            p_w = torch.sigmoid(mask_logits)  # soft mask probabilities
+
+            if self.training:
+                # Gumbel-sigmoid with straight-through estimator
+                u = torch.rand_like(mask_logits).clamp(1e-6, 1 - 1e-6)
+                gumbel_noise = torch.log(u) - torch.log(1 - u)
+                y_soft = torch.sigmoid((mask_logits + gumbel_noise) / tau)
+                hard_mask = (y_soft > 0.5).float()
+                # Straight-through: forward uses hard, backward uses soft
+                hard_mask = hard_mask - y_soft.detach() + y_soft
+            else:
+                hard_mask = (p_w > 0.5).float()
+
+            # --- 5. MDL loss: KL(Bernoulli(p_w) || Bernoulli(π)) ---
+            pi = self.mdl_prior
+            # KL = p * log(p/π) + (1-p) * log((1-p)/(1-π))
+            eps = 1e-7
+            p_clamped = p_w.clamp(eps, 1 - eps)
+            kl = (p_clamped * (p_clamped / pi).log()
+                  + (1 - p_clamped) * ((1 - p_clamped) / (1 - pi)).log())
+            mdl_loss = self.mdl_lambda * kl.mean()
+
+            # --- 6. Form hash keys ---
+            # Use sentinel values for masked-out positions
+            sentinel_vals = sentinels.unsqueeze(0).unsqueeze(0).expand(B, T, -1)  # (B, T, W)
+            keys = (window_ids * hard_mask.long()
+                    + sentinel_vals * (1 - hard_mask).long())  # (B, T, W)
+
+            # --- 7. Multi-head hashing → memory lookup ---
+            # For each head k: idx_k = (Σ_w keys[:,w] * hash_weights[k,w]) % hash_primes[k]
+            # keys: (B, T, W), hash_weights: (n_heads, W) → (B, T, n_heads)
+            keys_long = keys.long()
+            # (B, T, W) × (n_heads, W).T → sum over W → (B, T, n_heads)
+            hash_vals = torch.einsum("btw,hw->bth", keys_long.float(),
+                                      self.hash_weights.float()).long()
+            # Modulo by per-head primes
+            indices = hash_vals % self.hash_primes.unsqueeze(0).unsqueeze(0)  # (B, T, n_heads)
+            # Clamp to table size
+            indices = indices.clamp(0, memory_table.weight.size(0) - 1)
+
+            # Flatten, gather unique indices from CPU table, move to GPU
+            flat_indices = indices.reshape(-1)  # (B*T*n_heads,)
+
+            # Gather from CPU memory table
+            unique_indices, inverse = flat_indices.unique(return_inverse=True)
+            unique_embeddings = memory_table(unique_indices.cpu()).to(device)  # (n_unique, engram_dim)
+            gathered = unique_embeddings[inverse]  # (B*T*n_heads, engram_dim)
+
+            # Each head k looked up a full engram_dim vector; extract head k's
+            # own head_dim slice and concatenate across heads → (B, T, engram_dim)
+            gathered = gathered.view(B, T, self.n_heads, self.engram_dim)  # (B, T, 4, 128)
+            # View engram_dim as (n_heads, head_dim) → (B, T, 4, 4, 32)
+            gathered = gathered.view(B, T, self.n_heads, self.n_heads, self.head_dim)
+            # Diagonal: head k uses the k-th head_dim slice from its lookup
+            head_range = torch.arange(self.n_heads, device=device)
+            e = gathered[:, :, head_range, head_range, :]  # (B, T, 4, 32)
+            e = e.reshape(B, T, self.engram_dim)  # (B, T, 128)
+
+            # --- 8. Project + gate ---
+            k_t = self.W_K(e)   # (B, T, n_embd)
+            v_t = self.W_V(e)   # (B, T, n_embd)
+
+            # Gate: α = sigmoid(dot(ln_h(h), ln_k(k_t)) / sqrt(n_embd))
+            h_normed = self.ln_h(h)
+            k_normed = self.ln_k(k_t)
+            alpha = torch.sigmoid(
+                (h_normed * k_normed).sum(dim=-1, keepdim=True)
+                / math.sqrt(self.n_embd)
+            )  # (B, T, 1)
+            v_hat = alpha * v_t  # (B, T, n_embd)
+
+            # --- 9. Causal convolution ---
+            # (B, T, C) → (B, C, T) → conv → trim to T → (B, C, T) → (B, T, C)
+            conv_in = v_hat.transpose(1, 2)  # (B, C, T)
+            conv_out = self.conv(conv_in)[:, :, :T]  # trim for causal (padding=3, kernel=4)
+            conv_out = self.conv_act(conv_out)
+            conv_out = conv_out.transpose(1, 2)  # (B, T, C)
+
+            # Residual: conv output + gated value
+            out = conv_out + v_hat
+
+            return out, mdl_loss
+
     # ----- Transformer Block -----
     class Block(nn.Module):
         def __init__(self, config):
@@ -550,10 +805,20 @@ def build_model(config: GPTConfig, device: str = "cuda"):
             self.ln_2 = RMSNorm(config.n_embd)
             self.mlp = SwiGLUMLP(config)
 
-        def forward(self, x, freqs_cis):
-            x = x + self.attn(self.ln_1(x), freqs_cis)
-            x = x + self.mlp(self.ln_2(x))
-            return x
+        def forward(self, x, freqs_cis, engram_ctx=None):
+            if engram_ctx is not None:
+                engram_mod, token_ids, memory_table, tau = engram_ctx
+                attn_out, qk_logits = self.attn(self.ln_1(x), freqs_cis, return_qk=True)
+                engram_out, mdl_loss = engram_mod(
+                    x + attn_out, qk_logits, token_ids, memory_table, tau
+                )
+                x = x + attn_out + engram_out
+                x = x + self.mlp(self.ln_2(x))
+                return x, mdl_loss
+            else:
+                x = x + self.attn(self.ln_1(x), freqs_cis)
+                x = x + self.mlp(self.ln_2(x))
+                return x
 
     # ----- GPT (LLaMA-style with GQA + weight sharing) -----
     class GPT(nn.Module):
@@ -582,6 +847,23 @@ def build_model(config: GPTConfig, device: str = "cuda"):
 
             self._effective_depth = len(self._block_schedule)
 
+            # Learned Engrams: CPU memory table + per-injection-point modules
+            self._engram_map = {}  # schedule_index → engram_module_index
+            if config.use_engrams:
+                # CPU-resident memory table (~512 MB for 1M × 128 fp32)
+                self.memory_table = nn.Embedding(
+                    config.engram_table_size, config.engram_dim, sparse=True
+                )
+                nn.init.zeros_(self.memory_table.weight)
+                # Keep on CPU — gathered per-step, moved to GPU
+                self.memory_table = self.memory_table.cpu()
+
+                inject_indices = config.engram_inject_indices or (4, 30)
+                self.engram_modules = nn.ModuleList([
+                    LearnedEngramModule(config) for _ in inject_indices
+                ])
+                self._engram_map = {idx: i for i, idx in enumerate(inject_indices)}
+
             # Precompute RoPE frequencies and store as buffer
             head_dim = config.n_embd // config.n_head
             freqs_cis = precompute_freqs_cis(head_dim, config.block_size, config.rope_theta)
@@ -593,6 +875,13 @@ def build_model(config: GPTConfig, device: str = "cuda"):
             for pn, p in self.named_parameters():
                 if pn.endswith("c_proj.weight") or pn.endswith("w_down.weight"):
                     torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self._effective_depth))
+
+            # Re-zero engram W_V and conv after _init_weights (which would have overwritten)
+            if config.use_engrams:
+                for em in self.engram_modules:
+                    nn.init.zeros_(em.W_V.weight)
+                    nn.init.zeros_(em.conv.weight)
+                    nn.init.zeros_(em.conv.bias)
 
         def _init_weights(self, module):
             if isinstance(module, nn.Linear):
@@ -623,18 +912,42 @@ def build_model(config: GPTConfig, device: str = "cuda"):
             freqs_cis = torch.view_as_complex(self.freqs_cis[:T])
 
             use_ckpt = getattr(self, "_gradient_checkpointing", False) and self.training
-            for block in self._block_schedule:
-                if use_ckpt:
-                    x = torch.utils.checkpoint.checkpoint(
-                        block, x, freqs_cis, use_reentrant=False,
+            use_engrams = self.config.use_engrams and self._engram_map
+            mdl_losses = []
+
+            for sched_idx, block in enumerate(self._block_schedule):
+                engram_ctx = None
+                if use_engrams and sched_idx in self._engram_map:
+                    mod_idx = self._engram_map[sched_idx]
+                    tau = getattr(self, "_current_tau", 0.3)
+                    engram_ctx = (
+                        self.engram_modules[mod_idx],
+                        idx, self.memory_table, tau,
                     )
+
+                if engram_ctx is not None:
+                    # Engram blocks: manual attention + memory lookup
+                    # (not compatible with gradient checkpointing due to return tuple)
+                    x, mdl_loss = block(x, freqs_cis, engram_ctx=engram_ctx)
+                    mdl_losses.append(mdl_loss)
                 else:
-                    x = block(x, freqs_cis)
+                    if use_ckpt:
+                        x = torch.utils.checkpoint.checkpoint(
+                            block, x, freqs_cis, use_reentrant=False,
+                        )
+                    else:
+                        x = block(x, freqs_cis)
+
             x = self.transformer.ln_f(x)
 
             if targets is not None:
                 logits = self.lm_head(x)
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                if mdl_losses:
+                    self._last_mdl_loss = sum(mdl_losses).item()
+                    loss = loss + sum(mdl_losses)
+                else:
+                    self._last_mdl_loss = 0.0
             else:
                 logits = self.lm_head(x[:, [-1], :])
                 loss = None
@@ -689,7 +1002,7 @@ class MemmapDataset:
 # ===========================================================================
 # Checkpoint Helper
 # ===========================================================================
-def _save_checkpoint(model, optimizer, model_config, path, **kwargs):
+def _save_checkpoint(model, optimizer, model_config, path, table_optimizer=None, **kwargs):
     """Save a checkpoint with full metadata. Never loses data."""
     import torch
     state = model.state_dict() if not hasattr(model, "_orig_mod") else model._orig_mod.state_dict()
@@ -699,6 +1012,8 @@ def _save_checkpoint(model, optimizer, model_config, path, **kwargs):
         "config": model_config.__dict__,
         "architecture": "llama",
     }
+    if table_optimizer is not None:
+        ckpt["table_optimizer"] = table_optimizer.state_dict()
     ckpt.update(kwargs)
     torch.save(ckpt, str(path))
     del ckpt, state
@@ -819,14 +1134,19 @@ def train(
     best_val_loss = float("inf")
     tokens_processed = 0
     _resume_optimizer_state = None
+    _resume_table_optimizer_state = None
     if _pending_checkpoint is not None:
         checkpoint = _pending_checkpoint
         _pending_checkpoint = None
         model.load_state_dict(checkpoint["model"])
+        # Ensure memory table stays on CPU after state_dict load
+        if model_config.use_engrams and hasattr(model, "memory_table"):
+            model.memory_table = model.memory_table.cpu()
         start_step = checkpoint["step"]
         best_val_loss = checkpoint.get("best_val_loss", float("inf"))
         tokens_processed = checkpoint.get("tokens_processed", start_step * tokens_per_step)
         _resume_optimizer_state = checkpoint.get("optimizer")
+        _resume_table_optimizer_state = checkpoint.get("table_optimizer")
         logger.info("Resumed at step %d (epoch %.2f), best_val_loss=%.4f",
                      start_step, tokens_processed / tokens_per_epoch, best_val_loss)
         del checkpoint  # free CPU memory immediately
@@ -842,20 +1162,45 @@ def train(
         logger.info("Compiling model with torch.compile...")
         model = torch.compile(model)
 
-    # Optimizer
-    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
-    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    # Optimizer — separate SparseAdam for memory table (sparse gradients)
+    _raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+
+    param_dict = {pn: p for pn, p in _raw_model.named_parameters() if p.requires_grad}
+    # Separate memory table params from the rest
+    table_params = []
+    decay_params = []
+    nodecay_params = []
+    for pn, p in param_dict.items():
+        if "memory_table" in pn:
+            table_params.append(p)
+        elif p.dim() >= 2:
+            decay_params.append(p)
+        else:
+            nodecay_params.append(p)
+
     optim_groups = [
         {"params": decay_params, "weight_decay": train_config.weight_decay},
         {"params": nodecay_params, "weight_decay": 0.0},
     ]
+
+    use_fused = (device == "cuda")
     optimizer = torch.optim.AdamW(
         optim_groups,
         lr=train_config.learning_rate,
         betas=(train_config.beta1, train_config.beta2),
-        fused=True if device == "cuda" else False,
+        fused=use_fused,
     )
+
+    # Sparse optimizer for CPU memory table (nn.Embedding(sparse=True) → sparse grads)
+    table_optimizer = None
+    if model_config.use_engrams and table_params:
+        table_optimizer = torch.optim.SparseAdam(
+            table_params,
+            lr=train_config.learning_rate * model_config.engram_table_lr_mult,
+            betas=(train_config.beta1, train_config.beta2),
+        )
+        logger.info("Engram memory table: %d params, lr_mult=%.1f, SparseAdam",
+                     sum(p.numel() for p in table_params), model_config.engram_table_lr_mult)
 
     # Load optimizer state if resuming (from state saved earlier, no second disk load)
     if _resume_optimizer_state is not None:
@@ -863,6 +1208,10 @@ def train(
         logger.info("Restored optimizer state")
         del _resume_optimizer_state
         torch.cuda.empty_cache()
+    if _resume_table_optimizer_state is not None and table_optimizer is not None:
+        table_optimizer.load_state_dict(_resume_table_optimizer_state)
+        logger.info("Restored table optimizer state")
+        del _resume_table_optimizer_state
 
     # LR schedule
     def get_lr(step):
@@ -962,9 +1311,25 @@ def train(
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
+        # Update table optimizer LR (separate SparseAdam)
+        if table_optimizer is not None:
+            for param_group in table_optimizer.param_groups:
+                param_group["lr"] = lr * model_config.engram_table_lr_mult
+
+        # Engram: temperature annealing + table freezing
+        if model_config.use_engrams:
+            anneal_end = int(total_steps * 0.3)
+            tau = max(0.3, 1.0 - 0.7 * step / anneal_end) if step < anneal_end else 0.3
+            _raw_model._current_tau = tau
+
+            # Freeze memory table for first N steps
+            freeze = step < model_config.engram_freeze_table_steps
+            _raw_model.memory_table.weight.requires_grad_(not freeze)
 
         # Gradient accumulation
         optimizer.zero_grad(set_to_none=True)
+        if table_optimizer is not None:
+            table_optimizer.zero_grad(set_to_none=True)
         loss_accum = 0.0
 
         for micro_step in range(train_config.gradient_accumulation_steps):
@@ -989,6 +1354,10 @@ def train(
         scaler.step(optimizer)
         scaler.update()
 
+        # Step sparse optimizer for memory table (not affected by GradScaler)
+        if table_optimizer is not None:
+            table_optimizer.step()
+
         tokens_processed += tokens_per_step
         current_epoch = tokens_processed / tokens_per_epoch
 
@@ -1001,14 +1370,18 @@ def train(
                 step, loss_accum, lr, tokens_per_sec, current_epoch, dt / 60,
             )
             if use_wandb:
-                wandb.log({
+                log_dict = {
                     "train/loss": loss_accum,
                     "train/lr": lr,
                     "train/tokens_per_sec": tokens_per_sec,
                     "train/tokens_processed": tokens_processed,
                     "train/epoch": current_epoch,
                     "train/elapsed_min": dt / 60,
-                }, step=step)
+                }
+                if model_config.use_engrams:
+                    log_dict["engram/mdl_loss"] = getattr(_raw_model, "_last_mdl_loss", 0.0)
+                    log_dict["engram/tau"] = getattr(_raw_model, "_current_tau", 0.3)
+                wandb.log(log_dict, step=step)
 
         # Eval
         if step > 0 and step % train_config.eval_interval == 0:
@@ -1067,6 +1440,7 @@ def train(
                 best_val_loss = val_loss
                 ckpt_path = save_dir / "best.pt"
                 _save_checkpoint(model, optimizer, model_config, ckpt_path,
+                                 table_optimizer=table_optimizer,
                                  step=step, epoch=current_epoch, val_loss=val_loss,
                                  best_val_loss=best_val_loss,
                                  tokens_processed=tokens_processed,
@@ -1077,6 +1451,7 @@ def train(
         if step > 0 and step % train_config.save_interval == 0:
             ckpt_path = save_dir / f"step_{step:06d}.pt"
             _save_checkpoint(model, optimizer, model_config, ckpt_path,
+                             table_optimizer=table_optimizer,
                              step=step, epoch=current_epoch,
                              val_loss=val_loss if "val_loss" in dir() else None,
                              best_val_loss=best_val_loss,
@@ -1089,6 +1464,7 @@ def train(
         if curr_epoch_int > prev_epoch_int and curr_epoch_int >= 1:
             epoch_ckpt_path = save_dir / f"epoch_{curr_epoch_int:02d}.pt"
             _save_checkpoint(model, optimizer, model_config, epoch_ckpt_path,
+                             table_optimizer=table_optimizer,
                              step=step, epoch=current_epoch,
                              val_loss=val_loss if "val_loss" in dir() else None,
                              best_val_loss=best_val_loss,
@@ -1101,6 +1477,7 @@ def train(
     total_time = time.time() - t0
     ckpt_path = save_dir / "final.pt"
     _save_checkpoint(model, optimizer, model_config, ckpt_path,
+                     table_optimizer=table_optimizer,
                      step=total_steps, epoch=current_epoch,
                      best_val_loss=best_val_loss,
                      tokens_processed=tokens_processed,
@@ -1154,6 +1531,13 @@ def generate_text(
         bias=cfg["bias"],
         rope_theta=cfg.get("rope_theta", 10000.0),
         use_weight_sharing=cfg.get("use_weight_sharing", False),
+        # Learned Engrams (restored from checkpoint if present)
+        use_engrams=cfg.get("use_engrams", False),
+        engram_table_size=cfg.get("engram_table_size", 1_000_000),
+        engram_dim=cfg.get("engram_dim", 128),
+        engram_n_heads=cfg.get("engram_n_heads", 4),
+        engram_window=cfg.get("engram_window", 6),
+        engram_inject_indices=tuple(cfg.get("engram_inject_indices", (4, 30))),
     )
 
     # Build model
@@ -1286,6 +1670,12 @@ Examples:
         p.add_argument("--n-kv-head", type=int, default=4, help="KV head groups for GQA (default: 4)")
         p.add_argument("--no-weight-sharing", action="store_true", help="Disable block-wise weight sharing")
         p.add_argument("--dropout", type=float, default=0.0, help="Dropout rate (default: 0.0)")
+        # Learned Engrams
+        p.add_argument("--use-engrams", action="store_true", help="Enable learned engram memory module")
+        p.add_argument("--engram-table-size", type=int, default=1_000_000,
+                       help="Engram hash table slots (default: 1M)")
+        p.add_argument("--engram-freeze-steps", type=int, default=1000,
+                       help="Freeze engram table for first N steps (default: 1000)")
         # LR schedule
         p.add_argument("--lr-schedule", type=str, default="wsd", choices=["wsd", "cosine"],
                        help="LR schedule (default: wsd)")
@@ -1352,6 +1742,10 @@ Examples:
         train_config.lr_schedule = args.lr_schedule
         train_config.wsd_stable_frac = args.wsd_stable_frac
         train_config.wsd_decay_frac = args.wsd_decay_frac
+        # Learned Engrams
+        model_config.use_engrams = args.use_engrams
+        model_config.engram_table_size = args.engram_table_size
+        model_config.engram_freeze_table_steps = args.engram_freeze_steps
 
     if args.command == "prepare":
         if not args.data and not args.parquet:
