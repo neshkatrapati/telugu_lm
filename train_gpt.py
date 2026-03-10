@@ -78,11 +78,12 @@ class GPTConfig:
     engram_dim: int = 128                   # per-slot embedding dimension
     engram_n_heads: int = 4                 # independent hash heads
     engram_window: int = 6                  # local context window W
-    engram_mdl_lambda: float = 0.01         # MDL regularisation weight
+    engram_mdl_lambda: float = 0.001        # MDL regularisation weight (gentle)
     engram_mdl_prior: float = 0.3           # Bernoulli prior π for mask sparsity
     engram_inject_indices: tuple = (4, 30)  # schedule indices for injection
     engram_table_lr_mult: float = 5.0       # LR multiplier for memory table
     engram_freeze_table_steps: int = 1000   # freeze table for first N steps
+    engram_warmup_steps: int = 3000         # freeze ENTIRE engram module for first N steps
 
     def effective_depth(self):
         """Number of block forward passes (2x unique layers if weight sharing)."""
@@ -913,13 +914,15 @@ def build_model(config: GPTConfig, device: str = "cuda"):
             freqs_cis = torch.view_as_complex(self.freqs_cis[:T])
 
             use_ckpt = getattr(self, "_gradient_checkpointing", False) and self.training
-            use_engrams = self.config.use_engrams and self._engram_map
+            # Use _engram_map_active (empty during warmup, populated after)
+            active_map = getattr(self, "_engram_map_active", self._engram_map)
+            use_engrams = self.config.use_engrams and active_map
             mdl_losses = []
 
             for sched_idx, block in enumerate(self._block_schedule):
                 engram_ctx = None
-                if use_engrams and sched_idx in self._engram_map:
-                    mod_idx = self._engram_map[sched_idx]
+                if use_engrams and sched_idx in active_map:
+                    mod_idx = active_map[sched_idx]
                     tau = getattr(self, "_current_tau", 0.3)
                     engram_ctx = (
                         self.engram_modules[mod_idx],
@@ -1323,15 +1326,32 @@ def train(
             for param_group in table_optimizer.param_groups:
                 param_group["lr"] = lr * model_config.engram_table_lr_mult
 
-        # Engram: temperature annealing + table freezing
+        # Engram: warmup (full freeze) + temperature annealing + table freezing
         if model_config.use_engrams:
-            anneal_end = int(total_steps * 0.3)
-            tau = max(0.3, 1.0 - 0.7 * step / anneal_end) if step < anneal_end else 0.3
-            _raw_model._current_tau = tau
+            engram_active = step >= model_config.engram_warmup_steps
 
-            # Freeze memory table for first N steps
-            freeze = step < model_config.engram_freeze_table_steps
-            _raw_model.memory_table.weight.requires_grad_(not freeze)
+            # During warmup: freeze entire engram module + table (pure base model training)
+            for em in _raw_model.engram_modules.parameters():
+                em.requires_grad_(engram_active)
+            _raw_model.memory_table.weight.requires_grad_(
+                engram_active and step >= model_config.engram_freeze_table_steps
+            )
+
+            # Disable engram injection during warmup by clearing the map
+            if not engram_active:
+                _raw_model._engram_map_active = {}
+            else:
+                _raw_model._engram_map_active = _raw_model._engram_map
+
+            # Temperature annealing (only matters once active)
+            if engram_active:
+                steps_since_active = step - model_config.engram_warmup_steps
+                remaining_steps = total_steps - model_config.engram_warmup_steps
+                anneal_end = int(remaining_steps * 0.3)
+                tau = max(0.3, 1.0 - 0.7 * steps_since_active / anneal_end) if steps_since_active < anneal_end else 0.3
+            else:
+                tau = 1.0
+            _raw_model._current_tau = tau
 
         # Gradient accumulation
         optimizer.zero_grad(set_to_none=True)
@@ -1388,6 +1408,7 @@ def train(
                 if model_config.use_engrams:
                     log_dict["engram/mdl_loss"] = getattr(_raw_model, "_last_mdl_loss", 0.0)
                     log_dict["engram/tau"] = getattr(_raw_model, "_current_tau", 0.3)
+                    log_dict["engram/active"] = 1.0 if step >= model_config.engram_warmup_steps else 0.0
                 wandb.log(log_dict, step=step)
 
         # Eval
@@ -1684,7 +1705,9 @@ Examples:
         p.add_argument("--engram-table-size", type=int, default=1_000_000,
                        help="Engram hash table slots (default: 1M)")
         p.add_argument("--engram-freeze-steps", type=int, default=1000,
-                       help="Freeze engram table for first N steps (default: 1000)")
+                       help="Freeze engram table for first N steps after warmup (default: 1000)")
+        p.add_argument("--engram-warmup-steps", type=int, default=3000,
+                       help="Freeze entire engram module for first N steps (default: 3000)")
         # LR schedule
         p.add_argument("--lr-schedule", type=str, default="wsd", choices=["wsd", "cosine"],
                        help="LR schedule (default: wsd)")
@@ -1755,6 +1778,7 @@ Examples:
         model_config.use_engrams = args.use_engrams
         model_config.engram_table_size = args.engram_table_size
         model_config.engram_freeze_table_steps = args.engram_freeze_steps
+        model_config.engram_warmup_steps = args.engram_warmup_steps
 
     if args.command == "prepare":
         if not args.data and not args.parquet:
