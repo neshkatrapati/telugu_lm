@@ -638,6 +638,7 @@ def build_model(config: GPTConfig, device: str = "cuda"):
             nn.init.zeros_(self.conv.weight)
             nn.init.zeros_(self.conv.bias)
 
+        @torch.compiler.disable  # CPU↔GPU memory table lookup breaks Dynamo tracing
         def forward(self, h, qk_logits, token_ids, memory_table, tau=1.0):
             """
             Args:
@@ -1128,6 +1129,12 @@ def train(
     logger.info("=" * 70)
 
     model.to(device)
+    # Keep engram memory table on CPU (too large for GPU, ~512MB for 1M×128)
+    if model_config.use_engrams and hasattr(model, "memory_table"):
+        model.memory_table = model.memory_table.cpu()
+        logger.info("Engram memory table pinned to CPU (%d × %d = %.0f MB)",
+                     model_config.engram_table_size, model_config.engram_dim,
+                     model_config.engram_table_size * model_config.engram_dim * 4 / 1e6)
 
     # Resume BEFORE compile — checkpoint has raw keys (no _orig_mod. prefix)
     start_step = 0
@@ -1158,11 +1165,6 @@ def train(
         logger.info("Gradient checkpointing enabled — activation memory will be O(sqrt(layers))")
 
     # Compile (after loading weights so keys match)
-    # NOTE: torch.compile is incompatible with engrams (CPU↔GPU memory table
-    # lookup causes Dynamo device propagation error)
-    if model_config.use_engrams and train_config.compile_model:
-        logger.warning("Disabling torch.compile — incompatible with engram CPU memory table")
-        train_config.compile_model = False
     if train_config.compile_model and hasattr(torch, "compile"):
         logger.info("Compiling model with torch.compile...")
         model = torch.compile(model)
@@ -1550,6 +1552,8 @@ def generate_text(
     model.load_state_dict(checkpoint["model"])
     model.eval()
     model.to(device)
+    if config.use_engrams and hasattr(model, "memory_table"):
+        model.memory_table = model.memory_table.cpu()
 
     # Load tokenizer (SentencePiece or Morfessor)
     sp_model_path = tokenizer_dir / "sp_telugu.model"
