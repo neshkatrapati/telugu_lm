@@ -594,10 +594,11 @@ def build_model(config: GPTConfig, device: str = "cuda"):
             # Sentinel value for wildcard / padding positions
             self.sentinel_val = config.vocab_size + 1
 
-            # Zero-init: module starts as identity (no contribution)
-            nn.init.zeros_(self.W_V.weight)
-            nn.init.zeros_(self.gate_proj.weight)
-            nn.init.zeros_(self.gate_proj.bias)
+            # Gate starts slightly closed (bias=-2 → sigmoid≈0.12) to
+            # minimize perturbation. W_V keeps standard init so gradients flow.
+            nn.init.normal_(self.gate_proj.weight, mean=0.0, std=0.01)
+            nn.init.constant_(self.gate_proj.bias, -2.0)
+            # W_V: intentionally NOT zero — zero table + zero W_V = gradient deadlock
 
         @torch.compiler.disable  # CPU↔GPU memory table lookup breaks Dynamo
         def forward(self, h, token_ids, memory_table, table_size):
@@ -660,6 +661,21 @@ def build_model(config: GPTConfig, device: str = "cuda"):
             gate = torch.sigmoid(self.gate_proj(self.ln_gate(h)))  # (B, T, 1)
             out = gate * v
 
+            # --- 7. Diagnostics (detached, cheap) ---
+            with torch.no_grad():
+                p_mask = torch.sigmoid(mask_logits)  # (B, T, W)
+                self._last_diag = {
+                    "mask_prob_mean": p_mask.mean().item(),
+                    "mask_prob_std": p_mask.std().item(),
+                    "mask_active_per_pos": (p_mask > 0.5).float().sum(dim=-1).mean().item(),
+                    "gate_mean": gate.mean().item(),
+                    "gate_std": gate.std().item(),
+                    "output_norm": out.norm(dim=-1).mean().item(),
+                    "hidden_norm": h.norm(dim=-1).mean().item(),
+                    "unique_slots": flat_indices.unique().numel(),
+                    "total_positions": flat_indices.numel(),
+                }
+
             return out, indices
 
     # ----- Transformer Block -----
@@ -710,7 +726,7 @@ def build_model(config: GPTConfig, device: str = "cuda"):
                 self.memory_table = nn.Embedding(
                     config.engram_table_size, config.engram_dim, sparse=True
                 )
-                nn.init.zeros_(self.memory_table.weight)
+                nn.init.normal_(self.memory_table.weight, mean=0.0, std=0.01)
                 self.memory_table = self.memory_table.cpu()
 
                 inject_indices = config.engram_inject_indices or (4, 30)
@@ -738,12 +754,15 @@ def build_model(config: GPTConfig, device: str = "cuda"):
                 if pn.endswith("c_proj.weight") or pn.endswith("w_down.weight"):
                     torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self._effective_depth))
 
-            # Re-zero engram outputs after _init_weights (which would have overwritten)
+            # Engram init: W_V keeps standard init (needs non-zero for gradient flow).
+            # Gate starts slightly closed (bias=-2 → sigmoid(-2)≈0.12) to minimize
+            # initial perturbation while still allowing gradients to flow.
             if config.use_engrams:
                 for em in self.engram_modules:
-                    nn.init.zeros_(em.W_V.weight)
-                    nn.init.zeros_(em.gate_proj.weight)
-                    nn.init.zeros_(em.gate_proj.bias)
+                    # W_V: keep normal(0, 0.02) from _init_weights — NOT zero
+                    # gate_proj: small init, bias starts negative so gate ≈ 0.12
+                    nn.init.normal_(em.gate_proj.weight, mean=0.0, std=0.01)
+                    nn.init.constant_(em.gate_proj.bias, -2.0)
 
         def _init_weights(self, module):
             if isinstance(module, nn.Linear):
@@ -1270,8 +1289,31 @@ def train(
                     log_dict["engram/active"] = 1.0 if step >= model_config.engram_warmup_steps else 0.0
                     if step >= model_config.engram_warmup_steps:
                         activity = _raw_model.slot_activity
-                        log_dict["engram/active_slots"] = (activity > 0).sum().item()
-                        log_dict["engram/table_fill_pct"] = 100.0 * (activity > 0).sum().item() / model_config.engram_table_size
+                        n_active = (activity > 0).sum().item()
+                        log_dict["engram/active_slots"] = n_active
+                        log_dict["engram/table_fill_pct"] = 100.0 * n_active / model_config.engram_table_size
+                        # Per-module diagnostics from last micro-step
+                        for mod_idx, em in enumerate(_raw_model.engram_modules):
+                            diag = getattr(em, "_last_diag", None)
+                            if diag is None:
+                                continue
+                            pfx = f"engram/m{mod_idx}"
+                            log_dict[f"{pfx}/mask_prob_mean"] = diag["mask_prob_mean"]
+                            log_dict[f"{pfx}/mask_prob_std"] = diag["mask_prob_std"]
+                            log_dict[f"{pfx}/mask_active_per_pos"] = diag["mask_active_per_pos"]
+                            log_dict[f"{pfx}/gate_mean"] = diag["gate_mean"]
+                            log_dict[f"{pfx}/gate_std"] = diag["gate_std"]
+                            log_dict[f"{pfx}/output_norm"] = diag["output_norm"]
+                            log_dict[f"{pfx}/hidden_norm"] = diag["hidden_norm"]
+                            log_dict[f"{pfx}/out_hidden_ratio"] = diag["output_norm"] / max(diag["hidden_norm"], 1e-8)
+                            log_dict[f"{pfx}/collision_rate"] = 1.0 - diag["unique_slots"] / max(diag["total_positions"], 1)
+                        # Table weight norms (sampled cheaply)
+                        with torch.no_grad():
+                            tbl = _raw_model.memory_table.weight.data
+                            row_norms = tbl.norm(dim=1)
+                            log_dict["engram/table_norm_mean"] = row_norms.mean().item()
+                            log_dict["engram/table_norm_max"] = row_norms.max().item()
+                            log_dict["engram/table_nonzero_pct"] = 100.0 * (row_norms > 1e-6).sum().item() / tbl.size(0)
                 wandb.log(log_dict, step=step)
 
         # Eval
