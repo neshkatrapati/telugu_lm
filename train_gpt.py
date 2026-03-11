@@ -1374,9 +1374,10 @@ def train(
             scaler.scale(loss).backward()
             loss_accum += loss.item()
 
-        # Gradient clipping
+        # Gradient clipping (exclude sparse memory table — norm op unsupported on SparseCPU)
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
+        clip_params = [p for p in model.parameters() if p.grad is not None and not p.grad.is_sparse]
+        torch.nn.utils.clip_grad_norm_(clip_params, train_config.grad_clip)
 
         scaler.step(optimizer)
         scaler.update()
