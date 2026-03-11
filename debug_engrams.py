@@ -108,78 +108,105 @@ def main():
 
     idx = torch.tensor([token_ids], dtype=torch.long, device=device)
 
-    # === Hook into engram modules to capture internals ===
+    # === Capture engram internals by instrumenting the pattern_mlp ===
+    # We use register_forward_hook on sub-modules + manual inspection
+    # instead of monkey-patching forward (avoids self/binding issues)
     captures = {}
 
-    def make_hook(module_idx):
-        """Create a forward hook that captures engram internals."""
-        original_forward = model.engram_modules[module_idx].forward.__wrapped__ \
-            if hasattr(model.engram_modules[module_idx].forward, '__wrapped__') \
-            else model.engram_modules[module_idx].forward
+    def capture_engram_state(module_idx, engram_mod):
+        """Manually run engram diagnostics on the module's internal state."""
+        cap = {}
 
-        def debug_forward(self_mod, h, qk_logits, token_ids_arg, memory_table, tau=1.0):
-            B, T, C = h.shape
-            W = self_mod.W
-            dev = h.device
+        # Inspect pattern_mlp weights
+        mlp = engram_mod.pattern_mlp
+        cap["mlp0_weight_norm"] = mlp[0].weight.data.norm().item()
+        cap["mlp2_weight_norm"] = mlp[2].weight.data.norm().item()
+        cap["wk_norm"] = engram_mod.W_K.weight.data.norm().item()
+        cap["wv_norm"] = engram_mod.W_V.weight.data.norm().item()
+        cap["conv_norm"] = engram_mod.conv.weight.data.norm().item()
 
-            # --- Capture mask probabilities ---
-            # Rebuild the QK window extraction (same as forward)
-            offsets = torch.arange(W, device=dev).unsqueeze(0)
-            positions = torch.arange(T, device=dev).unsqueeze(1)
+        return cap
 
-            key_indices = positions - W + offsets
-            valid_mask = key_indices >= 0
-            key_indices_clamped = key_indices.clamp(min=0)
+    # Pre-capture module parameter norms
+    for i, em in enumerate(model.engram_modules):
+        captures[f"params_{i}"] = capture_engram_state(i, em)
 
-            ki_expanded = key_indices_clamped.unsqueeze(0).unsqueeze(0).expand(
-                B, qk_logits.size(1), -1, -1)
-            qk_window = torch.gather(qk_logits, dim=3, index=ki_expanded)
-            valid_mask_expanded = valid_mask.unsqueeze(0).unsqueeze(0).expand_as(qk_window)
-            qk_window = qk_window.masked_fill(~valid_mask_expanded, 0.0)
-            qk_window = qk_window.mean(dim=1)
+    # Now do a manual instrumented forward pass through the engram blocks
+    # Instead of hooking, we'll run the model and intercept at the Block level
+    print("Running instrumented forward pass...")
+    print()
 
-            mask_logits = self_mod.pattern_mlp(qk_window)
-            p_w = torch.sigmoid(mask_logits)
-            hard_mask = (p_w > 0.5).float()
-
-            # Run the actual forward to get output
-            out, mdl_loss = original_forward(h, qk_logits, token_ids_arg, memory_table, tau)
-
-            captures[f"engram_{module_idx}"] = {
-                "mask_probs": p_w.detach().cpu(),           # (B, T, W)
-                "hard_mask": hard_mask.detach().cpu(),      # (B, T, W)
-                "mask_logits": mask_logits.detach().cpu(),  # (B, T, W)
-                "qk_window": qk_window.detach().cpu(),     # (B, T, W)
-                "output_norm": out.detach().norm(dim=-1).cpu(),  # (B, T)
-                "hidden_norm": h.detach().norm(dim=-1).cpu(),    # (B, T)
-                "mdl_loss": mdl_loss.item(),
-                "positions_active": hard_mask.sum(dim=-1).detach().cpu(),  # (B, T)
-            }
-
-            return out, mdl_loss
-
-        import types
-        model.engram_modules[module_idx].forward = types.MethodType(
-            lambda self, *a, **kw: debug_forward(self, *a, **kw),
-            model.engram_modules[module_idx]
-        )
-
-    # Install hooks
-    for i in range(len(model.engram_modules)):
-        make_hook(i)
-
-    # Ensure engram map is active
-    model._engram_map_active = model._engram_map
-
-    # --- Run forward pass ---
     with torch.no_grad():
-        logits, loss = model(idx, idx)  # self-predict for loss
+        B, T = idx.size()
+        tok_emb = model.transformer.wte(idx)
+        x = model.transformer.drop(tok_emb)
+        freqs_cis = torch.view_as_complex(model.freqs_cis[:T])
+
+        active_map = getattr(model, "_engram_map_active", model._engram_map)
+        tau = getattr(model, "_current_tau", 0.3)
+
+        for sched_idx, block in enumerate(model._block_schedule):
+            if sched_idx in active_map:
+                mod_idx = active_map[sched_idx]
+                engram_mod = model.engram_modules[mod_idx]
+                W = engram_mod.W
+
+                # Run attention with QK logits
+                attn_out, qk_logits = block.attn(block.ln_1(x), freqs_cis, return_qk=True)
+                h = x + attn_out
+
+                # --- Extract QK window (same as engram forward) ---
+                offsets = torch.arange(W, device=device).unsqueeze(0)
+                positions = torch.arange(T, device=device).unsqueeze(1)
+                key_indices = positions - W + offsets
+                valid_mask = key_indices >= 0
+                key_indices_clamped = key_indices.clamp(min=0)
+                ki_expanded = key_indices_clamped.unsqueeze(0).unsqueeze(0).expand(
+                    B, qk_logits.size(1), -1, -1)
+                qk_window = torch.gather(qk_logits, dim=3, index=ki_expanded)
+                valid_mask_expanded = valid_mask.unsqueeze(0).unsqueeze(0).expand_as(qk_window)
+                qk_window = qk_window.masked_fill(~valid_mask_expanded, 0.0)
+                qk_window = qk_window.mean(dim=1)  # (B, T, W)
+
+                # --- Pattern predictor ---
+                mask_logits = engram_mod.pattern_mlp(qk_window)
+                p_w = torch.sigmoid(mask_logits)
+                hard_mask = (p_w > 0.5).float()
+
+                # --- Run full engram forward for output ---
+                engram_out, mdl_loss = engram_mod(
+                    h, qk_logits, idx, model.memory_table, tau
+                )
+
+                # --- Capture everything ---
+                captures[f"engram_{mod_idx}"] = {
+                    "mask_probs": p_w.detach().cpu(),
+                    "hard_mask": hard_mask.detach().cpu(),
+                    "mask_logits": mask_logits.detach().cpu(),
+                    "qk_window": qk_window.detach().cpu(),
+                    "output_norm": engram_out.detach().norm(dim=-1).cpu(),
+                    "hidden_norm": h.detach().norm(dim=-1).cpu(),
+                    "mdl_loss": mdl_loss.item(),
+                    "positions_active": hard_mask.sum(dim=-1).detach().cpu(),
+                }
+
+                x = h + engram_out
+                x = x + block.mlp(block.ln_2(x))
+            else:
+                x = block(x, freqs_cis)
+
+        x = model.transformer.ln_f(x)
+        logits = model.lm_head(x)
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)), idx.view(-1), ignore_index=-1)
 
     print(f"Forward pass loss: {loss.item():.4f}")
     print()
 
     # === Analyze captures ===
     for name, cap in captures.items():
+        if name.startswith("params_"):
+            continue  # handled separately below
         print(f"{'='*60}")
         print(f"  {name}")
         print(f"{'='*60}")
