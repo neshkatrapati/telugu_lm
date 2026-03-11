@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Debug Learned Engrams — inspect what the module is actually doing.
+Debug Learned Engrams v2 — inspect what the module is actually doing.
 
 Loads a checkpoint, runs a sample through the model, and captures
 intermediate engram values: mask probabilities, gate activations,
-table embedding norms, hash collisions, and output contributions.
+table embedding norms, hash slot usage, and output contributions.
 
 Usage:
     python debug_engrams.py --checkpoint ./checkpoints/best.pt \
@@ -21,7 +21,7 @@ from collections import Counter
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Debug engram module internals")
+    parser = argparse.ArgumentParser(description="Debug engram v2 module internals")
     parser.add_argument("--checkpoint", type=str, required=True, help="Model checkpoint")
     parser.add_argument("--tokenizer", type=str, default="./tokenizer", help="Tokenizer dir")
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt (optional)")
@@ -49,9 +49,8 @@ def main():
         rope_theta=cfg.get("rope_theta", 10000.0),
         use_weight_sharing=cfg.get("use_weight_sharing", False),
         use_engrams=cfg.get("use_engrams", False),
-        engram_table_size=cfg.get("engram_table_size", 1_000_000),
+        engram_table_size=cfg.get("engram_table_size", 100_000),
         engram_dim=cfg.get("engram_dim", 128),
-        engram_n_heads=cfg.get("engram_n_heads", 4),
         engram_window=cfg.get("engram_window", 6),
         engram_inject_indices=tuple(cfg.get("engram_inject_indices", (4, 30))),
     )
@@ -61,8 +60,8 @@ def main():
         sys.exit(1)
 
     print(f"Model: {config.n_layer}L, {config.n_embd}d, engrams at indices {config.engram_inject_indices}")
-    print(f"Engram config: table={config.engram_table_size}, dim={config.engram_dim}, "
-          f"heads={config.engram_n_heads}, window={config.engram_window}")
+    print(f"Engram v2 config: table={config.engram_table_size}, dim={config.engram_dim}, "
+          f"window={config.engram_window}")
 
     model = build_model(config, device)
     model.load_state_dict(checkpoint["model"])
@@ -72,7 +71,6 @@ def main():
     if hasattr(model, "memory_table"):
         model.memory_table = model.memory_table.cpu()
     model.eval()
-    model._current_tau = 0.3  # inference tau
 
     step = checkpoint.get("step", "?")
     print(f"Loaded checkpoint at step {step}")
@@ -108,31 +106,9 @@ def main():
 
     idx = torch.tensor([token_ids], dtype=torch.long, device=device)
 
-    # === Capture engram internals by instrumenting the pattern_mlp ===
-    # We use register_forward_hook on sub-modules + manual inspection
-    # instead of monkey-patching forward (avoids self/binding issues)
+    # === Manual instrumented forward pass ===
     captures = {}
 
-    def capture_engram_state(module_idx, engram_mod):
-        """Manually run engram diagnostics on the module's internal state."""
-        cap = {}
-
-        # Inspect pattern_mlp weights
-        mlp = engram_mod.pattern_mlp
-        cap["mlp0_weight_norm"] = mlp[0].weight.data.norm().item()
-        cap["mlp2_weight_norm"] = mlp[2].weight.data.norm().item()
-        cap["wk_norm"] = engram_mod.W_K.weight.data.norm().item()
-        cap["wv_norm"] = engram_mod.W_V.weight.data.norm().item()
-        cap["conv_norm"] = engram_mod.conv.weight.data.norm().item()
-
-        return cap
-
-    # Pre-capture module parameter norms
-    for i, em in enumerate(model.engram_modules):
-        captures[f"params_{i}"] = capture_engram_state(i, em)
-
-    # Now do a manual instrumented forward pass through the engram blocks
-    # Instead of hooking, we'll run the model and intercept at the Block level
     print("Running instrumented forward pass...")
     print()
 
@@ -143,39 +119,46 @@ def main():
         freqs_cis = torch.view_as_complex(model.freqs_cis[:T])
 
         active_map = getattr(model, "_engram_map_active", model._engram_map)
-        tau = getattr(model, "_current_tau", 0.3)
 
         for sched_idx, block in enumerate(model._block_schedule):
+            # Run block normally (v2: engram is AFTER block)
+            x = block(x, freqs_cis)
+
             if sched_idx in active_map:
                 mod_idx = active_map[sched_idx]
                 engram_mod = model.engram_modules[mod_idx]
                 W = engram_mod.W
 
-                # Run attention with QK logits
-                attn_out, qk_logits = block.attn(block.ln_1(x), freqs_cis, return_qk=True)
-                h = x + attn_out
+                # --- Manually run engram internals for diagnostics ---
+                # 1. Build window IDs
+                sentinel_pad = torch.full(
+                    (B, W), engram_mod.sentinel_val, device=device, dtype=idx.dtype
+                )
+                padded_ids = torch.cat([sentinel_pad, idx], dim=1)
+                window_ids = padded_ids.unfold(1, W, 1)[:, :T, :]
 
-                # --- Extract QK window (same as engram forward) ---
-                offsets = torch.arange(W, device=device).unsqueeze(0)
-                positions = torch.arange(T, device=device).unsqueeze(1)
-                key_indices = positions - W + offsets
-                valid_mask = key_indices >= 0
-                key_indices_clamped = key_indices.clamp(min=0)
-                ki_expanded = key_indices_clamped.unsqueeze(0).unsqueeze(0).expand(
-                    B, qk_logits.size(1), -1, -1)
-                qk_window = torch.gather(qk_logits, dim=3, index=ki_expanded)
-                valid_mask_expanded = valid_mask.unsqueeze(0).unsqueeze(0).expand_as(qk_window)
-                qk_window = qk_window.masked_fill(~valid_mask_expanded, 0.0)
-                qk_window = qk_window.mean(dim=1)  # (B, T, W)
-
-                # --- Pattern predictor ---
-                mask_logits = engram_mod.pattern_mlp(qk_window)
+                # 2. Mask predictor
+                mask_logits = engram_mod.mask_predictor(x)
                 p_w = torch.sigmoid(mask_logits)
                 hard_mask = (p_w > 0.5).float()
 
-                # --- Run full engram forward for output ---
-                engram_out, mdl_loss = engram_mod(
-                    h, qk_logits, idx, model.memory_table, tau
+                # 3. Hash keys
+                sentinel_fill = torch.full_like(window_ids, engram_mod.sentinel_val)
+                mask_int = hard_mask.long()
+                keys = window_ids * mask_int + sentinel_fill * (1 - mask_int)
+
+                # 4. Hash → indices
+                hash_vals = (keys.float() * engram_mod.hash_weights.float()).sum(dim=-1).long()
+                indices = hash_vals.abs() % config.engram_table_size
+
+                # 5. Run full engram forward for output
+                engram_out, slot_idx = engram_mod(
+                    x, idx, model.memory_table, config.engram_table_size
+                )
+
+                # 6. Gate values
+                gate = torch.sigmoid(
+                    engram_mod.gate_proj(engram_mod.ln_gate(x))
                 )
 
                 # --- Capture everything ---
@@ -183,17 +166,14 @@ def main():
                     "mask_probs": p_w.detach().cpu(),
                     "hard_mask": hard_mask.detach().cpu(),
                     "mask_logits": mask_logits.detach().cpu(),
-                    "qk_window": qk_window.detach().cpu(),
                     "output_norm": engram_out.detach().norm(dim=-1).cpu(),
-                    "hidden_norm": h.detach().norm(dim=-1).cpu(),
-                    "mdl_loss": mdl_loss.item(),
+                    "hidden_norm": x.detach().norm(dim=-1).cpu(),
+                    "gate_values": gate.detach().cpu(),
                     "positions_active": hard_mask.sum(dim=-1).detach().cpu(),
+                    "slot_indices": indices.detach().cpu(),
                 }
 
-                x = h + engram_out
-                x = x + block.mlp(block.ln_2(x))
-            else:
-                x = block(x, freqs_cis)
+                x = x + engram_out
 
         x = model.transformer.ln_f(x)
         logits = model.lm_head(x)
@@ -205,8 +185,6 @@ def main():
 
     # === Analyze captures ===
     for name, cap in captures.items():
-        if name.startswith("params_"):
-            continue  # handled separately below
         print(f"{'='*60}")
         print(f"  {name}")
         print(f"{'='*60}")
@@ -215,15 +193,16 @@ def main():
         hard = cap["hard_mask"]       # (1, T, W)
         out_norm = cap["output_norm"] # (1, T)
         h_norm = cap["hidden_norm"]   # (1, T)
+        gate = cap["gate_values"]     # (1, T, 1)
         positions_active = cap["positions_active"]  # (1, T)
-        qk_win = cap["qk_window"]    # (1, T, W)
+        slot_idx = cap["slot_indices"]  # (1, T)
 
-        T = p_w.size(1)
+        T_seq = p_w.size(1)
         W = p_w.size(2)
 
         # 1. Mask probability statistics
         print(f"\n--- Mask Probabilities (should vary if learning) ---")
-        print(f"  Mean p(mask=1):  {p_w.mean().item():.4f}  (prior={config.engram_mdl_prior})")
+        print(f"  Mean p(mask=1):  {p_w.mean().item():.4f}")
         print(f"  Std p(mask=1):   {p_w.std().item():.4f}  (>0.1 = good variation)")
         print(f"  Min:             {p_w.min().item():.4f}")
         print(f"  Max:             {p_w.max().item():.4f}")
@@ -235,7 +214,7 @@ def main():
         # 2. Hard mask statistics
         print(f"\n--- Hard Mask (positions selected per query) ---")
         mean_active = positions_active.float().mean().item()
-        print(f"  Mean active:     {mean_active:.2f} / {W}  (expect ~{W*config.engram_mdl_prior:.1f} from prior)")
+        print(f"  Mean active:     {mean_active:.2f} / {W}")
         # Distribution of active counts
         counts = positions_active[0].long().tolist()
         dist = Counter(counts)
@@ -244,7 +223,7 @@ def main():
         # 3. Are all masks identical? (collapsed)
         mask_patterns = hard[0]  # (T, W)
         unique_patterns = torch.unique(mask_patterns, dim=0)
-        print(f"  Unique patterns: {len(unique_patterns)} / {T} positions  ", end="")
+        print(f"  Unique patterns: {len(unique_patterns)} / {T_seq} positions  ", end="")
         if len(unique_patterns) <= 3:
             print("*** COLLAPSED — all positions use same mask ***")
             for i, pat in enumerate(unique_patterns):
@@ -252,11 +231,12 @@ def main():
         else:
             print("(good — diverse patterns)")
 
-        # 4. QK window logit statistics
-        print(f"\n--- QK Window Logits (input to pattern predictor) ---")
-        print(f"  Mean:  {qk_win.mean().item():.4f}")
-        print(f"  Std:   {qk_win.std().item():.4f}  (>0.1 = varied attention)")
-        print(f"  Range: [{qk_win.min().item():.4f}, {qk_win.max().item():.4f}]")
+        # 4. Gate statistics
+        print(f"\n--- Gate Values (how much engram output is used) ---")
+        print(f"  Mean gate:  {gate.mean().item():.4f}")
+        print(f"  Std gate:   {gate.std().item():.4f}")
+        print(f"  Min:        {gate.min().item():.4f}")
+        print(f"  Max:        {gate.max().item():.4f}")
 
         # 5. Output contribution
         ratio = out_norm / (h_norm + 1e-8)
@@ -271,9 +251,12 @@ def main():
         else:
             print("(meaningful contribution)")
 
-        # 6. MDL loss
-        print(f"\n--- MDL Loss ---")
-        print(f"  Value: {cap['mdl_loss']:.8f}")
+        # 6. Slot collision analysis
+        print(f"\n--- Slot Usage ---")
+        flat_slots = slot_idx[0].tolist()
+        unique_slots = len(set(flat_slots))
+        print(f"  Unique slots accessed: {unique_slots} / {T_seq} positions")
+        print(f"  Collision rate:        {1.0 - unique_slots / T_seq:.2%}")
 
         print()
 
@@ -294,15 +277,23 @@ def main():
         nz_norms = row_norms[row_norms > 1e-6]
         print(f"  Non-zero norms — mean: {nz_norms.mean().item():.6f}, max: {nz_norms.max().item():.6f}")
 
+    # Top-K most used slots (by norm, as proxy for training activity)
+    if nonzero_rows > 0:
+        top_k = min(10, nonzero_rows)
+        top_norms, top_indices = row_norms.topk(top_k)
+        print(f"\n  Top {top_k} slots by norm:")
+        for i in range(top_k):
+            print(f"    Slot {top_indices[i].item():6d}: norm={top_norms[i].item():.6f}")
+
     # Weight magnitude of key module parameters
     print(f"\n--- Module Parameter Norms ---")
     for i, em in enumerate(model.engram_modules):
         print(f"  Engram {i}:")
-        print(f"    pattern_mlp[0].weight norm: {em.pattern_mlp[0].weight.data.norm().item():.4f}")
-        print(f"    pattern_mlp[2].weight norm: {em.pattern_mlp[2].weight.data.norm().item():.4f}")
-        print(f"    W_K.weight norm:            {em.W_K.weight.data.norm().item():.4f}")
-        print(f"    W_V.weight norm:            {em.W_V.weight.data.norm().item():.6f}  (zero-init)")
-        print(f"    conv.weight norm:           {em.conv.weight.data.norm().item():.6f}  (zero-init)")
+        print(f"    mask_predictor[0].weight norm: {em.mask_predictor[0].weight.data.norm().item():.4f}")
+        print(f"    mask_predictor[2].weight norm: {em.mask_predictor[2].weight.data.norm().item():.4f}")
+        print(f"    W_V.weight norm:               {em.W_V.weight.data.norm().item():.6f}  (zero-init)")
+        print(f"    gate_proj.weight norm:         {em.gate_proj.weight.data.norm().item():.6f}  (zero-init)")
+        print(f"    gate_proj.bias:                {em.gate_proj.bias.data.item():.6f}  (zero-init)")
 
     print()
     print("Done.")
