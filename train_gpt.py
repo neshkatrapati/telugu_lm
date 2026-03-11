@@ -1007,9 +1007,11 @@ def train(
     logger.info("=" * 70)
 
     model.to(device)
-    # Keep engram memory table on CPU (sparse embeddings)
+    # Keep engram memory table + slot activity on CPU
     if model_config.use_engrams and hasattr(model, "memory_table"):
         model.memory_table = model.memory_table.cpu()
+        if hasattr(model, "slot_activity"):
+            model.slot_activity = model.slot_activity.cpu()
         logger.info("Engram v2: table on CPU (%d × %d = %.0f MB), evict every %d steps",
                      model_config.engram_table_size, model_config.engram_dim,
                      model_config.engram_table_size * model_config.engram_dim * 4 / 1e6,
@@ -1025,9 +1027,11 @@ def train(
         checkpoint = _pending_checkpoint
         _pending_checkpoint = None
         model.load_state_dict(checkpoint["model"])
-        # Ensure memory table stays on CPU after state_dict load
+        # Ensure memory table + slot activity stay on CPU after state_dict load
         if model_config.use_engrams and hasattr(model, "memory_table"):
             model.memory_table = model.memory_table.cpu()
+            if hasattr(model, "slot_activity"):
+                model.slot_activity = model.slot_activity.cpu()
         start_step = checkpoint["step"]
         best_val_loss = checkpoint.get("best_val_loss", float("inf"))
         tokens_processed = checkpoint.get("tokens_processed", start_step * tokens_per_step)
@@ -1286,34 +1290,44 @@ def train(
                     "train/elapsed_min": dt / 60,
                 }
                 if model_config.use_engrams:
-                    log_dict["engram/active"] = 1.0 if step >= model_config.engram_warmup_steps else 0.0
-                    if step >= model_config.engram_warmup_steps:
-                        activity = _raw_model.slot_activity
-                        n_active = (activity > 0).sum().item()
-                        log_dict["engram/active_slots"] = n_active
-                        log_dict["engram/table_fill_pct"] = 100.0 * n_active / model_config.engram_table_size
-                        # Per-module diagnostics from last micro-step
-                        for mod_idx, em in enumerate(_raw_model.engram_modules):
-                            diag = getattr(em, "_last_diag", None)
-                            if diag is None:
-                                continue
-                            pfx = f"engram/m{mod_idx}"
-                            log_dict[f"{pfx}/mask_prob_mean"] = diag["mask_prob_mean"]
-                            log_dict[f"{pfx}/mask_prob_std"] = diag["mask_prob_std"]
-                            log_dict[f"{pfx}/mask_active_per_pos"] = diag["mask_active_per_pos"]
-                            log_dict[f"{pfx}/gate_mean"] = diag["gate_mean"]
-                            log_dict[f"{pfx}/gate_std"] = diag["gate_std"]
-                            log_dict[f"{pfx}/output_norm"] = diag["output_norm"]
-                            log_dict[f"{pfx}/hidden_norm"] = diag["hidden_norm"]
-                            log_dict[f"{pfx}/out_hidden_ratio"] = diag["output_norm"] / max(diag["hidden_norm"], 1e-8)
-                            log_dict[f"{pfx}/collision_rate"] = 1.0 - diag["unique_slots"] / max(diag["total_positions"], 1)
-                        # Table weight norms (sampled cheaply)
-                        with torch.no_grad():
-                            tbl = _raw_model.memory_table.weight.data
-                            row_norms = tbl.norm(dim=1)
-                            log_dict["engram/table_norm_mean"] = row_norms.mean().item()
-                            log_dict["engram/table_norm_max"] = row_norms.max().item()
-                            log_dict["engram/table_nonzero_pct"] = 100.0 * (row_norms > 1e-6).sum().item() / tbl.size(0)
+                    engram_on = step >= model_config.engram_warmup_steps
+                    log_dict["engram/active"] = 1.0 if engram_on else 0.0
+
+                    # Table stats — always logged (even during warmup)
+                    with torch.no_grad():
+                        tbl = _raw_model.memory_table.weight.data
+                        row_norms = tbl.norm(dim=1)
+                        log_dict["engram/table_norm_mean"] = row_norms.mean().item()
+                        log_dict["engram/table_norm_max"] = row_norms.max().item()
+                        log_dict["engram/table_nonzero_pct"] = 100.0 * (row_norms > 1e-6).sum().item() / tbl.size(0)
+
+                    # Slot activity — always logged
+                    activity = _raw_model.slot_activity
+                    n_active = (activity > 0).sum().item()
+                    log_dict["engram/active_slots"] = n_active
+                    log_dict["engram/table_fill_pct"] = 100.0 * n_active / model_config.engram_table_size
+
+                    # Module parameter norms — always logged
+                    for mod_idx, em in enumerate(_raw_model.engram_modules):
+                        pfx = f"engram/m{mod_idx}"
+                        log_dict[f"{pfx}/wv_norm"] = em.W_V.weight.data.norm().item()
+                        log_dict[f"{pfx}/gate_bias"] = em.gate_proj.bias.data.item()
+
+                    # Per-module forward-pass diagnostics (only exist once engrams run)
+                    for mod_idx, em in enumerate(_raw_model.engram_modules):
+                        diag = getattr(em, "_last_diag", None)
+                        if diag is None:
+                            continue
+                        pfx = f"engram/m{mod_idx}"
+                        log_dict[f"{pfx}/mask_prob_mean"] = diag["mask_prob_mean"]
+                        log_dict[f"{pfx}/mask_prob_std"] = diag["mask_prob_std"]
+                        log_dict[f"{pfx}/mask_active_per_pos"] = diag["mask_active_per_pos"]
+                        log_dict[f"{pfx}/gate_mean"] = diag["gate_mean"]
+                        log_dict[f"{pfx}/gate_std"] = diag["gate_std"]
+                        log_dict[f"{pfx}/output_norm"] = diag["output_norm"]
+                        log_dict[f"{pfx}/hidden_norm"] = diag["hidden_norm"]
+                        log_dict[f"{pfx}/out_hidden_ratio"] = diag["output_norm"] / max(diag["hidden_norm"], 1e-8)
+                        log_dict[f"{pfx}/collision_rate"] = 1.0 - diag["unique_slots"] / max(diag["total_positions"], 1)
                 wandb.log(log_dict, step=step)
 
         # Eval
