@@ -579,7 +579,7 @@ def build_model(config: GPTConfig, device: str = "cuda"):
 
             # Gate starts slightly closed (bias=-2 → sigmoid≈0.12)
             nn.init.normal_(self.gate_proj.weight, mean=0.0, std=0.01)
-            nn.init.constant_(self.gate_proj.bias, -2.0)
+            nn.init.constant_(self.gate_proj.bias, -0.5)
 
         def forward(self, h, pattern_ids, pattern_table):
             """
@@ -698,7 +698,7 @@ def build_model(config: GPTConfig, device: str = "cuda"):
             if config.use_engrams:
                 for em in self.engram_modules:
                     nn.init.normal_(em.gate_proj.weight, mean=0.0, std=0.01)
-                    nn.init.constant_(em.gate_proj.bias, -2.0)
+                    nn.init.constant_(em.gate_proj.bias, -0.5)
 
         def _init_weights(self, module):
             if isinstance(module, nn.Linear):
