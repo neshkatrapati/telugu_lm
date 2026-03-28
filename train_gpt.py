@@ -592,7 +592,6 @@ def build_model(config: GPTConfig, device: str = "cuda"):
                 engram_out:    (B, T, n_embd) — additive residual
             """
             B, T, C = h.shape
-            device = h.device
 
             # --- 1. Lookup pattern embeddings ---
             # Clamp -1 → 0 for embedding lookup, then zero out no-match positions
@@ -606,10 +605,16 @@ def build_model(config: GPTConfig, device: str = "cuda"):
             gate = torch.sigmoid(self.gate_proj(self.ln_gate(h)))  # (B, T, 1)
             out = gate * v
 
-            # --- 3. Diagnostics (detached, cheap) ---
+            # --- 3. Diagnostics (outside compile graph) ---
+            self._collect_diag(gate, out, h, no_match)
+
+            return out
+
+        @torch.compiler.disable
+        def _collect_diag(self, gate, out, h, no_match):
             with torch.no_grad():
                 n_matched = (~no_match).sum().item()
-                n_total = B * T
+                n_total = no_match.numel()
                 self._last_diag = {
                     "gate_mean": gate.mean().item(),
                     "gate_std": gate.std().item(),
@@ -619,8 +624,6 @@ def build_model(config: GPTConfig, device: str = "cuda"):
                     "matched_gate_mean": gate[~no_match].mean().item() if n_matched > 0 else 0.0,
                     "unmatched_gate_mean": gate[no_match].mean().item() if n_matched < n_total else 0.0,
                 }
-
-            return out
 
     # ----- Transformer Block -----
     class Block(nn.Module):
