@@ -79,6 +79,7 @@ class GPTConfig:
     engram_inject_indices: tuple = (4, 30)  # schedule indices for injection
     engram_table_lr_mult: float = 5.0       # LR multiplier for pattern table
     engram_warmup_steps: int = 3000         # freeze ENTIRE engram module for first N steps
+    engram_gate_freeze_steps: int = 500      # force gate open (0.5) for N steps after warmup
 
     def effective_depth(self):
         """Number of block forward passes (2x unique layers if weight sharing)."""
@@ -581,12 +582,13 @@ def build_model(config: GPTConfig, device: str = "cuda"):
             nn.init.normal_(self.gate_proj.weight, mean=0.0, std=0.01)
             nn.init.constant_(self.gate_proj.bias, -0.5)
 
-        def forward(self, h, pattern_ids, pattern_table):
+        def forward(self, h, pattern_ids, pattern_table, gate_frozen=False):
             """
             Args:
                 h:             (B, T, n_embd) — hidden states
                 pattern_ids:   (B, T) int32 — precomputed pattern IDs (-1 = no match)
                 pattern_table: nn.Embedding (n_patterns, engram_dim) on same device
+                gate_frozen:   bool — if True, force gate=0.5 (don't use learned gate)
 
             Returns:
                 engram_out:    (B, T, n_embd) — additive residual
@@ -602,16 +604,24 @@ def build_model(config: GPTConfig, device: str = "cuda"):
 
             # --- 2. Project + gate ---
             v = self.W_V(emb)                     # (B, T, n_embd)
-            gate = torch.sigmoid(self.gate_proj(self.ln_gate(h)))  # (B, T, 1)
+            if gate_frozen:
+                gate = torch.full((B, T, 1), 0.5, device=h.device, dtype=h.dtype)
+            else:
+                gate = torch.sigmoid(self.gate_proj(self.ln_gate(h)))  # (B, T, 1)
             out = gate * v
 
-            # --- 3. Diagnostics (outside compile graph) ---
-            self._collect_diag(gate, out, h, no_match)
+            # --- 3. Stash tensors for diagnostics (computed outside compile) ---
+            self._diag_tensors = (gate.detach(), out.detach(), h.detach(), no_match.detach())
 
             return out
 
-        @torch.compiler.disable
-        def _collect_diag(self, gate, out, h, no_match):
+        def collect_diag(self):
+            """Call from training loop OUTSIDE torch.compile to avoid graph breaks."""
+            tup = getattr(self, "_diag_tensors", None)
+            if tup is None:
+                return
+            gate, out, h, no_match = tup
+            self._diag_tensors = None
             with torch.no_grad():
                 n_matched = (~no_match).sum().item()
                 n_total = no_match.numel()
@@ -745,7 +755,8 @@ def build_model(config: GPTConfig, device: str = "cuda"):
                 if use_engrams and sched_idx in active_map:
                     mod_idx = active_map[sched_idx]
                     engram_out = self.engram_modules[mod_idx](
-                        x, pattern_ids, self.pattern_table
+                        x, pattern_ids, self.pattern_table,
+                        gate_frozen=getattr(self, "_gate_frozen", False),
                     )
                     x = x + engram_out
 
@@ -1172,11 +1183,23 @@ def train(
         # Engram v3: warmup (full freeze, no eviction needed)
         if model_config.use_engrams:
             engram_active = step >= model_config.engram_warmup_steps
+            gate_freeze_end = model_config.engram_warmup_steps + model_config.engram_gate_freeze_steps
+            gate_frozen = engram_active and step < gate_freeze_end
 
             # During warmup: freeze entire engram module + pattern table
             for em in _raw_model.engram_modules.parameters():
                 em.requires_grad_(engram_active)
             _raw_model.pattern_table.weight.requires_grad_(engram_active)
+
+            # Freeze gate params during gate-freeze window (table + W_V still learn)
+            if gate_frozen:
+                for em in _raw_model.engram_modules:
+                    em.gate_proj.weight.requires_grad_(False)
+                    em.gate_proj.bias.requires_grad_(False)
+                    em.ln_gate.weight.requires_grad_(False)
+
+            # Set flag for forward pass
+            _raw_model._gate_frozen = gate_frozen
 
             # Disable engram injection during warmup
             if not engram_active:
@@ -1238,7 +1261,9 @@ def train(
                 }
                 if model_config.use_engrams:
                     engram_on = step >= model_config.engram_warmup_steps
+                    gf_end = model_config.engram_warmup_steps + model_config.engram_gate_freeze_steps
                     log_dict["engram/active"] = 1.0 if engram_on else 0.0
+                    log_dict["engram/gate_frozen"] = 1.0 if (engram_on and step < gf_end) else 0.0
 
                     # Pattern table stats — always logged
                     with torch.no_grad():
@@ -1254,6 +1279,9 @@ def train(
                         log_dict[f"{pfx}/wv_norm"] = em.W_V.weight.data.norm().item()
                         log_dict[f"{pfx}/gate_bias"] = em.gate_proj.bias.data.item()
 
+                    # Collect diagnostics OUTSIDE compile graph
+                    for em in _raw_model.engram_modules:
+                        em.collect_diag()
                     # Per-module forward-pass diagnostics (only after warmup)
                     for mod_idx, em in enumerate(_raw_model.engram_modules):
                         diag = getattr(em, "_last_diag", None)
@@ -1563,6 +1591,8 @@ Examples:
                        help="Per-pattern embedding dimension (default: 64)")
         p.add_argument("--engram-warmup-steps", type=int, default=3000,
                        help="Freeze entire engram module for first N steps (default: 3000)")
+        p.add_argument("--engram-gate-freeze-steps", type=int, default=500,
+                       help="Force gate open (0.5) for N steps after warmup (default: 500)")
         # LR schedule
         p.add_argument("--lr-schedule", type=str, default="wsd", choices=["wsd", "cosine"],
                        help="LR schedule (default: wsd)")
@@ -1634,6 +1664,7 @@ Examples:
         model_config.engram_table_size = args.engram_table_size
         model_config.engram_dim = args.engram_dim
         model_config.engram_warmup_steps = args.engram_warmup_steps
+        model_config.engram_gate_freeze_steps = args.engram_gate_freeze_steps
 
     if args.command == "prepare":
         if not args.data and not args.parquet:
