@@ -72,15 +72,13 @@ class GPTConfig:
     rope_theta: float = 10000.0  # RoPE base frequency
     use_weight_sharing: bool = True  # MobileLLM-LS block-wise sharing (2x effective depth)
 
-    # Learned Engrams v2 (conditional n-gram memory with binary masks)
+    # Engrams v3 (PMI-based 5-gram pattern memory)
     use_engrams: bool = False
-    engram_table_size: int = 100_000        # slots in CPU hash table (small = collision pressure)
-    engram_dim: int = 128                   # per-slot embedding dimension
-    engram_window: int = 6                  # local context window W (6-gram)
+    engram_table_size: int = 580_262        # number of unique patterns from preprocessing
+    engram_dim: int = 64                    # per-pattern embedding dimension
     engram_inject_indices: tuple = (4, 30)  # schedule indices for injection
-    engram_table_lr_mult: float = 5.0       # LR multiplier for memory table
+    engram_table_lr_mult: float = 5.0       # LR multiplier for pattern table
     engram_warmup_steps: int = 3000         # freeze ENTIRE engram module for first N steps
-    engram_evict_interval: int = 5000       # zero out low-activity slots every N steps (0 = off)
 
     def effective_depth(self):
         """Number of block forward passes (2x unique layers if weight sharing)."""
@@ -551,132 +549,78 @@ def build_model(config: GPTConfig, device: str = "cuda"):
         def forward(self, x):
             return self.dropout(self.w_down(F.silu(self.w_gate(x)) * self.w_up(x)))
 
-    # ----- Learned Engram Module v2 (simple n-gram memory) -----
-    class SimpleEngramModule(nn.Module):
-        """Simple n-gram memory with learned binary masks.
+    # ----- Engram Module v3 (PMI-based 5-gram pattern memory) -----
+    class PatternEngramModule(nn.Module):
+        """Pattern-based engram memory using precomputed 5-gram templates.
 
-        For each position, looks at the preceding W=6 tokens and learns a
-        binary mask (Token vs Wildcard) per position. The masked n-gram is
-        hashed into a small CPU table. Collision pressure naturally selects
-        for frequent, useful patterns.
+        Each token position has a precomputed pattern_id from PMI-scored
+        5-gram templates (exact collocations + partial templates). The
+        pattern_id indexes into a learned embedding table on GPU.
 
-        Zero-initialised so the module starts as identity (no contribution).
+        Gate is initialized slightly closed (sigmoid(-2) ≈ 0.12) so the
+        module starts near-identity. Positions with pattern_id == -1
+        (no match) get a zero vector.
         """
 
         def __init__(self, config):
             super().__init__()
-            W = config.engram_window          # 6
-            n_embd = config.n_embd            # 768
-            engram_dim = config.engram_dim    # 128
+            n_embd = config.n_embd
+            engram_dim = config.engram_dim
 
-            self.W = W
             self.n_embd = n_embd
             self.engram_dim = engram_dim
 
-            # Mask predictor: hidden state → W binary logits (Token vs Wildcard)
-            self.mask_predictor = nn.Sequential(
-                nn.Linear(n_embd, 2 * W),
-                nn.SiLU(),
-                nn.Linear(2 * W, W),
-            )
-
-            # Memory → hidden projection
+            # Pattern embedding → hidden projection
             self.W_V = nn.Linear(engram_dim, n_embd, bias=False)
 
             # Gate: scalar per position via projection
             self.ln_gate = RMSNorm(n_embd)
             self.gate_proj = nn.Linear(n_embd, 1, bias=True)
 
-            # Polynomial hash weights per window position
-            hash_weights = torch.randint(1, 100_000, (W,), dtype=torch.long)
-            self.register_buffer("hash_weights", hash_weights)
-
-            # Sentinel value for wildcard / padding positions
-            self.sentinel_val = config.vocab_size + 1
-
-            # Gate starts slightly closed (bias=-2 → sigmoid≈0.12) to
-            # minimize perturbation. W_V keeps standard init so gradients flow.
+            # Gate starts slightly closed (bias=-2 → sigmoid≈0.12)
             nn.init.normal_(self.gate_proj.weight, mean=0.0, std=0.01)
             nn.init.constant_(self.gate_proj.bias, -2.0)
-            # W_V: intentionally NOT zero — zero table + zero W_V = gradient deadlock
 
-        @torch.compiler.disable  # CPU↔GPU memory table lookup breaks Dynamo
-        def forward(self, h, token_ids, memory_table, table_size):
+        def forward(self, h, pattern_ids, pattern_table):
             """
             Args:
-                h:            (B, T, n_embd) — hidden states (output of a Block)
-                token_ids:    (B, T) — input token IDs (int)
-                memory_table: nn.Embedding on CPU (table_size, engram_dim)
-                table_size:   int — for modulo in hashing
+                h:             (B, T, n_embd) — hidden states
+                pattern_ids:   (B, T) int32 — precomputed pattern IDs (-1 = no match)
+                pattern_table: nn.Embedding (n_patterns, engram_dim) on same device
 
             Returns:
-                engram_out:   (B, T, n_embd) — additive residual
-                slot_indices: (B, T) long — which table slots were accessed
+                engram_out:    (B, T, n_embd) — additive residual
             """
             B, T, C = h.shape
-            W = self.W
             device = h.device
 
-            # --- 1. Build window token IDs: (B, T, W) ---
-            sentinel_pad = torch.full(
-                (B, W), self.sentinel_val, device=device, dtype=token_ids.dtype
-            )
-            padded_ids = torch.cat([sentinel_pad, token_ids], dim=1)  # (B, T+W)
-            window_ids = padded_ids.unfold(1, W, 1)[:, :T, :]  # (B, T, W)
+            # --- 1. Lookup pattern embeddings ---
+            # Clamp -1 → 0 for embedding lookup, then zero out no-match positions
+            no_match = (pattern_ids < 0)
+            safe_ids = pattern_ids.clamp(min=0)
+            emb = pattern_table(safe_ids)         # (B, T, engram_dim)
+            emb = emb.masked_fill(no_match.unsqueeze(-1), 0.0)
 
-            # --- 2. Predict binary mask from hidden state ---
-            mask_logits = self.mask_predictor(h)  # (B, T, W)
-
-            if self.training:
-                # Gumbel-sigmoid with straight-through estimator
-                u = torch.rand_like(mask_logits).clamp(1e-6, 1 - 1e-6)
-                gumbel_noise = torch.log(u) - torch.log(1 - u)
-                y_soft = torch.sigmoid(mask_logits + gumbel_noise)
-                hard_mask = (y_soft > 0.5).float()
-                # STE: forward uses hard, backward uses soft
-                hard_mask = hard_mask - y_soft.detach() + y_soft
-            else:
-                hard_mask = (torch.sigmoid(mask_logits) > 0.5).float()
-
-            # --- 3. Form hash keys ---
-            # Token positions: actual ID; wildcard positions: sentinel
-            sentinel_fill = torch.full_like(window_ids, self.sentinel_val)
-            # hard_mask is float with STE; use > 0.5 for integer indexing
-            mask_int = (hard_mask > 0.5).long()
-            keys = window_ids * mask_int + sentinel_fill * (1 - mask_int)  # (B, T, W)
-
-            # --- 4. Polynomial hash → single table index per position ---
-            # hash = (Σ_w keys[:,:,w] * hash_weights[w]) % table_size
-            hash_vals = (keys.float() * self.hash_weights.float()).sum(dim=-1).long()
-            indices = hash_vals.abs() % table_size  # (B, T)
-
-            # --- 5. CPU table lookup ---
-            flat_indices = indices.reshape(-1)
-            unique_indices, inverse = flat_indices.unique(return_inverse=True)
-            unique_emb = memory_table(unique_indices.cpu()).to(device)
-            gathered = unique_emb[inverse].view(B, T, self.engram_dim)
-
-            # --- 6. Project + gate ---
-            v = self.W_V(gathered)  # (B, T, n_embd)
+            # --- 2. Project + gate ---
+            v = self.W_V(emb)                     # (B, T, n_embd)
             gate = torch.sigmoid(self.gate_proj(self.ln_gate(h)))  # (B, T, 1)
             out = gate * v
 
-            # --- 7. Diagnostics (detached, cheap) ---
+            # --- 3. Diagnostics (detached, cheap) ---
             with torch.no_grad():
-                p_mask = torch.sigmoid(mask_logits)  # (B, T, W)
+                n_matched = (~no_match).sum().item()
+                n_total = B * T
                 self._last_diag = {
-                    "mask_prob_mean": p_mask.mean().item(),
-                    "mask_prob_std": p_mask.std().item(),
-                    "mask_active_per_pos": (p_mask > 0.5).float().sum(dim=-1).mean().item(),
                     "gate_mean": gate.mean().item(),
                     "gate_std": gate.std().item(),
                     "output_norm": out.norm(dim=-1).mean().item(),
                     "hidden_norm": h.norm(dim=-1).mean().item(),
-                    "unique_slots": flat_indices.unique().numel(),
-                    "total_positions": flat_indices.numel(),
+                    "hit_rate": n_matched / max(n_total, 1),
+                    "matched_gate_mean": gate[~no_match].mean().item() if n_matched > 0 else 0.0,
+                    "unmatched_gate_mean": gate[no_match].mean().item() if n_matched < n_total else 0.0,
                 }
 
-            return out, indices
+            return out
 
     # ----- Transformer Block -----
     class Block(nn.Module):
@@ -719,28 +663,20 @@ def build_model(config: GPTConfig, device: str = "cuda"):
 
             self._effective_depth = len(self._block_schedule)
 
-            # Learned Engrams v2: CPU memory table + per-injection-point modules
+            # Engrams v3: precomputed PMI pattern table (GPU)
             self._engram_map = {}  # schedule_index → engram_module_index
             if config.use_engrams:
-                # CPU-resident memory table (~50 MB for 100K × 128 fp32)
-                self.memory_table = nn.Embedding(
-                    config.engram_table_size, config.engram_dim, sparse=True
+                # Pattern embedding table — lives on GPU during training
+                self.pattern_table = nn.Embedding(
+                    config.engram_table_size, config.engram_dim,
                 )
-                nn.init.normal_(self.memory_table.weight, mean=0.0, std=0.01)
-                self.memory_table = self.memory_table.cpu()
+                nn.init.normal_(self.pattern_table.weight, mean=0.0, std=0.01)
 
                 inject_indices = config.engram_inject_indices or (4, 30)
                 self.engram_modules = nn.ModuleList([
-                    SimpleEngramModule(config) for _ in inject_indices
+                    PatternEngramModule(config) for _ in inject_indices
                 ])
                 self._engram_map = {idx: i for i, idx in enumerate(inject_indices)}
-
-                # Slot activity tracking for eviction (CPU buffer, not a parameter)
-                self.register_buffer(
-                    "slot_activity",
-                    torch.zeros(config.engram_table_size, dtype=torch.float32),
-                    persistent=False,  # don't save in checkpoint (reset on load)
-                )
 
             # Precompute RoPE frequencies and store as buffer
             head_dim = config.n_embd // config.n_head
@@ -754,13 +690,10 @@ def build_model(config: GPTConfig, device: str = "cuda"):
                 if pn.endswith("c_proj.weight") or pn.endswith("w_down.weight"):
                     torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self._effective_depth))
 
-            # Engram init: W_V keeps standard init (needs non-zero for gradient flow).
-            # Gate starts slightly closed (bias=-2 → sigmoid(-2)≈0.12) to minimize
-            # initial perturbation while still allowing gradients to flow.
+            # Engram init: W_V keeps standard init (non-zero for gradient flow).
+            # Gate starts slightly closed (bias=-2 → sigmoid(-2)≈0.12).
             if config.use_engrams:
                 for em in self.engram_modules:
-                    # W_V: keep normal(0, 0.02) from _init_weights — NOT zero
-                    # gate_proj: small init, bias starts negative so gate ≈ 0.12
                     nn.init.normal_(em.gate_proj.weight, mean=0.0, std=0.01)
                     nn.init.constant_(em.gate_proj.bias, -2.0)
 
@@ -781,7 +714,7 @@ def build_model(config: GPTConfig, device: str = "cuda"):
         def gradient_checkpointing_disable(self):
             self._gradient_checkpointing = False
 
-        def forward(self, idx, targets=None):
+        def forward(self, idx, targets=None, pattern_ids=None):
             device = idx.device
             B, T = idx.size()
             assert T <= self.config.block_size, f"Sequence length {T} > block_size {self.config.block_size}"
@@ -795,7 +728,7 @@ def build_model(config: GPTConfig, device: str = "cuda"):
             use_ckpt = getattr(self, "_gradient_checkpointing", False) and self.training
             # Use _engram_map_active (empty during warmup, populated after)
             active_map = getattr(self, "_engram_map_active", self._engram_map)
-            use_engrams = self.config.use_engrams and active_map
+            use_engrams = self.config.use_engrams and active_map and pattern_ids is not None
 
             for sched_idx, block in enumerate(self._block_schedule):
                 if use_ckpt:
@@ -808,19 +741,10 @@ def build_model(config: GPTConfig, device: str = "cuda"):
                 # Engram injection: AFTER the block, additive residual
                 if use_engrams and sched_idx in active_map:
                     mod_idx = active_map[sched_idx]
-                    engram_out, slot_idx = self.engram_modules[mod_idx](
-                        x, idx, self.memory_table, self.config.engram_table_size
+                    engram_out = self.engram_modules[mod_idx](
+                        x, pattern_ids, self.pattern_table
                     )
                     x = x + engram_out
-
-                    # Track slot activity for eviction (no grad needed)
-                    if self.training:
-                        with torch.no_grad():
-                            flat_slots = slot_idx.reshape(-1).cpu()
-                            self.slot_activity.scatter_add_(
-                                0, flat_slots,
-                                torch.ones_like(flat_slots, dtype=torch.float32),
-                            )
 
             x = self.transformer.ln_f(x)
 
@@ -860,10 +784,18 @@ def build_model(config: GPTConfig, device: str = "cuda"):
 class MemmapDataset:
     """Memory-mapped dataset for pretraining. Zero RAM overhead."""
 
-    def __init__(self, data_path: Path, block_size: int):
+    def __init__(self, data_path: Path, block_size: int, pattern_path: Path = None):
         self.data = np.memmap(str(data_path), dtype=np.uint32, mode="r")
         self.block_size = block_size
         self.n_tokens = len(self.data)
+        # Optional: precomputed 5-gram pattern IDs (int32, -1 = no match)
+        self.patterns = None
+        if pattern_path is not None and pattern_path.exists():
+            self.patterns = np.memmap(str(pattern_path), dtype=np.int32, mode="r")
+            # pattern_ids covers 5-gram windows: length = n_tokens - 4
+            # For token position i, the pattern ending at i is patterns[i - 4]
+            # (window starting at i-4 covers tokens [i-4, i-3, i-2, i-1, i])
+            logger.info("  Loaded pattern_ids: %d entries from %s", len(self.patterns), pattern_path)
 
     def __len__(self):
         return self.n_tokens // self.block_size
@@ -875,7 +807,27 @@ class MemmapDataset:
         y = np.stack([self.data[i + 1:i + 1 + self.block_size].astype(np.int64) for i in ix])
         x = torch.from_numpy(x).to(device)
         y = torch.from_numpy(y).to(device)
-        return x, y
+
+        # Pattern IDs: for each token position, use the 5-gram window ENDING at that position
+        # pattern_ids[j] = pattern for window [j, j+1, j+2, j+3, j+4]
+        # Token at corpus position (i + t) ends the window starting at (i + t - 4)
+        p = None
+        if self.patterns is not None:
+            n_pat = len(self.patterns)
+            p_list = []
+            for i in ix:
+                pat = np.full(self.block_size, -1, dtype=np.int32)
+                # First 4 positions have no complete 5-gram → stay -1
+                src_start = max(0, i - 4)
+                dst_start = max(0, 4 - i)  # offset into pat if i < 4
+                src_end = min(i - 4 + self.block_size, n_pat)
+                length = src_end - src_start
+                if length > 0:
+                    pat[dst_start:dst_start + length] = self.patterns[src_start:src_end]
+                p_list.append(pat)
+            p = torch.from_numpy(np.stack(p_list)).to(device)
+
+        return x, y, p
 
 
 # ===========================================================================
@@ -921,8 +873,20 @@ def train(
     logger.info("=" * 70)
 
     # Load data
-    train_data = MemmapDataset(data_dir / "train.bin", model_config.block_size)
-    val_data = MemmapDataset(data_dir / "val.bin", model_config.block_size)
+    # Pattern IDs path: data_dir / "5grams" / "pattern_ids.bin" (if engrams enabled)
+    pattern_path = None
+    if model_config.use_engrams:
+        pattern_path = data_dir / "5grams" / "pattern_ids.bin"
+        if not pattern_path.exists():
+            logger.warning("Engrams enabled but no pattern_ids.bin at %s — engrams will be disabled", pattern_path)
+            pattern_path = None
+
+    train_data = MemmapDataset(data_dir / "train.bin", model_config.block_size, pattern_path=pattern_path)
+    # Val: try val pattern_ids, fall back to None (engrams just get -1 = no match during eval)
+    val_pattern_path = data_dir / "5grams" / "val_pattern_ids.bin" if pattern_path else None
+    if val_pattern_path and not val_pattern_path.exists():
+        val_pattern_path = None
+    val_data = MemmapDataset(data_dir / "val.bin", model_config.block_size, pattern_path=val_pattern_path)
 
     logger.info("  Train tokens: %d (%.2f GB)", train_data.n_tokens, train_data.n_tokens * 4 / 1e9)
     logger.info("  Val tokens:   %d", val_data.n_tokens)
@@ -1007,15 +971,11 @@ def train(
     logger.info("=" * 70)
 
     model.to(device)
-    # Keep engram memory table + slot activity on CPU
-    if model_config.use_engrams and hasattr(model, "memory_table"):
-        model.memory_table = model.memory_table.cpu()
-        if hasattr(model, "slot_activity"):
-            model.slot_activity = model.slot_activity.cpu()
-        logger.info("Engram v2: table on CPU (%d × %d = %.0f MB), evict every %d steps",
+    # Engram v3: pattern table stays on GPU (dense, ~148 MB for 580K × 64)
+    if model_config.use_engrams and hasattr(model, "pattern_table"):
+        logger.info("Engram v3: pattern table on GPU (%d × %d = %.0f MB)",
                      model_config.engram_table_size, model_config.engram_dim,
-                     model_config.engram_table_size * model_config.engram_dim * 4 / 1e6,
-                     model_config.engram_evict_interval)
+                     model_config.engram_table_size * model_config.engram_dim * 4 / 1e6)
 
     # Resume BEFORE compile — checkpoint has raw keys (no _orig_mod. prefix)
     start_step = 0
@@ -1026,12 +986,7 @@ def train(
     if _pending_checkpoint is not None:
         checkpoint = _pending_checkpoint
         _pending_checkpoint = None
-        model.load_state_dict(checkpoint["model"])
-        # Ensure memory table + slot activity stay on CPU after state_dict load
-        if model_config.use_engrams and hasattr(model, "memory_table"):
-            model.memory_table = model.memory_table.cpu()
-            if hasattr(model, "slot_activity"):
-                model.slot_activity = model.slot_activity.cpu()
+        model.load_state_dict(checkpoint["model"], strict=False)
         start_step = checkpoint["step"]
         best_val_loss = checkpoint.get("best_val_loss", float("inf"))
         tokens_processed = checkpoint.get("tokens_processed", start_step * tokens_per_step)
@@ -1052,16 +1007,16 @@ def train(
         logger.info("Compiling model with torch.compile...")
         model = torch.compile(model)
 
-    # Optimizer — separate SparseAdam for memory table (sparse gradients)
+    # Optimizer
     _raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
 
     param_dict = {pn: p for pn, p in _raw_model.named_parameters() if p.requires_grad}
-    # Separate memory table params from the rest
+    # Pattern table gets its own group with LR multiplier, no weight decay
     table_params = []
     decay_params = []
     nodecay_params = []
     for pn, p in param_dict.items():
-        if "memory_table" in pn:
+        if "pattern_table" in pn:
             table_params.append(p)
         elif p.dim() >= 2:
             decay_params.append(p)
@@ -1072,6 +1027,13 @@ def train(
         {"params": decay_params, "weight_decay": train_config.weight_decay},
         {"params": nodecay_params, "weight_decay": 0.0},
     ]
+    # Pattern table: separate LR multiplier, no weight decay, same optimizer
+    if table_params:
+        optim_groups.append({
+            "params": table_params,
+            "weight_decay": 0.0,
+            "lr": train_config.learning_rate * model_config.engram_table_lr_mult,
+        })
 
     use_fused = (device == "cuda")
     optimizer = torch.optim.AdamW(
@@ -1081,16 +1043,13 @@ def train(
         fused=use_fused,
     )
 
-    # Sparse optimizer for CPU memory table (nn.Embedding(sparse=True) → sparse grads)
-    table_optimizer = None
+    # Log pattern table info
+    table_optimizer = None  # kept for checkpoint compat, no separate optimizer needed
     if model_config.use_engrams and table_params:
-        table_optimizer = torch.optim.SparseAdam(
-            table_params,
-            lr=train_config.learning_rate * model_config.engram_table_lr_mult,
-            betas=(train_config.beta1, train_config.beta2),
-        )
-        logger.info("Engram memory table: %d params, lr_mult=%.1f, SparseAdam",
-                     sum(p.numel() for p in table_params), model_config.engram_table_lr_mult)
+        logger.info("Engram pattern table: %d params (%.1f MB), lr_mult=%.1f, in main AdamW",
+                     sum(p.numel() for p in table_params),
+                     sum(p.numel() for p in table_params) * 4 / 1e6,
+                     model_config.engram_table_lr_mult)
 
     # Load optimizer state if resuming (from state saved earlier, no second disk load)
     if _resume_optimizer_state is not None:
@@ -1199,42 +1158,28 @@ def train(
     for step in range(start_step, total_steps):
         # LR schedule
         lr = get_lr(step)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
-        # Update table optimizer LR (separate SparseAdam)
-        if table_optimizer is not None:
-            for param_group in table_optimizer.param_groups:
+        for i, param_group in enumerate(optimizer.param_groups):
+            if i < 2:
+                # decay + nodecay groups
+                param_group["lr"] = lr
+            else:
+                # pattern table group — apply LR multiplier
                 param_group["lr"] = lr * model_config.engram_table_lr_mult
 
-        # Engram v2: warmup (full freeze) + periodic eviction
+        # Engram v3: warmup (full freeze, no eviction needed)
         if model_config.use_engrams:
             engram_active = step >= model_config.engram_warmup_steps
 
-            # During warmup: freeze entire engram module + table
+            # During warmup: freeze entire engram module + pattern table
             for em in _raw_model.engram_modules.parameters():
                 em.requires_grad_(engram_active)
-            _raw_model.memory_table.weight.requires_grad_(engram_active)
+            _raw_model.pattern_table.weight.requires_grad_(engram_active)
 
             # Disable engram injection during warmup
             if not engram_active:
                 _raw_model._engram_map_active = {}
             else:
                 _raw_model._engram_map_active = _raw_model._engram_map
-
-            # Periodic eviction: zero out slots that were never accessed
-            evict_interval = model_config.engram_evict_interval
-            if (engram_active and evict_interval > 0
-                    and step > 0 and step % evict_interval == 0):
-                with torch.no_grad():
-                    activity = _raw_model.slot_activity
-                    inactive = activity == 0
-                    n_inactive = inactive.sum().item()
-                    if n_inactive > 0:
-                        _raw_model.memory_table.weight.data[inactive] = 0.0
-                        logger.info("Engram eviction at step %d: zeroed %d/%d inactive slots",
-                                    step, n_inactive, model_config.engram_table_size)
-                    # Reset activity counter
-                    _raw_model.slot_activity.zero_()
 
         # Gradient accumulation
         optimizer.zero_grad(set_to_none=True)
@@ -1243,10 +1188,10 @@ def train(
         loss_accum = 0.0
 
         for micro_step in range(train_config.gradient_accumulation_steps):
-            x, y = train_data.get_batch(train_config.micro_batch_size, device)
+            x, y, p = train_data.get_batch(train_config.micro_batch_size, device)
 
             with ctx:
-                logits, loss = model(x, y)
+                logits, loss = model(x, y, pattern_ids=p)
                 loss = loss / train_config.gradient_accumulation_steps
 
             if step <= start_step + 1 and micro_step == 0:
@@ -1257,15 +1202,14 @@ def train(
             scaler.scale(loss).backward()
             loss_accum += loss.item()
 
-        # Gradient clipping (exclude sparse memory table — norm op unsupported on SparseCPU)
+        # Gradient clipping
         scaler.unscale_(optimizer)
-        clip_params = [p for p in model.parameters() if p.grad is not None and not p.grad.is_sparse]
-        torch.nn.utils.clip_grad_norm_(clip_params, train_config.grad_clip)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
 
         scaler.step(optimizer)
         scaler.update()
 
-        # Step sparse optimizer for memory table (not affected by GradScaler)
+        # (table_optimizer is None in v3 — pattern table is in main AdamW)
         if table_optimizer is not None:
             table_optimizer.step()
 
@@ -1293,19 +1237,13 @@ def train(
                     engram_on = step >= model_config.engram_warmup_steps
                     log_dict["engram/active"] = 1.0 if engram_on else 0.0
 
-                    # Table stats — always logged (even during warmup)
+                    # Pattern table stats — always logged
                     with torch.no_grad():
-                        tbl = _raw_model.memory_table.weight.data
+                        tbl = _raw_model.pattern_table.weight.data
                         row_norms = tbl.norm(dim=1)
                         log_dict["engram/table_norm_mean"] = row_norms.mean().item()
                         log_dict["engram/table_norm_max"] = row_norms.max().item()
-                        log_dict["engram/table_nonzero_pct"] = 100.0 * (row_norms > 1e-6).sum().item() / tbl.size(0)
-
-                    # Slot activity — always logged
-                    activity = _raw_model.slot_activity
-                    n_active = (activity > 0).sum().item()
-                    log_dict["engram/active_slots"] = n_active
-                    log_dict["engram/table_fill_pct"] = 100.0 * n_active / model_config.engram_table_size
+                        log_dict["engram/table_norm_std"] = row_norms.std().item()
 
                     # Module parameter norms — always logged
                     for mod_idx, em in enumerate(_raw_model.engram_modules):
@@ -1313,21 +1251,20 @@ def train(
                         log_dict[f"{pfx}/wv_norm"] = em.W_V.weight.data.norm().item()
                         log_dict[f"{pfx}/gate_bias"] = em.gate_proj.bias.data.item()
 
-                    # Per-module forward-pass diagnostics (only exist once engrams run)
+                    # Per-module forward-pass diagnostics (only after warmup)
                     for mod_idx, em in enumerate(_raw_model.engram_modules):
                         diag = getattr(em, "_last_diag", None)
                         if diag is None:
                             continue
                         pfx = f"engram/m{mod_idx}"
-                        log_dict[f"{pfx}/mask_prob_mean"] = diag["mask_prob_mean"]
-                        log_dict[f"{pfx}/mask_prob_std"] = diag["mask_prob_std"]
-                        log_dict[f"{pfx}/mask_active_per_pos"] = diag["mask_active_per_pos"]
                         log_dict[f"{pfx}/gate_mean"] = diag["gate_mean"]
                         log_dict[f"{pfx}/gate_std"] = diag["gate_std"]
                         log_dict[f"{pfx}/output_norm"] = diag["output_norm"]
                         log_dict[f"{pfx}/hidden_norm"] = diag["hidden_norm"]
                         log_dict[f"{pfx}/out_hidden_ratio"] = diag["output_norm"] / max(diag["hidden_norm"], 1e-8)
-                        log_dict[f"{pfx}/collision_rate"] = 1.0 - diag["unique_slots"] / max(diag["total_positions"], 1)
+                        log_dict[f"{pfx}/hit_rate"] = diag["hit_rate"]
+                        log_dict[f"{pfx}/matched_gate_mean"] = diag["matched_gate_mean"]
+                        log_dict[f"{pfx}/unmatched_gate_mean"] = diag["unmatched_gate_mean"]
                 wandb.log(log_dict, step=step)
 
         # Eval
@@ -1336,9 +1273,9 @@ def train(
             val_loss = 0.0
             with torch.no_grad():
                 for _ in range(train_config.eval_steps):
-                    x, y = val_data.get_batch(train_config.micro_batch_size, device)
+                    x, y, p = val_data.get_batch(train_config.micro_batch_size, device)
                     with ctx:
-                        _, loss = model(x, y)
+                        _, loss = model(x, y, pattern_ids=p)
                     val_loss += loss.item()
             val_loss /= train_config.eval_steps
 
@@ -1478,21 +1415,18 @@ def generate_text(
         bias=cfg["bias"],
         rope_theta=cfg.get("rope_theta", 10000.0),
         use_weight_sharing=cfg.get("use_weight_sharing", False),
-        # Learned Engrams v2 (restored from checkpoint if present)
+        # Engrams v3 (restored from checkpoint if present)
         use_engrams=cfg.get("use_engrams", False),
-        engram_table_size=cfg.get("engram_table_size", 100_000),
-        engram_dim=cfg.get("engram_dim", 128),
-        engram_window=cfg.get("engram_window", 6),
+        engram_table_size=cfg.get("engram_table_size", 580_262),
+        engram_dim=cfg.get("engram_dim", 64),
         engram_inject_indices=tuple(cfg.get("engram_inject_indices", (4, 30))),
     )
 
     # Build model
     model = build_model(config, device)
-    model.load_state_dict(checkpoint["model"])
+    model.load_state_dict(checkpoint["model"], strict=False)
     model.eval()
     model.to(device)
-    if config.use_engrams and hasattr(model, "memory_table"):
-        model.memory_table = model.memory_table.cpu()
 
     # Load tokenizer (SentencePiece or Morfessor)
     sp_model_path = tokenizer_dir / "sp_telugu.model"
@@ -1618,14 +1552,14 @@ Examples:
         p.add_argument("--n-kv-head", type=int, default=4, help="KV head groups for GQA (default: 4)")
         p.add_argument("--no-weight-sharing", action="store_true", help="Disable block-wise weight sharing")
         p.add_argument("--dropout", type=float, default=0.0, help="Dropout rate (default: 0.0)")
-        # Learned Engrams v2
-        p.add_argument("--use-engrams", action="store_true", help="Enable learned engram memory module")
-        p.add_argument("--engram-table-size", type=int, default=100_000,
-                       help="Engram hash table slots (default: 100K)")
+        # Engrams v3 (PMI pattern memory)
+        p.add_argument("--use-engrams", action="store_true", help="Enable PMI pattern engram memory")
+        p.add_argument("--engram-table-size", type=int, default=580_262,
+                       help="Number of unique patterns (default: 580262 from preprocessing)")
+        p.add_argument("--engram-dim", type=int, default=64,
+                       help="Per-pattern embedding dimension (default: 64)")
         p.add_argument("--engram-warmup-steps", type=int, default=3000,
                        help="Freeze entire engram module for first N steps (default: 3000)")
-        p.add_argument("--engram-evict-interval", type=int, default=5000,
-                       help="Zero out inactive engram slots every N steps (default: 5000, 0=off)")
         # LR schedule
         p.add_argument("--lr-schedule", type=str, default="wsd", choices=["wsd", "cosine"],
                        help="LR schedule (default: wsd)")
@@ -1692,11 +1626,11 @@ Examples:
         train_config.lr_schedule = args.lr_schedule
         train_config.wsd_stable_frac = args.wsd_stable_frac
         train_config.wsd_decay_frac = args.wsd_decay_frac
-        # Learned Engrams v2
+        # Engrams v3
         model_config.use_engrams = args.use_engrams
         model_config.engram_table_size = args.engram_table_size
+        model_config.engram_dim = args.engram_dim
         model_config.engram_warmup_steps = args.engram_warmup_steps
-        model_config.engram_evict_interval = args.engram_evict_interval
 
     if args.command == "prepare":
         if not args.data and not args.parquet:
