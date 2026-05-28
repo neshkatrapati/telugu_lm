@@ -1,0 +1,83 @@
+# macOS
+.DS_Store
+.AppleDouble
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Model artifacts (kept on shared volume, not in git)
+*.pt
+*.safetensors
+*.bin
+*.npy
+*.fp16.npy
+*.fp16.bin
+faiss.index
+
+# Generated data dirs (huge, live on the volume)
+data/
+train-data/
+train-data-v2/
+codemix-train-data/
+stage_a_data/
+codemix-tokens/
+segmented_corpus/
+sft-data/
+sft_data/
+
+# Checkpoints
+checkpoints/
+pothana-engrams/
+pothana-base-300M/
+pothana-chat-300M-hf/
+pothana-sp-base-300M/
+sft_checkpoints/
+
+# HF release dirs (we publish via HF Hub, not git)
+hf_release/
+
+# Logs / experiment tracking
+wandb/
+*.log
+
+# Tokenizer artifacts
+tokenizer/
+tokenizer-new/
+tokenizer-new-v5/
+tokenizer-new-v6/
+tokenizer-sp/
+
+# Specific large artifacts at root
+pothana.mark1.pt
+pothana-engrams-new-tok.pt
+mark-zero.pt
+morfessor_telugu.bin
+eval_corpus.txt
+engram_paper.pdf
+engram_run_history.csv
+
+# Large generated JSONL traces (live on the volume)
+codemix-*.jsonl
+codemix-pilot*.jsonl
+
+# Temp / scratch
+/tmp/
+tmp_cvt.py
+
+# Vendored 3rd-party (in tmpl_expt/)
+tmpl_expt/kenlm/
+tmpl_expt/ukwac*.txt
+tmpl_expt/templates.duckdb
+tmpl_expt/vocab.list
+
+# Large reference assets (in plans/)
+plans/*.pptx
+

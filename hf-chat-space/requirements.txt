@@ -1,0 +1,6 @@
+transformers
+torch
+morfessor
+gradio
+huggingface_hub
+safetensors
